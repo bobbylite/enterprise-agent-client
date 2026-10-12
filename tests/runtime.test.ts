@@ -10,13 +10,18 @@ import { parseEnterpriseConfig } from '../src/shared/config';
 import { MemorySecretStore } from '../src/shared/secrets';
 import type { ChatEvent } from '../src/shared/types';
 
-async function boot(delayMs = 0) {
+async function boot(
+  delayMs = 0,
+  patch?: (config: ReturnType<typeof parseEnterpriseConfig>) => void,
+  fetchImpl?: typeof fetch,
+) {
   const rawBranding = JSON.parse(readFileSync('branding/default.json', 'utf8')) as Record<string, unknown>;
   const branding = parseBranding(
     { ...rawBranding, appName: 'Northstar', agentName: 'Northstar' },
     null,
   );
   const config = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')));
+  patch?.(config);
   const db = Repository.open(':memory:');
   const events: ChatEvent[] = [];
   const runtime = await Runtime.create({
@@ -29,6 +34,7 @@ async function boot(delayMs = 0) {
     encryptionAvailable: true,
     mockDelayMs: delayMs,
     emit: (event) => events.push(event),
+    fetchImpl,
   });
   return { runtime, events, db };
 }
@@ -110,6 +116,76 @@ describe('mock runtime', () => {
   });
 });
 
+describe('pi.flow runtime', () => {
+  function pingone(config: ReturnType<typeof parseEnterpriseConfig>): void {
+    config.tenant.mode = 'pingone';
+    config.tenant.authHost = 'https://auth.example';
+    config.tenant.environmentId = 'env-1';
+    config.tenant.clientId = 'client-1';
+    config.protect.enabled = false;
+  }
+
+  it('signs in when the policy is identifier-first', async () => {
+    let state = '';
+    const posted: string[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const headers = new Headers(init?.headers);
+      const type = headers.get('content-type') ?? '';
+      if (type) posted.push(type);
+      if (String(url).includes('/as/authorize')) {
+        state = new URL(String(url)).searchParams.get('state') ?? '';
+        return json(200, {
+          id: 'flow-1',
+          status: 'SIGN_ON_REQUIRED',
+          _links: { 'user.lookup': { href: 'https://auth.example/env-1/flows/flow-1' } },
+        });
+      }
+      if (type.includes('user.lookup')) {
+        return json(200, {
+          id: 'flow-1',
+          status: 'PASSWORD_REQUIRED',
+          _links: { 'usernamePassword.check': { href: 'https://auth.example/env-1/flows/flow-1' } },
+        });
+      }
+      if (type.includes('usernamePassword.check')) {
+        return json(200, {
+          id: 'flow-1',
+          status: 'COMPLETED',
+          authorizeResponse: { code: 'auth-code', state },
+          _embedded: { user: { id: 'user-1', username: 'ada' } },
+        });
+      }
+      return json(200, { access_token: 'user-token', expires_in: 3600, token_type: 'Bearer' });
+    };
+    const { runtime } = await boot(0, pingone, fetchImpl);
+    const signedIn = await runtime.submitCredentials('ada', 'secret', '');
+    expect(signedIn.session?.username).toBe('ada');
+    expect(posted).toEqual([
+      'application/vnd.pingidentity.user.lookup+json',
+      'application/vnd.pingidentity.usernamePassword.check+json',
+      'application/x-www-form-urlencoded',
+    ]);
+  });
+
+  it('reports an external identity provider instead of posting usernamePassword.check', async () => {
+    const posted: string[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const type = new Headers(init?.headers).get('content-type');
+      if (type) posted.push(type);
+      if (String(url).includes('/as/authorize')) {
+        return json(200, { id: 'flow-ext', status: 'EXTERNAL_AUTHENTICATION_REQUIRED', _links: {} });
+      }
+      return json(500, { message: 'unexpected' });
+    };
+    const { runtime } = await boot(0, pingone, fetchImpl);
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(state.session).toBeNull();
+    expect(state.login.phase).toBe('error');
+    expect(state.login.message).toMatch(/external identity provider/);
+    expect(posted).toEqual([]);
+  });
+});
+
 async function waitFor(events: ChatEvent[], predicate: (event: ChatEvent) => boolean): Promise<ChatEvent> {
   const started = Date.now();
   while (Date.now() - started < 5000) {
@@ -118,4 +194,11 @@ async function waitFor(events: ChatEvent[], predicate: (event: ChatEvent) => boo
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('Timed out waiting for an event.');
+}
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
 }

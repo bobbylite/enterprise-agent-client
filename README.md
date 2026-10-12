@@ -91,6 +91,21 @@ npm run dev
 
 Mock mode is the committed example, so `npm run dev` signs in locally and does not call PingOne. Any non-empty password is accepted. On the login screen, choose a risk scenario: low, new device, anomalous location, impossible travel, or bot.
 
+### If dev reports "Electron uninstall"
+
+Electron 44's npm package does not download the desktop binary from a `postinstall` script. `electron-vite` then reads `node_modules/electron/path.txt` and throws `Error: Electron uninstall` when that file was never written. A fresh `npm install` on macOS (and on Windows or Linux) hits this before the window opens. The message means the desktop binary was never downloaded.
+
+`postinstall`, `predev`, and the `dev` script itself run `scripts/ensure-electron.mjs`. When the binary for the current OS is missing, that script runs `node node_modules/electron/install.js`, which writes `path.txt` (`Electron.app/Contents/MacOS/Electron` on macOS, `electron.exe` on Windows, `electron` on Linux). `npm install && npm run dev` therefore downloads Electron before `electron-vite` starts.
+
+`npm install --ignore-scripts`, or `ignore-scripts=true` in your npm config, skips `postinstall` and `predev`. The `dev` script still runs the check, because npm executes the script you named even when it skips lifecycle hooks. If you start `electron-vite` directly, run the installer yourself:
+
+```bash
+node node_modules/electron/install.js
+npm run dev
+```
+
+The zip comes from the Electron GitHub releases. Behind a proxy, set `ELECTRON_MIRROR` to a mirror of those releases. `ELECTRON_SKIP_BINARY_DOWNLOAD=1` skips the check on purpose; unset it and run the installer above when you want the app to launch.
+
 To point the app at a real tenant, copy the example config and env file. Do not commit either copy.
 
 ```bash
@@ -166,19 +181,20 @@ Use two applications in the same environment. A public PKCE application cannot a
 | Redirect URI | `http://127.0.0.1:53147/callback` (must match `tenant.redirectUri`) |
 | Scopes | `openid`, `profile`, `email` |
 | Response modes | `pi.flow` for the in-app login, and `query` for the system-browser fallback |
-| Sign-on policy | Username/password. Add an MFA step if you want real step-up. |
+| Sign-on policy | Username/password, or identifier first followed by a PingOne password. Add an MFA step if you want real step-up. External identity providers, FIDO2, and push still use the system browser. |
 
 Put the environment id and this application's client id in `tenant`. Set `tenant.authHost` and `tenant.apiHost` for the region (`https://auth.pingone.com` and `https://api.pingone.com`, or the `.eu`, `.ca`, `.asia`, or `.com.au` hosts). `tenant.region` is a label for operators; the hosts are what the client calls.
 
 `tenant.login.preferred`: `pi.flow` or `system-browser`. `allowSystemBrowserFallback` shows the browser button next to pi.flow. `stepUpAcrValues` is sent as `acr_values` when policy asks for step-up and the first flow did not challenge the user. If that second flow still has no MFA challenge, sign-in stops and the message tells an admin to fix the sign-on policy. A locally typed code is treated as MFA only in mock mode.
 
-pi.flow statuses this client posts:
+pi.flow actions are `POST`ed to the `_links` href for that action. When the status requires the action and the href did not parse, the client posts to `{authHost}/{envId}/flows/{flowId}`. It reads `status` and `_links` before choosing an action, and it does not post `usernamePassword.check` on an identifier step.
 
-- `USERNAME_PASSWORD_REQUIRED` with `application/vnd.pingidentity.usernamePassword.check+json`
-- `OTP_REQUIRED` and `VERIFICATION_CODE_REQUIRED` with `application/vnd.pingidentity.otp.check+json`
-- device selection with `application/vnd.pingidentity.device.select+json`
+- `USERNAME_PASSWORD_REQUIRED` and `PASSWORD_REQUIRED` post `{ "username", "password" }` as `application/vnd.pingidentity.usernamePassword.check+json`.
+- Identifier first (`SIGN_ON_REQUIRED`, or the same step when the status is `IDENTIFIER_REQUIRED`) posts `{ "username" }` as `application/vnd.pingidentity.user.lookup+json`. If the next status is `PASSWORD_REQUIRED` (or still offers `usernamePassword.check`), the password is posted with the username/password media type. If the next status is OTP, device selection, or an external provider, the password is not posted and that step is shown instead.
+- `OTP_REQUIRED` posts `application/vnd.pingidentity.otp.check+json`.
+- `DEVICE_SELECTION_REQUIRED` posts `application/vnd.pingidentity.device.select+json`.
 
-`COMPLETED` is read from `authorizeResponse.code` or from the resume URL. The code is exchanged at `{authHost}/{envId}/as/token` with `grant_type=authorization_code`, the PKCE verifier, and no client secret.
+`COMPLETED` (and `COMPLETED_ACCEPTED` when it carries a code) is read from `authorizeResponse.code` or from the resume URL. The code is exchanged at `{authHost}/{envId}/as/token` with `grant_type=authorization_code`, the PKCE verifier, and no client secret.
 
 ### 2. Worker application (token exchange and Protect)
 
@@ -235,7 +251,7 @@ The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-
 ## What is stubbed
 
 - OS installers, auto-update, and code signing.
-- pi.flow statuses this UI does not complete: FIDO2, push confirmation, magic link, identifier-first, and account recovery. Those flows stop with an unsupported-step error.
+- pi.flow statuses this UI does not complete: FIDO2 assertion, push confirmation, magic link, account recovery, and external identity-provider redirects. Those stop with a message that names the flow status and points at the system browser. Identifier-first policies are handled.
 - Continuous Protect re-evaluation during a session, and richer feedback than the completion-status update.
 - Anthropic and generic-provider extras: extended thinking, prompt caching, and full vision parity. Basic streaming and image blocks on the Anthropic path are implemented.
 - Group chat fan-out, @mentions, and debate. Replies are sequential.
