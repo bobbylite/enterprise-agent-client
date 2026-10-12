@@ -1,0 +1,329 @@
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { createPkce } from '../src/shared/auth/pkce';
+import { PiFlowClient } from '../src/shared/auth/pi-flow';
+import { waitForLoopbackCode } from '../src/shared/auth/loopback';
+import { classifyAccessToken } from '../src/shared/auth/tokens';
+import { parseBranding } from '../src/shared/branding';
+import { parseEnterpriseConfig } from '../src/shared/config';
+import { composeInstructions } from '../src/shared/instructions/compose';
+import { choiceFromUser, previewApproval } from '../src/shared/mcp/approvals';
+import { renderRiskContext } from '../src/shared/protect/context';
+import { mockRiskPayload } from '../src/shared/protect/mock';
+import { decideRisk, summarizeRisk } from '../src/shared/protect/policy';
+import { extractRiskReasons } from '../src/shared/protect/reasons';
+import { parseAnthropicData, parseOpenAiData } from '../src/shared/providers/sse';
+import { mockResult } from '../src/shared/providers/mock';
+import { assertValidCron, cronMatches } from '../src/shared/schedule/cron';
+import { AudienceTokenCache, exchangeSubjectToken } from '../src/shared/tokens/exchange';
+import { MemorySecretStore } from '../src/shared/secrets';
+import { parseEnv, redactSecrets } from '../src/shared/env';
+
+describe('branding', () => {
+  it('requires an app name and does not invent one', () => {
+    expect(() => parseBranding({ agentName: 'Ada' }, null)).toThrow(/appName/);
+  });
+
+  it('loads the sample theme from the branding file', () => {
+    const raw = JSON.parse(readFileSync('branding/default.json', 'utf8')) as { appName: string; agentName: string };
+    const branding = parseBranding(raw, null);
+    expect(branding.appName).toBe(raw.appName);
+    expect(branding.agentName).toBe(raw.agentName);
+    expect(branding.appName).toBe(branding.agentName);
+  });
+
+  it('does not hardcode the sample agent name in source', () => {
+    const raw = JSON.parse(readFileSync('branding/default.json', 'utf8')) as { agentName: string };
+    const hits: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const path = join(dir, entry);
+        if (statSync(path).isDirectory()) walk(path);
+        else if (/\.(ts|tsx|js|mjs|css)$/.test(path)) {
+          const text = readFileSync(path, 'utf8');
+          if (text.includes(raw.agentName)) hits.push(path);
+        }
+      }
+    };
+    walk('src');
+    expect(hits).toEqual([]);
+  });
+});
+
+describe('pkce and session freshness', () => {
+  it('creates an S256 challenge', async () => {
+    const pkce = await createPkce();
+    expect(pkce.verifier).not.toBe(pkce.challenge);
+    expect(pkce.challenge).not.toContain('=');
+    expect(pkce.state).not.toBe(pkce.verifier);
+  });
+
+  it('refreshes only when a refresh token exists', () => {
+    const now = 1_000_000;
+    expect(classifyAccessToken({ expiresAt: now + 120_000 }, now)).toBe('valid');
+    expect(classifyAccessToken({ expiresAt: now + 10_000, refreshToken: 'r' }, now)).toBe('refresh');
+    expect(classifyAccessToken({ expiresAt: now + 10_000 }, now)).toBe('reauth');
+  });
+});
+
+describe('pi.flow', () => {
+  it('submits credentials, keeps cookies, and exchanges the code', async () => {
+    const seen: { url: string; cookie?: string; body?: string; contentType?: string }[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const headers = new Headers(init?.headers);
+      seen.push({
+        url: String(url),
+        cookie: headers.get('cookie') ?? undefined,
+        body:
+          typeof init?.body === 'string'
+            ? init.body
+            : init?.body instanceof URLSearchParams
+              ? init.body.toString()
+              : undefined,
+        contentType: headers.get('content-type') ?? undefined,
+      });
+      if (String(url).includes('/as/authorize')) {
+        return json(200, {
+          id: 'flow-1',
+          status: 'USERNAME_PASSWORD_REQUIRED',
+          _links: { 'usernamePassword.check': { href: 'https://auth.example/flows/flow-1' } },
+          resumeUrl: 'https://auth.example/as/resume?flowId=flow-1',
+        }, ['ST=abc; Path=/; HttpOnly']);
+      }
+      if (String(url).includes('/flows/flow-1')) {
+        return json(200, {
+          id: 'flow-1',
+          status: 'COMPLETED',
+          authorizeResponse: { code: 'auth-code', state: 'state-1' },
+          _embedded: { user: { id: 'user-1', username: 'ada' } },
+        });
+      }
+      return json(200, { access_token: 'user-token', expires_in: 60, token_type: 'Bearer', refresh_token: 'refresh-1' });
+    };
+    const client = new PiFlowClient({
+      authHost: 'https://auth.example',
+      environmentId: 'env-1',
+      clientId: 'client-1',
+      fetchImpl,
+      now: () => 0,
+    });
+    const flow = await client.startAuthorize({
+      redirectUri: 'http://127.0.0.1:53147/callback',
+      scopes: ['openid'],
+      challenge: 'challenge',
+      state: 'state-1',
+    });
+    const done = await client.submitUsernamePassword(flow, 'ada', 'secret');
+    expect(seen[1]?.cookie).toContain('ST=abc');
+    expect(seen[1]?.contentType).toContain('usernamePassword.check');
+    const code = await client.authorizationCode(done);
+    const tokens = await client.exchangeCode({
+      code: code.code,
+      verifier: 'verifier',
+      redirectUri: 'http://127.0.0.1:53147/callback',
+    });
+    expect(tokens.accessToken).toBe('user-token');
+    expect(tokens.refreshToken).toBe('refresh-1');
+    expect(tokens.expiresAt).toBe(60_000);
+    expect(seen[2]?.body).toContain('code_verifier=verifier');
+  });
+});
+
+describe('loopback', () => {
+  it('accepts a matching state and rejects a mismatch', async () => {
+    const pending = waitForLoopbackCode({
+      redirectUri: 'http://127.0.0.1:53147/callback',
+      expectedState: 'good-state',
+      timeoutMs: 2000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const response = await fetch('http://127.0.0.1:53147/callback?code=abc&state=good-state');
+    expect(response.status).toBe(200);
+    await expect(pending).resolves.toEqual({ code: 'abc', state: 'good-state' });
+
+    const rejected = waitForLoopbackCode({
+      redirectUri: 'http://127.0.0.1:53148/callback',
+      expectedState: 'good-state',
+      timeoutMs: 2000,
+    });
+    const mismatch = expect(rejected).rejects.toThrow(/state/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await fetch('http://127.0.0.1:53148/callback?code=abc&state=bad-state');
+    await mismatch;
+  });
+});
+
+describe('token exchange', () => {
+  it('sends an RFC 8693 request and caches until expiry', async () => {
+    let calls = 0;
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      calls += 1;
+      const body = String(init?.body);
+      expect(body).toContain('grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange');
+      expect(body).toContain('audience=https%3A%2F%2Fmcp.example');
+      expect(new Headers(init?.headers).get('authorization')).toContain('Basic ');
+      return json(200, { access_token: 'aud-token', expires_in: 120, token_type: 'Bearer' });
+    };
+    const now = { value: 1_000 };
+    const cache = new AudienceTokenCache(new MemorySecretStore(), 60_000, () => now.value);
+    const first = await exchangeSubjectToken({
+      tokenEndpoint: 'https://auth.example/env/as/token',
+      subjectToken: 'user-token',
+      audience: 'https://mcp.example',
+      scope: 'mcp:tools',
+      clientId: 'worker',
+      clientSecret: 'secret',
+      fetchImpl,
+      now: () => now.value,
+    });
+    await cache.put('https://mcp.example', first);
+    expect(await cache.get('https://mcp.example')).toMatchObject({ accessToken: 'aud-token' });
+    now.value = first.expiresAt;
+    expect(await cache.get('https://mcp.example')).toBeNull();
+    expect(calls).toBe(1);
+  });
+});
+
+describe('protect policy', () => {
+  const policy = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8'))).protect.policy;
+
+  it('extracts new device, location, travel, and bot reasons', () => {
+    expect(extractRiskReasons(mockRiskPayload('new_device').details).map((reason) => reason.code)).toContain('NEW_DEVICE');
+    expect(extractRiskReasons(mockRiskPayload('anomalous_location').details).map((reason) => reason.code)).toContain('ANOMALOUS_LOCATION');
+    expect(extractRiskReasons(mockRiskPayload('impossible_travel').details).map((reason) => reason.code)).toContain('IMPOSSIBLE_TRAVEL');
+    expect(extractRiskReasons(mockRiskPayload('bot').details).map((reason) => reason.code)).toContain('BOT');
+    expect(extractRiskReasons(mockRiskPayload('low').details)).toEqual([]);
+  });
+
+  it('lets the most restrictive matching action win', () => {
+    const travel = mockRiskPayload('impossible_travel');
+    const reasons = extractRiskReasons(travel.details);
+    expect(decideRisk(policy, travel.level, reasons)).toBe('block');
+    const location = mockRiskPayload('anomalous_location');
+    expect(decideRisk(policy, location.level, extractRiskReasons(location.details))).toBe('restrict_tools');
+    expect(decideRisk(policy, 'LOW', [])).toBe('allow');
+  });
+
+  it('writes a risk context the agent can quote', () => {
+    const payload = mockRiskPayload('new_device');
+    const reasons = extractRiskReasons(payload.details);
+    const action = decideRisk(policy, payload.level, reasons);
+    const text = renderRiskContext(
+      {
+        level: payload.level,
+        action,
+        reasons,
+        summary: summarizeRisk(payload.level, action, reasons),
+        signalsCollected: true,
+        evaluatedAt: 0,
+      },
+      'Northstar',
+    );
+    expect(text).toContain('Risk level: MEDIUM');
+    expect(text).toContain('New device');
+    expect(text).toContain('Policy action: step_up_mfa');
+    expect(text).toContain('Northstar');
+  });
+});
+
+describe('instructions and approvals', () => {
+  it('orders enterprise policy above persona and user text', () => {
+    const prompt = composeInstructions({
+      branding: { appName: 'Northstar', agentName: 'Northstar' },
+      enterprise: fields('Enterprise rule'),
+      persona: fields('Persona rule'),
+      user: fields('User rule'),
+      room: 'Room rule',
+      risk: 'Risk level: LOW.',
+    });
+    expect(prompt.indexOf('Enterprise rule')).toBeLessThan(prompt.indexOf('Persona rule'));
+    expect(prompt.indexOf('Persona rule')).toBeLessThan(prompt.indexOf('User rule'));
+    expect(prompt.indexOf('User rule')).toBeLessThan(prompt.indexOf('Room rule'));
+    expect(prompt).toContain('You are Northstar');
+  });
+
+  it('forces a prompt when tools are restricted and blocks writes in read-only mode', () => {
+    expect(previewApproval({ riskAction: 'read_only', readOnlyHint: false })).toMatchObject({ type: 'deny', automatic: true });
+    expect(previewApproval({ riskAction: 'read_only', readOnlyHint: true })).toMatchObject({ type: 'prompt' });
+    expect(previewApproval({ riskAction: 'restrict_tools', readOnlyHint: true, remembered: 'always' })).toMatchObject({
+      type: 'prompt',
+      allowAlways: false,
+    });
+    expect(previewApproval({ riskAction: 'allow', readOnlyHint: false, remembered: 'always' })).toMatchObject({
+      type: 'allow',
+      persistence: 'always',
+    });
+    expect(choiceFromUser('always', false)).toMatchObject({ type: 'allow', persistence: 'once' });
+    expect(previewApproval({ riskAction: 'block', readOnlyHint: true })).toMatchObject({ type: 'deny' });
+  });
+});
+
+describe('cron and providers', () => {
+  it('matches weekdays and steps', () => {
+    expect(cronMatches('0 9 * * 1-5', new Date(2026, 9, 12, 9, 0, 30))).toBe(true);
+    expect(cronMatches('0 9 * * 1-5', new Date(2026, 9, 11, 9, 0))).toBe(false);
+    expect(cronMatches('*/15 * * * *', new Date(2026, 0, 1, 3, 45))).toBe(true);
+    expect(cronMatches('*/15 * * * *', new Date(2026, 0, 1, 3, 10))).toBe(false);
+    expect(() => assertValidCron('* * *')).toThrow(/5 fields/);
+  });
+
+  it('parses provider streams and lets the mock provider call echo', () => {
+    expect(parseOpenAiData('[DONE]')).toBe('done');
+    expect(parseOpenAiData(JSON.stringify({ choices: [{ delta: { content: 'Hi' } }] }))).toMatchObject({ text: 'Hi' });
+    expect(
+      parseAnthropicData(JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Yo' } })),
+    ).toMatchObject({ text: 'Yo' });
+    const echoed = mockResult({
+      model: 'mock-1',
+      system: 'Risk level: LOW. Policy action: allow.',
+      temperature: 0,
+      tools: [{ name: 'echo__echo', description: 'Echo', inputSchema: { type: 'object' } }],
+      messages: [{ role: 'user', content: 'echo hello' }],
+    });
+    expect(echoed.toolCalls[0]?.arguments).toContain('hello');
+    const follow = mockResult({
+      model: 'mock-1',
+      system: 'Risk level: HIGH. Policy action: block.',
+      temperature: 0,
+      tools: [],
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'tool', content: 'hello', toolCallId: '1' },
+      ],
+    });
+    expect(follow.content).toContain('HIGH');
+  });
+});
+
+describe('config safety', () => {
+  it('rejects secrets embedded in enterprise config', () => {
+    const raw = JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')) as Record<string, unknown>;
+    expect(() => parseEnterpriseConfig({ ...raw, workerClientSecret: 'nope' })).toThrow(/keychain/);
+  });
+
+  it('parses env files without dropping quoted values', () => {
+    expect(parseEnv('# comment\nOPENAI_API_KEY="abc 123"\n\nEMPTY=')).toEqual({
+      OPENAI_API_KEY: 'abc 123',
+      EMPTY: '',
+    });
+    expect(redactSecrets('Authorization: Bearer abc.def')).toContain('[redacted]');
+  });
+});
+
+function fields(text: string) {
+  return {
+    persona: text,
+    communicationStyle: '',
+    autonomy: '',
+    safety: '',
+    untrustedContent: '',
+  };
+}
+
+function json(status: number, body: unknown, cookies: string[] = []): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json', 'set-cookie': cookies.join(', ') },
+  });
+}
