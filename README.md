@@ -102,13 +102,13 @@ In `config/enterprise.json` set `tenant.mode` to `pingone` and fill the hosts, e
 
 `BRANDING_PATH` overrides the branding file. `ENTERPRISE_CONFIG` overrides the enterprise file. The defaults are `branding/default.json` and, when present, `config/enterprise.json`, otherwise the example.
 
-In a container where Chromium's sandbox cannot start, launch with:
+In a container where Chromium's sandbox cannot start, launch with both variables. `ELECTRON_DISABLE_SANDBOX` is read before the process starts; `AGENT_DISABLE_SANDBOX` also turns off GPU acceleration and `/dev/shm` usage.
 
 ```bash
-AGENT_DISABLE_SANDBOX=1 npm run dev
+ELECTRON_DISABLE_SANDBOX=1 AGENT_DISABLE_SANDBOX=1 npm run dev
 ```
 
-That sets `--no-sandbox` and disables GPU acceleration. Do not use it on a desktop you do not control.
+Do not use those switches on a desktop you do not control. The sandboxed preload is built as CommonJS (`out/preload/index.cjs`) so it loads when `package.json` has `"type": "module"`.
 
 ### Scripts
 

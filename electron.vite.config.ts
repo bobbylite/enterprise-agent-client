@@ -14,6 +14,15 @@ export default defineConfig({
   preload: {
     plugins: [externalizeDepsPlugin()],
     resolve: { alias },
+    build: {
+      rollupOptions: {
+        output: {
+          format: 'cjs',
+          // Sandboxed preload cannot parse ESM. .cjs stays CommonJS when package.json type is module.
+          entryFileNames: 'index.cjs',
+        },
+      },
+    },
   },
   renderer: {
     resolve: { alias },

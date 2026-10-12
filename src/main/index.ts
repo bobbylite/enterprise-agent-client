@@ -13,6 +13,7 @@ const moduleDir = dirname(fileURLToPath(import.meta.url));
 if (process.env.AGENT_DISABLE_SANDBOX === '1') {
   app.commandLine.appendSwitch('no-sandbox');
   app.commandLine.appendSwitch('disable-gpu');
+  app.commandLine.appendSwitch('disable-dev-shm-usage');
   app.disableHardwareAcceleration();
 }
 
@@ -39,7 +40,7 @@ function createWindow(title: string, background: string): BrowserWindow {
     title,
     backgroundColor: background,
     webPreferences: {
-      preload: join(moduleDir, '../preload/index.mjs'),
+      preload: join(moduleDir, '../preload/index.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
