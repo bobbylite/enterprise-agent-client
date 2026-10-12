@@ -1,0 +1,1336 @@
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { fillTemplate } from '@shared/branding';
+import type { EnterpriseConfig } from '@shared/config';
+import { riskEvaluationsUrl, tokenEndpoint } from '@shared/config';
+import { MFA_STATUSES, PiFlowClient, buildAuthorizeUrl, type FlowSnapshot } from '@shared/auth/pi-flow';
+import { createPkce, type PkcePair } from '@shared/auth/pkce';
+import { waitForLoopbackCode } from '@shared/auth/loopback';
+import { classifyAccessToken, type TokenSet } from '@shared/auth/tokens';
+import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
+import { composeInstructions } from '@shared/instructions/compose';
+import { toolKey } from '@shared/mcp/approvals';
+import { buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
+import { mockRiskPayload } from '@shared/protect/mock';
+import { decideRisk, summarizeRisk } from '@shared/protect/policy';
+import { extractRiskReasons, riskLevel } from '@shared/protect/reasons';
+import { renderRiskContext } from '@shared/protect/context';
+import { createProvider, defaultModelFor } from '@shared/providers/index';
+import type { ProviderMessage } from '@shared/providers/types';
+import { assertValidCron, cronMatches, minuteKey } from '@shared/schedule/cron';
+import type { SecretStore } from '@shared/secrets';
+import { AudienceTokenCache, fetchClientCredentials, getOrExchange } from '@shared/tokens/exchange';
+import { redactSecrets } from '@shared/env';
+import type {
+  AgentProfile,
+  AppState,
+  ApprovalChoice,
+  ApprovalRequest,
+  Attachment,
+  Branding,
+  ChatEvent,
+  ChatSnapshot,
+  InstructionEditorState,
+  InstructionFields,
+  LoginView,
+  McpServerInput,
+  McpServerView,
+  MockScenario,
+  ProviderId,
+  RiskView,
+  Room,
+  RoomInput,
+  Routine,
+  RoutineInput,
+  RoutineRun,
+  SessionView,
+  SettingsInput,
+  SettingsView,
+} from '@shared/types';
+import { Repository, type AgentRow, type McpServerRow } from './db';
+import { McpHub } from './mcp';
+import { runAgentTurn } from './turn';
+
+interface StoredSession {
+  accessToken: string;
+  refreshToken?: string;
+  idToken?: string;
+  expiresAt: number;
+  tokenType: string;
+  userId: string;
+  username: string;
+}
+
+interface PendingLogin {
+  userId: string;
+  username: string;
+  signals: string;
+  obtainTokens: () => Promise<TokenSet>;
+}
+
+export interface PickedFile {
+  name: string;
+  mime: string;
+  bytes: Uint8Array;
+}
+
+export interface RuntimeOptions {
+  config: EnterpriseConfig;
+  branding: Branding;
+  db: Repository;
+  secrets: SecretStore;
+  appRoot: string;
+  attachmentsDir: string;
+  encryptionAvailable: boolean;
+  env?: Record<string, string | undefined>;
+  fetchImpl?: typeof fetch;
+  openExternal?: (url: string) => Promise<void>;
+  pickFiles?: () => Promise<PickedFile[]>;
+  now?: () => number;
+  emit?: (event: ChatEvent) => void;
+  mockDelayMs?: number;
+  version?: string;
+}
+
+const SCENARIOS: MockScenario[] = ['low', 'new_device', 'anomalous_location', 'impossible_travel', 'bot'];
+
+export class Runtime {
+  private session: StoredSession | null = null;
+  private risk: RiskView | null = null;
+  private login: LoginView = { phase: 'idle' };
+  private stepUpRequired = false;
+  private scenario: MockScenario = 'low';
+  private pkce: PkcePair | null = null;
+  private flow: FlowSnapshot | null = null;
+  private mfaSatisfied = false;
+  private stepUpRestarted = false;
+  private pendingLogin: PendingLogin | null = null;
+  private pendingSignals = '';
+  private browserAbort: AbortController | null = null;
+  private workerToken: TokenSet | null = null;
+  private readonly exchangeErrors = new Map<string, string>();
+  private readonly approvals = new Map<string, (choice: ApprovalChoice) => void>();
+  private readonly pi: PiFlowClient;
+  private readonly cache: AudienceTokenCache;
+  private readonly hub: McpHub;
+  private firing = false;
+
+  private constructor(private readonly options: RuntimeOptions) {
+    this.pi = new PiFlowClient({
+      authHost: options.config.tenant.authHost,
+      environmentId: options.config.tenant.environmentId,
+      clientId: options.config.tenant.clientId,
+      fetchImpl: options.fetchImpl,
+      now: options.now,
+    });
+    this.cache = new AudienceTokenCache(options.secrets, 60_000, options.now);
+    this.hub = new McpHub({ name: options.branding.appName, version: options.version ?? '0.1.0' });
+  }
+
+  static async create(options: RuntimeOptions): Promise<Runtime> {
+    const runtime = new Runtime(options);
+    await runtime.init();
+    return runtime;
+  }
+
+  async dispose(): Promise<void> {
+    this.browserAbort?.abort();
+    await this.hub.disconnectAll();
+  }
+
+  private now(): number {
+    return this.options.now?.() ?? Date.now();
+  }
+
+  setEmitter(emit: (event: ChatEvent) => void): void {
+    this.options.emit = emit;
+  }
+
+  private emit(event: ChatEvent): void {
+    this.options.emit?.(event);
+  }
+
+  private env(name: string): string {
+    return this.options.env?.[name]?.trim() ?? '';
+  }
+
+  async init(): Promise<void> {
+    await this.hydrateSecrets();
+    this.seed();
+    this.syncBrandedAgents();
+    const storedScenario = this.options.db.getSetting('mockScenario');
+    if (storedScenario && SCENARIOS.includes(storedScenario as MockScenario)) {
+      this.scenario = storedScenario as MockScenario;
+    }
+    await this.restoreSession();
+  }
+
+  state(): AppState {
+    return {
+      mode: this.options.config.tenant.mode,
+      session: this.sessionView(),
+      risk: this.risk,
+      stepUpRequired: this.stepUpRequired,
+      encryptionAvailable: this.options.encryptionAvailable,
+      loginPreferred: this.options.config.tenant.login.preferred,
+      allowSystemBrowserFallback: this.options.config.tenant.login.allowSystemBrowserFallback,
+      mockScenario: this.scenario,
+      login: this.login,
+    };
+  }
+
+  async submitCredentials(username: string, password: string, signals: string): Promise<AppState> {
+    const name = username.trim();
+    if (!name || !password) throw new Error('Enter a username and password.');
+    this.pendingSignals = signals;
+    if (this.options.config.tenant.mode === 'mock') {
+      return this.completeLogin({
+        userId: `mock:${name}`,
+        username: name,
+        signals,
+        mfaSatisfied: false,
+        obtainTokens: async () => this.mockToken(`mock:${name}`),
+      });
+    }
+    if (!this.flow || !this.flow.links['usernamePassword.check']) {
+      this.pkce = await createPkce();
+      this.mfaSatisfied = false;
+      this.flow = await this.pi.startAuthorize({
+        redirectUri: this.options.config.tenant.redirectUri,
+        scopes: this.options.config.tenant.scopes,
+        challenge: this.pkce.challenge,
+        state: this.pkce.state,
+      });
+    }
+    const next = await this.pi.submitUsernamePassword(this.flow, name, password);
+    return this.advance(next, signals);
+  }
+
+  async submitOtp(otp: string, signals: string): Promise<AppState> {
+    if (this.pendingLogin) {
+      if (!/^\d{6}$/.test(otp.trim())) throw new Error('Enter a 6-digit verification code.');
+      const pending = this.pendingLogin;
+      this.pendingLogin = null;
+      const tokens = await pending.obtainTokens();
+      await this.activate(tokens, pending.userId, pending.username);
+      await this.markRisk('SUCCESS');
+      return this.state();
+    }
+    if (!this.flow) throw new Error('Start sign-in again.');
+    const next = await this.pi.submitOtp(this.flow, otp.trim());
+    this.mfaSatisfied = true;
+    return this.advance(next, signals || this.pendingSignals);
+  }
+
+  async selectDevice(deviceId: string, signals: string): Promise<AppState> {
+    if (!this.flow) throw new Error('Start sign-in again.');
+    const next = await this.pi.selectDevice(this.flow, deviceId);
+    return this.advance(next, signals || this.pendingSignals);
+  }
+
+  async startSystemBrowserLogin(signals: string): Promise<AppState> {
+    this.pendingSignals = signals;
+    if (this.options.config.tenant.mode === 'mock') {
+      return this.completeLogin({
+        userId: 'mock:browser-user',
+        username: 'browser-user',
+        signals,
+        mfaSatisfied: false,
+        obtainTokens: async () => this.mockToken('mock:browser-user'),
+      });
+    }
+    this.pkce = await createPkce();
+    const url = buildAuthorizeUrl({
+      authHost: this.options.config.tenant.authHost,
+      environmentId: this.options.config.tenant.environmentId,
+      clientId: this.options.config.tenant.clientId,
+      redirectUri: this.options.config.tenant.redirectUri,
+      scopes: this.options.config.tenant.scopes,
+      challenge: this.pkce.challenge,
+      state: this.pkce.state,
+      responseMode: 'query',
+    });
+    this.browserAbort = new AbortController();
+    const pending = waitForLoopbackCode({
+      redirectUri: this.options.config.tenant.redirectUri,
+      expectedState: this.pkce.state,
+      signal: this.browserAbort.signal,
+    });
+    this.login = { phase: 'browser-wait', message: 'Continue in the browser window.' };
+    if (!this.options.openExternal) throw new Error('System browser sign-in is not available.');
+    await this.options.openExternal(url);
+    const { code } = await pending;
+    const verifier = this.pkce.verifier;
+    const tokens = await this.pi.exchangeCode({
+      code,
+      verifier,
+      redirectUri: this.options.config.tenant.redirectUri,
+    });
+    const payload = decodeJwtPayload(tokens.idToken || tokens.accessToken);
+    const userId = typeof payload.sub === 'string' ? payload.sub : 'user';
+    const username = stringClaim(payload.preferred_username) || stringClaim(payload.email) || userId;
+    return this.completeLogin({
+      userId,
+      username,
+      signals,
+      mfaSatisfied: false,
+      obtainTokens: async () => tokens,
+    });
+  }
+
+  async cancelLogin(): Promise<AppState> {
+    this.browserAbort?.abort();
+    this.browserAbort = null;
+    this.flow = null;
+    this.pkce = null;
+    this.pendingLogin = null;
+    this.stepUpRequired = false;
+    this.mfaSatisfied = false;
+    this.stepUpRestarted = false;
+    this.login = { phase: 'idle' };
+    return this.state();
+  }
+
+  async setMockScenario(scenario: MockScenario): Promise<AppState> {
+    if (this.options.config.tenant.mode !== 'mock') {
+      throw new Error('Risk scenarios are only available in mock mode.');
+    }
+    this.scenario = scenario;
+    this.options.db.setSetting('mockScenario', scenario);
+    return this.state();
+  }
+
+  async logout(): Promise<AppState> {
+    this.session = null;
+    this.risk = null;
+    this.stepUpRequired = false;
+    this.pendingLogin = null;
+    this.flow = null;
+    await this.options.secrets.delete('session');
+    this.options.db.setSetting('risk', '');
+    await this.hub.disconnectAll();
+    this.login = { phase: 'idle' };
+    return this.state();
+  }
+
+  listConversations() {
+    this.requireSession();
+    return this.options.db.listConversations().filter((item) => item.kind === 'direct');
+  }
+
+  createConversation(): ChatSnapshot {
+    this.requireSession();
+    const agent = this.defaultAgent();
+    const now = this.now();
+    const conversation = {
+      id: randomId(),
+      title: 'New chat',
+      kind: 'direct' as const,
+      agentId: agent.id,
+      roomId: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.options.db.insertConversation(conversation);
+    return { conversation, messages: [] };
+  }
+
+  openConversation(id: string): ChatSnapshot {
+    this.requireSession();
+    const conversation = this.options.db.getConversation(id);
+    if (!conversation) throw new Error('That conversation was not found.');
+    return { conversation, messages: this.options.db.listMessages(id) };
+  }
+
+  async sendMessage(conversationId: string, text: string, attachmentIds: string[]): Promise<void> {
+    const conversation = this.openConversation(conversationId).conversation;
+    const body = text.trim();
+    if (!body && attachmentIds.length === 0) throw new Error('Write a message or attach a file.');
+    const messageId = randomId();
+    const now = this.now();
+    this.options.db.insertMessage({
+      id: messageId,
+      conversationId,
+      role: 'user',
+      authorId: this.session?.userId ?? null,
+      authorName: this.session?.username ?? 'You',
+      content: body,
+      createdAt: now,
+    });
+    if (attachmentIds.length > 0) this.options.db.linkAttachments(messageId, attachmentIds);
+    if (conversation.title === 'New chat' && body) {
+      this.options.db.touchConversation(conversationId, now, body.slice(0, 48));
+    } else {
+      this.options.db.touchConversation(conversationId, now);
+    }
+    const agent = this.options.db.getAgent(conversation.agentId ?? '') ?? this.defaultAgent();
+    try {
+      await this.speak(conversationId, agent, undefined);
+    } catch (error) {
+      const message = redactSecrets(error instanceof Error ? error.message : String(error));
+      this.emit({ type: 'error', conversationId, message });
+      throw new Error(message, { cause: error });
+    }
+  }
+
+  async pickAttachments(): Promise<Attachment[]> {
+    this.requireSession();
+    if (!this.options.pickFiles) throw new Error('File picking is not available.');
+    const files = await this.options.pickFiles();
+    mkdirSync(this.options.attachmentsDir, { recursive: true });
+    return files.map((file) => {
+      const id = randomId();
+      const name = basename(file.name) || 'attachment';
+      const path = join(this.options.attachmentsDir, `${id}-${name}`);
+      writeFileSync(path, file.bytes);
+      this.options.db.insertAttachment({
+        id,
+        messageId: null,
+        name,
+        mime: file.mime || 'application/octet-stream',
+        size: file.bytes.byteLength,
+        path,
+      });
+      const previewDataUrl =
+        file.mime.startsWith('image/') && file.bytes.byteLength < 200_000
+          ? `data:${file.mime};base64,${Buffer.from(file.bytes).toString('base64')}`
+          : undefined;
+      return { id, messageId: null, name, mime: file.mime, size: file.bytes.byteLength, previewDataUrl };
+    });
+  }
+
+  listAgents(): AgentProfile[] {
+    return this.options.db.listAgents().map(({ instructions: _instructions, ...agent }) => agent);
+  }
+
+  listRooms(): Room[] {
+    this.requireSession();
+    return this.options.db.listRooms();
+  }
+
+  saveRoom(input: RoomInput): Room {
+    this.requireSession();
+    if (!input.name.trim()) throw new Error('Give the room a name.');
+    if (input.agentIds.length === 0) throw new Error('Choose at least one agent.');
+    const existing = input.id ? this.options.db.getRoom(input.id) : null;
+    const room = {
+      id: input.id || randomId(),
+      name: input.name.trim(),
+      instructions: input.instructions,
+      createdAt: existing?.createdAt ?? this.now(),
+      agentIds: input.agentIds,
+    };
+    this.options.db.upsertRoom(room);
+    return room;
+  }
+
+  deleteRoom(id: string): void {
+    this.requireSession();
+    this.options.db.deleteRoom(id);
+  }
+
+  openRoom(id: string): ChatSnapshot {
+    this.requireSession();
+    const room = this.options.db.getRoom(id);
+    if (!room) throw new Error('That room was not found.');
+    let conversation = this.options.db.findRoomConversation(id);
+    if (!conversation) {
+      const now = this.now();
+      conversation = {
+        id: randomId(),
+        title: room.name,
+        kind: 'room',
+        agentId: null,
+        roomId: id,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.options.db.insertConversation(conversation);
+    }
+    return { conversation, messages: this.options.db.listMessages(conversation.id) };
+  }
+
+  async sendRoomMessage(roomId: string, text: string): Promise<void> {
+    const snapshot = this.openRoom(roomId);
+    const body = text.trim();
+    if (!body) throw new Error('Write a message.');
+    const room = this.options.db.getRoom(roomId);
+    if (!room) throw new Error('That room was not found.');
+    const now = this.now();
+    this.options.db.insertMessage({
+      id: randomId(),
+      conversationId: snapshot.conversation.id,
+      role: 'user',
+      authorId: this.session?.userId ?? null,
+      authorName: this.session?.username ?? 'You',
+      content: body,
+      createdAt: now,
+    });
+    this.options.db.touchConversation(snapshot.conversation.id, now);
+    for (const agentId of room.agentIds) {
+      const agent = this.options.db.getAgent(agentId);
+      if (!agent) continue;
+      await this.speak(snapshot.conversation.id, agent, room.instructions);
+    }
+  }
+
+  getInstructions(): InstructionEditorState {
+    const persona = this.options.db.getInstructions('persona') ?? this.options.branding.persona;
+    const user = this.options.db.getInstructions('user') ?? emptyFields();
+    return {
+      enterprise: this.options.config.enterpriseInstructions,
+      persona,
+      user,
+      enterpriseLocked: true,
+      personaCustomized: this.options.db.getSetting('personaCustomized') === '1',
+    };
+  }
+
+  savePersona(fields: InstructionFields): InstructionEditorState {
+    this.options.db.setInstructions('persona', fields);
+    this.options.db.setSetting('personaCustomized', '1');
+    return this.getInstructions();
+  }
+
+  saveUserLayer(fields: InstructionFields): InstructionEditorState {
+    this.options.db.setInstructions('user', fields);
+    return this.getInstructions();
+  }
+
+  resetPersona(): InstructionEditorState {
+    this.options.db.setInstructions('persona', this.options.branding.persona);
+    this.options.db.setSetting('personaCustomized', '0');
+    return this.getInstructions();
+  }
+
+  listMcpServers(): McpServerView[] {
+    return this.options.db.listMcpServers().map((server) => this.serverView(server));
+  }
+
+  async saveMcpServer(input: McpServerInput): Promise<McpServerView> {
+    if (!input.name.trim()) throw new Error('Give the server a name.');
+    const row: McpServerRow = {
+      id: input.id || randomId(),
+      name: input.name.trim(),
+      transport: input.transport,
+      command: input.command.trim(),
+      args: parseArgs(input.args),
+      url: input.url.trim(),
+      audience: input.audience.trim(),
+      scope: input.scope.trim(),
+      enabled: input.enabled,
+    };
+    if (row.transport === 'stdio' && !row.command) throw new Error('A stdio server needs a command.');
+    if (row.transport !== 'stdio' && !row.url) throw new Error('An HTTP server needs a URL.');
+    this.options.db.upsertMcpServer(row);
+    return this.serverView(row);
+  }
+
+  async deleteMcpServer(id: string): Promise<void> {
+    await this.hub.disconnect(id);
+    this.options.db.deleteMcpServer(id);
+  }
+
+  async connectMcp(id: string): Promise<McpServerView> {
+    this.requireSession();
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
+    if (!server) throw new Error('That server was not found.');
+    let accessToken: string | undefined;
+    if (server.audience) {
+      accessToken = await this.tokenForAudience(server.audience, server.scope);
+    }
+    await this.hub.connect({
+      id: server.id,
+      name: server.name,
+      transport: server.transport,
+      command: server.command,
+      args: server.args,
+      url: server.url,
+      cwd: this.options.appRoot,
+      accessToken,
+    });
+    return this.serverView(server);
+  }
+
+  async disconnectMcp(id: string): Promise<McpServerView> {
+    await this.hub.disconnect(id);
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
+    if (!server) throw new Error('That server was not found.');
+    return this.serverView(server);
+  }
+
+  respondApproval(id: string, choice: ApprovalChoice): void {
+    const resolve = this.approvals.get(id);
+    if (!resolve) throw new Error('That approval request has expired.');
+    this.approvals.delete(id);
+    resolve(choice);
+  }
+
+  listRoutines(): Routine[] {
+    return this.options.db.listRoutines().map(({ lastFiredMinute: _last, ...routine }) => routine);
+  }
+
+  saveRoutine(input: RoutineInput): Routine {
+    assertValidCron(input.cron);
+    if (!input.name.trim() || !input.prompt.trim()) throw new Error('A routine needs a name and a prompt.');
+    const existing = input.id ? this.options.db.getRoutine(input.id) : null;
+    const routine = {
+      id: input.id || randomId(),
+      name: input.name.trim(),
+      prompt: input.prompt,
+      targetType: input.targetType,
+      targetId: input.targetId,
+      cron: input.cron.trim(),
+      enabled: input.enabled,
+      createdAt: existing?.createdAt ?? this.now(),
+      lastFiredMinute: existing?.lastFiredMinute ?? null,
+    };
+    this.options.db.upsertRoutine(routine);
+    const { lastFiredMinute: _last, ...publicRoutine } = routine;
+    return publicRoutine;
+  }
+
+  deleteRoutine(id: string): void {
+    this.options.db.deleteRoutine(id);
+  }
+
+  async runRoutine(id: string): Promise<RoutineRun> {
+    this.requireSession();
+    const routine = this.options.db.getRoutine(id);
+    if (!routine) throw new Error('That routine was not found.');
+    return this.executeRoutine(routine);
+  }
+
+  listRoutineRuns(id: string): RoutineRun[] {
+    return this.options.db.listRuns(id);
+  }
+
+  getSettings(): SettingsView {
+    const provider = (this.options.db.getSetting('provider') ?? this.options.config.provider.default) as ProviderId;
+    return {
+      provider,
+      model: this.options.db.getSetting('model') ?? defaultModelFor(provider, this.options.config.provider),
+      temperature: Number(this.options.db.getSetting('temperature') ?? this.options.config.provider.temperature),
+      openaiBaseUrl: this.options.db.getSetting('openaiBaseUrl') ?? this.options.config.provider.openaiBaseUrl,
+      anthropicBaseUrl: this.options.db.getSetting('anthropicBaseUrl') ?? this.options.config.provider.anthropicBaseUrl,
+      genericBaseUrl: this.options.db.getSetting('genericBaseUrl') ?? this.options.config.provider.genericBaseUrl,
+      keys: {
+        openai: false,
+        anthropic: false,
+        generic: false,
+        worker: false,
+      },
+    };
+  }
+
+  async getSettingsAsync(): Promise<SettingsView> {
+    const view = this.getSettings();
+    view.keys = {
+      openai: Boolean(await this.options.secrets.get('openaiApiKey')),
+      anthropic: Boolean(await this.options.secrets.get('anthropicApiKey')),
+      generic: Boolean(await this.options.secrets.get('genericApiKey')),
+      worker: Boolean(await this.options.secrets.get('workerClientSecret')),
+    };
+    return view;
+  }
+
+  async saveSettings(input: SettingsInput): Promise<SettingsView> {
+    if (input.temperature < 0 || input.temperature > 2) throw new Error('Temperature must be between 0 and 2.');
+    this.options.db.setSetting('provider', input.provider);
+    this.options.db.setSetting('model', input.model.trim() || defaultModelFor(input.provider, this.options.config.provider));
+    this.options.db.setSetting('temperature', String(input.temperature));
+    this.options.db.setSetting('openaiBaseUrl', input.openaiBaseUrl.trim());
+    this.options.db.setSetting('anthropicBaseUrl', input.anthropicBaseUrl.trim());
+    this.options.db.setSetting('genericBaseUrl', input.genericBaseUrl.trim());
+    await this.maybeSecret('openaiApiKey', input.openaiApiKey, input.clearKeys?.includes('openai'));
+    await this.maybeSecret('anthropicApiKey', input.anthropicApiKey, input.clearKeys?.includes('anthropic'));
+    await this.maybeSecret('genericApiKey', input.genericApiKey, input.clearKeys?.includes('generic'));
+    await this.maybeSecret('workerClientSecret', input.workerClientSecret, input.clearKeys?.includes('worker'));
+    return this.getSettingsAsync();
+  }
+
+  async fireDueRoutines(date: Date): Promise<RoutineRun[]> {
+    if (!this.session || this.firing) return [];
+    this.firing = true;
+    const runs: RoutineRun[] = [];
+    try {
+      const key = minuteKey(date);
+      for (const routine of this.options.db.listRoutines()) {
+        if (!routine.enabled || routine.lastFiredMinute === key) continue;
+        if (!cronMatches(routine.cron, date)) continue;
+        this.options.db.markRoutineFired(routine.id, key);
+        const run = await this.executeRoutine(routine);
+        runs.push(run);
+        this.emit({ type: 'routine-finished', run });
+      }
+    } finally {
+      this.firing = false;
+    }
+    return runs;
+  }
+
+  private async executeRoutine(routine: Routine & { lastFiredMinute?: string | null }): Promise<RoutineRun> {
+    const run: RoutineRun = {
+      id: randomId(),
+      routineId: routine.id,
+      startedAt: this.now(),
+      finishedAt: null,
+      status: 'running',
+      output: null,
+      error: null,
+    };
+    this.options.db.insertRun(run);
+    try {
+      let output = '';
+      if (routine.targetType === 'room') {
+        const snapshot = this.openRoom(routine.targetId);
+        this.options.db.insertMessage({
+          id: randomId(),
+          conversationId: snapshot.conversation.id,
+          role: 'user',
+          authorId: 'routine',
+          authorName: routine.name,
+          content: routine.prompt,
+          createdAt: this.now(),
+        });
+        const room = this.options.db.getRoom(routine.targetId);
+        for (const agentId of room?.agentIds ?? []) {
+          const agent = this.options.db.getAgent(agentId);
+          if (!agent) continue;
+          output = await this.speak(snapshot.conversation.id, agent, room?.instructions);
+        }
+      } else {
+        const agent = this.options.db.getAgent(routine.targetId) ?? this.defaultAgent();
+        const now = this.now();
+        const conversation = {
+          id: randomId(),
+          title: routine.name,
+          kind: 'routine' as const,
+          agentId: agent.id,
+          roomId: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        this.options.db.insertConversation(conversation);
+        this.options.db.insertMessage({
+          id: randomId(),
+          conversationId: conversation.id,
+          role: 'user',
+          authorId: 'routine',
+          authorName: routine.name,
+          content: routine.prompt,
+          createdAt: now,
+        });
+        output = await this.speak(conversation.id, agent, undefined);
+      }
+      const finished = { finishedAt: this.now(), status: 'success' as const, output, error: null };
+      this.options.db.finishRun(run.id, finished);
+      return { ...run, ...finished };
+    } catch (error) {
+      const finished = {
+        finishedAt: this.now(),
+        status: 'error' as const,
+        output: null,
+        error: redactSecrets(error instanceof Error ? error.message : String(error)),
+      };
+      this.options.db.finishRun(run.id, finished);
+      return { ...run, ...finished };
+    }
+  }
+
+  private async speak(conversationId: string, agent: AgentRow, room: string | undefined): Promise<string> {
+    const settings = await this.getSettingsAsync();
+    const provider = createProvider(settings.provider, {
+      fetchImpl: this.options.fetchImpl,
+      delayMs: this.options.mockDelayMs ?? 12,
+    });
+    const apiKey = await this.apiKey(settings.provider);
+    const baseUrl =
+      settings.provider === 'openai'
+        ? settings.openaiBaseUrl
+        : settings.provider === 'anthropic'
+          ? settings.anthropicBaseUrl
+          : settings.provider === 'generic'
+            ? settings.genericBaseUrl
+            : undefined;
+    const history = this.providerHistory(conversationId);
+    return runAgentTurn({
+      provider,
+      request: {
+        model: settings.model,
+        system: this.systemPrompt(agent, room),
+        temperature: settings.temperature,
+        apiKey,
+        baseUrl,
+      },
+      messages: history,
+      tools: this.hub.allTools(),
+      conversationId,
+      author: { id: agent.id, name: agent.name },
+      riskAction: this.risk?.action ?? 'allow',
+      remembered: (serverId, toolName) => this.options.db.getToolPreference(serverId, toolName) ?? undefined,
+      rememberAlways: (serverId, toolName) => this.options.db.setToolPreference(serverId, toolName, 'always'),
+      requestApproval: (request) => this.askApproval(request),
+      callTool: (tool, args) => this.hub.call(tool.serverId, tool.name, args),
+      persistMessage: (message) => {
+        this.options.db.insertMessage({
+          id: message.id,
+          conversationId,
+          role: 'assistant',
+          authorId: message.authorId,
+          authorName: message.authorName,
+          content: message.content,
+          createdAt: this.now(),
+        });
+      },
+      persistTool: (tool) => this.options.db.insertToolInvocation(tool),
+      emit: (event) => this.emit(event),
+    });
+  }
+
+  private askApproval(request: ApprovalRequest): Promise<ApprovalChoice> {
+    return new Promise((resolve) => {
+      this.approvals.set(request.id, resolve);
+      this.emit({ type: 'approval-required', request });
+    });
+  }
+
+  private systemPrompt(agent: AgentRow, room?: string): string {
+    const persona = agent.instructions ?? this.getInstructions().persona;
+    const risk = this.risk
+      ? renderRiskContext(this.risk, agent.nameFromBranding ? this.options.branding.agentName : agent.name)
+      : undefined;
+    return composeInstructions({
+      branding: { appName: this.options.branding.appName, agentName: agent.name },
+      enterprise: this.options.config.enterpriseInstructions,
+      persona,
+      user: this.getInstructions().user,
+      room,
+      risk,
+    });
+  }
+
+  private providerHistory(conversationId: string): ProviderMessage[] {
+    const history: ProviderMessage[] = [];
+    for (const message of this.options.db.listMessages(conversationId)) {
+      if (message.role === 'user') {
+        const attachments = message.attachments.flatMap((item) => {
+          const stored = this.options.db.getAttachment(item.id);
+          return stored ? [this.readAttachment(stored)] : [];
+        });
+        let content = message.content;
+        for (const attachment of attachments) {
+          if (attachment.text) {
+            content += `\n\n<untrusted-attachment name="${attachment.name}">\n${attachment.text}\n</untrusted-attachment>`;
+          } else {
+            content += `\n\n<untrusted-attachment name="${attachment.name}" mime="${attachment.mime}" />`;
+          }
+        }
+        history.push({ role: 'user', content, attachments });
+        continue;
+      }
+      if (message.role !== 'assistant') continue;
+      const toolCalls = message.tools.map((tool) => ({
+        id: tool.id,
+        name: toolKey(tool.serverId, tool.toolName),
+        arguments: JSON.stringify(tool.args ?? {}),
+      }));
+      history.push({ role: 'assistant', content: message.content, toolCalls });
+      for (const tool of message.tools) {
+        history.push({
+          role: 'tool',
+          toolCallId: tool.id,
+          name: toolKey(tool.serverId, tool.toolName),
+          content: tool.result ?? '',
+        });
+      }
+    }
+    return history;
+  }
+
+  private readAttachment(attachment: Attachment & { path: string }): {
+    name: string;
+    mime: string;
+    text?: string;
+    dataBase64?: string;
+  } {
+    const bytes = readFileSync(attachment.path);
+    if (attachment.mime.startsWith('image/') && bytes.byteLength < 1_500_000) {
+      return { name: attachment.name, mime: attachment.mime, dataBase64: bytes.toString('base64') };
+    }
+    if (attachment.mime.startsWith('text/') || attachment.mime === 'application/json') {
+      return { name: attachment.name, mime: attachment.mime, text: bytes.toString('utf8').slice(0, 32_000) };
+    }
+    return { name: attachment.name, mime: attachment.mime };
+  }
+
+  private async advance(flow: FlowSnapshot, signals: string): Promise<AppState> {
+    this.flow = flow;
+    if (flow.status === 'COMPLETED' || flow.authorizeResponse?.code) {
+      const username = flow.user?.username || 'user';
+      return this.completeLogin({
+        userId: flow.user?.id || `external:${username}`,
+        username,
+        signals,
+        mfaSatisfied: this.mfaSatisfied,
+        obtainTokens: async () => {
+          const code = await this.pi.authorizationCode(flow);
+          if (this.pkce && code.state && code.state !== this.pkce.state) {
+            throw new Error('The authorization response failed the state check.');
+          }
+          if (!this.pkce) throw new Error('The sign-in challenge is missing. Start again.');
+          return this.pi.exchangeCode({
+            code: code.code,
+            verifier: this.pkce.verifier,
+            redirectUri: this.options.config.tenant.redirectUri,
+          });
+        },
+      });
+    }
+    if (MFA_STATUSES.has(flow.status)) this.mfaSatisfied = false;
+    const view = this.viewForFlow(flow);
+    this.login = view;
+    return this.state();
+  }
+
+  private viewForFlow(flow: FlowSnapshot): LoginView {
+    if (flow.links['otp.check'] || MFA_STATUSES.has(flow.status)) {
+      return { phase: 'otp', status: flow.status, message: 'Enter the verification code from your organization.' };
+    }
+    if (flow.links['device.select']) {
+      return { phase: 'device', status: flow.status, devices: flow.devices, message: 'Choose a verification device.' };
+    }
+    if (flow.links['usernamePassword.check']) {
+      return { phase: 'credentials', status: flow.status };
+    }
+    return {
+      phase: 'error',
+      status: flow.status,
+      message: `This sign-in step is not supported yet (${flow.status || 'unknown status'}). Use the system browser fallback if it is enabled.`,
+    };
+  }
+
+  private async completeLogin(input: PendingLogin & { mfaSatisfied: boolean }): Promise<AppState> {
+    const risk = await this.evaluateRisk(input.userId, input.username, input.signals);
+    this.risk = risk;
+    this.options.db.setSetting('risk', JSON.stringify(risk));
+    if (risk.action === 'block') {
+      await this.markRisk('FAILED');
+      this.session = null;
+      await this.options.secrets.delete('session');
+      this.stepUpRequired = false;
+      this.login = { phase: 'blocked', message: risk.summary };
+      return this.state();
+    }
+    if (risk.action === 'step_up_mfa' && !input.mfaSatisfied) {
+      if (this.options.config.tenant.mode === 'mock') {
+        this.pendingLogin = input;
+        this.stepUpRequired = true;
+        this.login = {
+          phase: 'otp',
+          stepUp: true,
+          message: 'Step-up verification is required. In mock mode, enter any 6-digit code.',
+        };
+        return this.state();
+      }
+      if (this.stepUpRestarted || !this.options.config.tenant.login.stepUpAcrValues) {
+        this.login = {
+          phase: 'error',
+          stepUp: true,
+          message: this.options.config.tenant.login.stepUpAcrValues
+            ? 'The sign-on policy did not issue an MFA challenge. Update the PingOne sign-on policy so step-up has a real factor.'
+            : 'Risk policy requires step-up MFA. Set tenant.login.stepUpAcrValues and require that factor in the sign-on policy.',
+        };
+        this.stepUpRequired = true;
+        return this.state();
+      }
+      this.stepUpRestarted = true;
+      this.pkce = await createPkce();
+      this.mfaSatisfied = false;
+      this.flow = await this.pi.startAuthorize({
+        redirectUri: this.options.config.tenant.redirectUri,
+        scopes: this.options.config.tenant.scopes,
+        challenge: this.pkce.challenge,
+        state: this.pkce.state,
+        acrValues: this.options.config.tenant.login.stepUpAcrValues,
+        loginHint: input.username,
+      });
+      this.stepUpRequired = true;
+      this.login = { ...this.viewForFlow(this.flow), stepUp: true };
+      return this.state();
+    }
+    const tokens = await input.obtainTokens();
+    await this.activate(tokens, input.userId, input.username);
+    await this.markRisk('SUCCESS');
+    return this.state();
+  }
+
+  private async evaluateRisk(userId: string, username: string, signals: string): Promise<RiskView> {
+    const evaluatedAt = this.now();
+    if (!this.options.config.protect.enabled) {
+      return {
+        level: 'LOW',
+        action: 'allow',
+        reasons: [],
+        summary: 'Protect is turned off in enterprise config. No risk evaluation was run.',
+        signalsCollected: Boolean(signals),
+        evaluatedAt,
+      };
+    }
+    if (this.options.config.tenant.mode === 'mock') {
+      const payload = mockRiskPayload(this.scenario);
+      const reasons = extractRiskReasons(payload.details);
+      const action = decideRisk(this.options.config.protect.policy, payload.level, reasons);
+      return {
+        evaluationId: `mock-${randomId()}`,
+        level: payload.level,
+        action,
+        reasons,
+        summary: summarizeRisk(payload.level, action, reasons),
+        signalsCollected: Boolean(signals),
+        evaluatedAt,
+      };
+    }
+    const ip = await this.clientIp();
+    const worker = await this.workerAccessToken();
+    const evaluation = await createRiskEvaluation({
+      url: riskEvaluationsUrl(this.options.config),
+      accessToken: worker,
+      riskPolicySetId: this.options.config.protect.riskPolicySetId || undefined,
+      fetchImpl: this.options.fetchImpl,
+      event: buildRiskEvent({
+        ip,
+        userId,
+        username,
+        userType: this.options.config.protect.userType,
+        userAgent: `${this.options.branding.appName}/${this.options.version ?? '0.1.0'} (${process.platform})`,
+        targetId: this.options.config.tenant.clientId || 'desktop-agent',
+        targetName: this.options.branding.appName,
+        signals: signals || undefined,
+      }),
+    });
+    const reasons = extractRiskReasons(evaluation.details);
+    const level = riskLevel(evaluation.level);
+    const action = decideRisk(this.options.config.protect.policy, level, reasons);
+    return {
+      evaluationId: evaluation.id,
+      level,
+      action,
+      reasons,
+      summary: summarizeRisk(level, action, reasons),
+      signalsCollected: Boolean(signals),
+      evaluatedAt,
+    };
+  }
+
+  private async activate(tokens: TokenSet, userId: string, username: string): Promise<void> {
+    this.session = {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      idToken: tokens.idToken,
+      expiresAt: tokens.expiresAt,
+      tokenType: tokens.tokenType,
+      userId,
+      username,
+    };
+    await this.options.secrets.set('session', JSON.stringify(this.session));
+    this.login = { phase: 'idle' };
+    this.stepUpRequired = false;
+    this.pendingLogin = null;
+    this.flow = null;
+    this.stepUpRestarted = false;
+    await this.exchangeAudiences();
+  }
+
+  private async exchangeAudiences(): Promise<void> {
+    if (!this.session) return;
+    for (const audience of this.options.config.tokenExchange.audiences) {
+      try {
+        await this.tokenForAudience(audience.audience, audience.scope);
+        this.exchangeErrors.delete(audience.audience);
+      } catch (error) {
+        this.exchangeErrors.set(audience.audience, error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+
+  private async tokenForAudience(audience: string, scope: string): Promise<string> {
+    if (!this.session) throw new Error('Sign in before requesting an audience token.');
+    if (this.options.config.tenant.mode === 'mock') {
+      const cached = await this.cache.get(audience);
+      if (cached) return cached.accessToken;
+      const token = this.mockToken(this.session.userId, audience);
+      token.scope = scope;
+      await this.cache.put(audience, token);
+      return token.accessToken;
+    }
+    const subject = await this.subjectToken();
+    const clientId = this.env('PINGONE_WORKER_CLIENT_ID') || this.options.config.tokenExchange.clientId;
+    const clientSecret = await this.options.secrets.get('workerClientSecret');
+    if (!clientId || !clientSecret) {
+      throw new Error('Configure the worker client id and secret used for token exchange.');
+    }
+    const token = await getOrExchange({
+      cache: this.cache,
+      tokenEndpoint: tokenEndpoint(this.options.config),
+      subjectToken: subject,
+      audience,
+      scope,
+      clientId,
+      clientSecret,
+      fetchImpl: this.options.fetchImpl,
+      now: () => this.now(),
+    });
+    return token.accessToken;
+  }
+
+  private async subjectToken(): Promise<string> {
+    if (!this.session) throw new Error('Sign in again.');
+    const freshness = classifyAccessToken(this.session, this.now());
+    if (freshness === 'valid') return this.session.accessToken;
+    if (freshness === 'refresh' && this.session.refreshToken && this.options.config.tenant.mode === 'pingone') {
+      const next = await this.pi.refresh(this.session.refreshToken);
+      this.session = {
+        ...this.session,
+        accessToken: next.accessToken,
+        refreshToken: next.refreshToken ?? this.session.refreshToken,
+        idToken: next.idToken ?? this.session.idToken,
+        expiresAt: next.expiresAt,
+        tokenType: next.tokenType,
+      };
+      await this.options.secrets.set('session', JSON.stringify(this.session));
+      return this.session.accessToken;
+    }
+    this.session = null;
+    await this.options.secrets.delete('session');
+    throw new Error('Your sign-in expired. Sign in again.');
+  }
+
+  private async workerAccessToken(): Promise<string> {
+    if (this.workerToken && classifyAccessToken(this.workerToken, this.now()) === 'valid') {
+      return this.workerToken.accessToken;
+    }
+    const clientId = this.env('PINGONE_WORKER_CLIENT_ID') || this.options.config.tokenExchange.clientId;
+    const clientSecret = await this.options.secrets.get('workerClientSecret');
+    if (!clientId || !clientSecret) {
+      throw new Error('Configure the worker client id and secret used for Protect and token exchange.');
+    }
+    this.workerToken = await fetchClientCredentials({
+      tokenEndpoint: tokenEndpoint(this.options.config),
+      clientId,
+      clientSecret,
+      fetchImpl: this.options.fetchImpl,
+      now: () => this.now(),
+    });
+    return this.workerToken.accessToken;
+  }
+
+  private async clientIp(): Promise<string> {
+    if (this.options.config.protect.reportedIp) return this.options.config.protect.reportedIp;
+    if (this.options.config.protect.resolvePublicIp) return resolvePublicIp(this.options.fetchImpl);
+    throw new Error('Set protect.reportedIp or protect.resolvePublicIp so risk evaluation has a client IP.');
+  }
+
+  private async markRisk(status: 'SUCCESS' | 'FAILED'): Promise<void> {
+    if (this.options.config.tenant.mode !== 'pingone' || !this.risk?.evaluationId) return;
+    try {
+      const accessToken = await this.workerAccessToken();
+      await updateRiskEvaluation({
+        url: riskEvaluationsUrl(this.options.config, this.risk.evaluationId),
+        accessToken,
+        completionStatus: status,
+        fetchImpl: this.options.fetchImpl,
+      });
+    } catch (error) {
+      this.emit({
+        type: 'error',
+        conversationId: '',
+        message: redactSecrets(error instanceof Error ? error.message : String(error)),
+      });
+    }
+  }
+
+  private mockToken(userId: string, audience = 'user'): TokenSet {
+    const expiresAt = this.now() + 8 * 60 * 60 * 1000;
+    const accessToken = `${encodeJsonSegment({ alg: 'none', typ: 'mock' })}.${encodeJsonSegment({
+      sub: userId,
+      aud: audience,
+      exp: Math.floor(expiresAt / 1000),
+      mock: true,
+    })}.mock`;
+    return { accessToken, expiresAt, tokenType: 'Bearer' };
+  }
+
+  private async restoreSession(): Promise<void> {
+    const raw = await this.options.secrets.get('session');
+    if (!raw) return;
+    const stored = JSON.parse(raw) as StoredSession;
+    const freshness = classifyAccessToken(stored, this.now());
+    if (freshness === 'reauth') {
+      await this.options.secrets.delete('session');
+      return;
+    }
+    if (freshness === 'refresh') {
+      if (this.options.config.tenant.mode !== 'pingone' || !stored.refreshToken) {
+        await this.options.secrets.delete('session');
+        return;
+      }
+      try {
+        const next = await this.pi.refresh(stored.refreshToken);
+        stored.accessToken = next.accessToken;
+        stored.refreshToken = next.refreshToken ?? stored.refreshToken;
+        stored.expiresAt = next.expiresAt;
+        await this.options.secrets.set('session', JSON.stringify(stored));
+      } catch {
+        await this.options.secrets.delete('session');
+        return;
+      }
+    }
+    this.session = stored;
+    const riskRaw = this.options.db.getSetting('risk');
+    if (riskRaw) {
+      try {
+        this.risk = JSON.parse(riskRaw) as RiskView;
+      } catch {
+        this.risk = null;
+      }
+    }
+    await this.exchangeAudiences();
+  }
+
+  private async hydrateSecrets(): Promise<void> {
+    await this.copyEnvSecret('workerClientSecret', 'PINGONE_WORKER_CLIENT_SECRET');
+    await this.copyEnvSecret('openaiApiKey', 'OPENAI_API_KEY');
+    await this.copyEnvSecret('anthropicApiKey', 'ANTHROPIC_API_KEY');
+    await this.copyEnvSecret('genericApiKey', 'GENERIC_PROVIDER_API_KEY');
+  }
+
+  private async copyEnvSecret(account: string, envName: string): Promise<void> {
+    const value = this.env(envName);
+    if (!value) return;
+    if (await this.options.secrets.get(account)) return;
+    await this.options.secrets.set(account, value);
+  }
+
+  private async maybeSecret(account: string, value: string | undefined, clear: boolean | undefined): Promise<void> {
+    if (clear) {
+      await this.options.secrets.delete(account);
+      return;
+    }
+    if (value && value.trim()) await this.options.secrets.set(account, value.trim());
+  }
+
+  private async apiKey(provider: ProviderId): Promise<string | undefined> {
+    if (provider === 'openai') return (await this.options.secrets.get('openaiApiKey')) ?? undefined;
+    if (provider === 'anthropic') return (await this.options.secrets.get('anthropicApiKey')) ?? undefined;
+    if (provider === 'generic') return (await this.options.secrets.get('genericApiKey')) ?? undefined;
+    return undefined;
+  }
+
+  private seed(): void {
+    if (this.options.db.getSetting('seeded') === '1') return;
+    const config = this.options.config;
+    const agents = config.agents.length
+      ? config.agents
+      : [{ id: 'default', nameFromBranding: true, provider: config.provider.default, model: 'mock-1' as const }];
+    for (const agent of agents) {
+      const name = agent.nameFromBranding ? this.options.branding.agentName : agent.name || 'Agent';
+      this.options.db.upsertAgent({
+        id: agent.id,
+        name,
+        provider: agent.provider,
+        model: agent.model,
+        nameFromBranding: Boolean(agent.nameFromBranding),
+        instructions: agent.instructions ?? null,
+      });
+    }
+    for (const room of config.rooms) {
+      this.options.db.upsertRoom({ ...room, createdAt: this.now() });
+    }
+    for (const server of config.mcpServers) {
+      this.options.db.upsertMcpServer({
+        id: server.id,
+        name: server.name,
+        transport: server.transport,
+        command: server.command ?? '',
+        args: server.args ?? [],
+        url: server.url ?? '',
+        audience: server.audience ?? '',
+        scope: server.scope ?? '',
+        enabled: true,
+      });
+    }
+    for (const routine of config.routines) {
+      this.options.db.upsertRoutine({ ...routine, createdAt: this.now(), lastFiredMinute: null });
+    }
+    this.options.db.setSetting('provider', config.provider.default);
+    this.options.db.setSetting('model', defaultModelFor(config.provider.default, config.provider));
+    this.options.db.setSetting('temperature', String(config.provider.temperature));
+    this.options.db.setSetting('openaiBaseUrl', config.provider.openaiBaseUrl);
+    this.options.db.setSetting('anthropicBaseUrl', config.provider.anthropicBaseUrl);
+    this.options.db.setSetting('genericBaseUrl', config.provider.genericBaseUrl);
+    this.options.db.setSetting('seeded', '1');
+  }
+
+  private syncBrandedAgents(): void {
+    for (const agent of this.options.db.listAgents()) {
+      if (agent.nameFromBranding && agent.name !== this.options.branding.agentName) {
+        this.options.db.upsertAgent({ ...agent, name: this.options.branding.agentName });
+      }
+    }
+    const persona = fillTemplate(this.options.branding.persona.persona, this.options.branding);
+    if (this.options.db.getSetting('personaCustomized') !== '1' && persona) {
+      this.options.db.setInstructions('persona', this.options.branding.persona);
+    }
+  }
+
+  private defaultAgent(): AgentRow {
+    const agents = this.options.db.listAgents();
+    const branded = agents.find((agent) => agent.nameFromBranding);
+    const agent = branded ?? agents[0];
+    if (!agent) throw new Error('No agent is configured.');
+    return agent;
+  }
+
+  private requireSession(): void {
+    if (!this.session || this.stepUpRequired) throw new Error('Sign in to continue.');
+  }
+
+  private sessionView(): SessionView | null {
+    if (!this.session || this.stepUpRequired) return null;
+    return {
+      userId: this.session.userId,
+      username: this.session.username,
+      expiresAt: this.session.expiresAt,
+    };
+  }
+
+  private serverView(server: McpServerRow): McpServerView {
+    const tools = this.hub.tools(server.id);
+    return {
+      ...server,
+      status: this.hub.status(server.id),
+      error: this.hub.error(server.id) ?? this.exchangeErrors.get(server.audience),
+      tools: tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        readOnlyHint: tool.readOnlyHint,
+      })),
+    };
+  }
+}
+
+function emptyFields(): InstructionFields {
+  return { persona: '', communicationStyle: '', autonomy: '', safety: '', untrustedContent: '' };
+}
+
+function parseArgs(value: string): string[] {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  if (trimmed.includes('\n')) return trimmed.split('\n').map((line) => line.trim()).filter(Boolean);
+  return trimmed.split(/\s+/);
+}
+
+function stringClaim(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
