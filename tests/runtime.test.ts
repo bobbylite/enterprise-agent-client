@@ -15,6 +15,7 @@ async function boot(
   patch?: (config: ReturnType<typeof parseEnterpriseConfig>) => void,
   fetchImpl?: typeof fetch,
   secrets = new MemorySecretStore(),
+  env?: Record<string, string | undefined>,
 ) {
   const rawBranding = JSON.parse(readFileSync('branding/default.json', 'utf8')) as Record<string, unknown>;
   const branding = parseBranding(
@@ -36,6 +37,7 @@ async function boot(
     mockDelayMs: delayMs,
     emit: (event) => events.push(event),
     fetchImpl,
+    env,
   });
   return { runtime, events, db };
 }
@@ -143,6 +145,39 @@ describe('mock runtime', () => {
     expect(second).not.toBe(first);
     expect(JSON.stringify(refreshed)).not.toContain(second);
     expect(refreshed.aud).toBe('https://mcp.local.echo');
+  });
+
+  it('stores the AI Agent secret from the environment and from settings', async () => {
+    const secrets = new MemorySecretStore();
+    const { runtime } = await boot(0, undefined, undefined, secrets, {
+      PINGONE_AGENT_CLIENT_SECRET: 'agent-from-env',
+      PINGONE_WORKER_CLIENT_SECRET: 'worker-from-env',
+    });
+    const view = await runtime.getSettingsAsync();
+    expect(view.keys.agent).toBe(true);
+    expect(view.keys.worker).toBe(true);
+    expect(await secrets.get('agentClientSecret')).toBe('agent-from-env');
+    const saved = await runtime.saveSettings({
+      provider: view.provider,
+      model: view.model,
+      temperature: view.temperature,
+      openaiBaseUrl: view.openaiBaseUrl,
+      anthropicBaseUrl: view.anthropicBaseUrl,
+      genericBaseUrl: view.genericBaseUrl,
+      agentClientSecret: 'typed-agent',
+    });
+    expect(saved.keys.agent).toBe(true);
+    expect(await secrets.get('agentClientSecret')).toBe('typed-agent');
+  });
+
+  it('puts an act claim on mock audience tokens when delegation is on', async () => {
+    const { runtime } = await boot(0, (config) => {
+      config.tokenExchange.delegation = true;
+      config.tokenExchange.clientId = 'agent-id';
+    });
+    await runtime.submitCredentials('ada', 'secret', '');
+    const exchanged = (await runtime.listInspectedTokens()).find((item) => item.id === 'echo-local');
+    expect(exchanged?.act).toEqual({ sub: 'agent-id' });
   });
 
   it('hides token inspection when the admin flag is off', async () => {
@@ -260,7 +295,119 @@ describe('pi.flow runtime', () => {
     expect(signedIn.session?.username).toBe('ada');
     expect(events[0]?.ip).toBeUndefined();
   });
+
+  it('exchanges with the AI Agent client and keeps Protect on the worker', async () => {
+    const grants = await captureGrants({ delegation: false });
+    const exchanged = grants.filter((grant) => grant.grant.includes('token-exchange'));
+    const credentials = grants.filter((grant) => grant.grant === 'client_credentials');
+    expect(exchanged).toHaveLength(1);
+    expect(exchanged[0]?.basic).toBe('agent-id:agent-secret');
+    expect(exchanged[0]?.actor).toBeUndefined();
+    expect(credentials.map((grant) => grant.basic)).toContain('worker-id:worker-secret');
+    expect(credentials.some((grant) => grant.basic.startsWith('agent-id:'))).toBe(false);
+  });
+
+  it('falls back to the worker client when the AI Agent secret is absent', async () => {
+    const grants = await captureGrants({ delegation: false, agentSecret: false });
+    const exchanged = grants.filter((grant) => grant.grant.includes('token-exchange'));
+    expect(exchanged).toHaveLength(1);
+    expect(exchanged[0]?.basic).toBe('worker-id:worker-secret');
+  });
+
+  it('sends the AI Agent client-credentials token as actor_token when delegation is on', async () => {
+    const grants = await captureGrants({ delegation: true });
+    const exchanged = grants.find((grant) => grant.grant.includes('token-exchange'));
+    const actor = grants.find((grant) => grant.grant === 'client_credentials' && grant.basic === 'agent-id:agent-secret');
+    const worker = grants.find((grant) => grant.grant === 'client_credentials' && grant.basic === 'worker-id:worker-secret');
+    expect(actor?.accessToken).toBe('agent-actor-token');
+    expect(worker?.accessToken).toBe('worker-cc-token');
+    expect(exchanged?.basic).toBe('agent-id:agent-secret');
+    expect(exchanged?.actor).toBe('agent-actor-token');
+  });
 });
+
+async function captureGrants(input: { delegation: boolean; agentSecret?: boolean }): Promise<TokenGrant[]> {
+  const grants: TokenGrant[] = [];
+  const secrets = new MemorySecretStore();
+  await secrets.set('workerClientSecret', 'worker-secret');
+  if (input.agentSecret !== false) await secrets.set('agentClientSecret', 'agent-secret');
+  const { runtime } = await boot(
+    0,
+    (config) => {
+      config.tenant.mode = 'pingone';
+      config.tenant.authHost = 'https://auth.example';
+      config.tenant.apiHost = 'https://api.example';
+      config.tenant.environmentId = 'env-1';
+      config.tenant.clientId = 'public-client';
+      config.tokenExchange.clientId = 'agent-id';
+      config.tokenExchange.delegation = input.delegation;
+      config.tokenExchange.audiences = [{ id: 'echo', audience: 'https://mcp.example', scope: 'mcp:tools' }];
+      config.protect.enabled = true;
+      config.protect.reportedIp = '203.0.113.9';
+      config.protect.resolvePublicIp = false;
+    },
+    tokenFetch(grants),
+    secrets,
+    { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+  );
+  const signedIn = await runtime.submitCredentials('ada', 'secret', '');
+  expect(signedIn.session?.username).toBe('ada');
+  return grants;
+}
+
+interface TokenGrant {
+  grant: string;
+  basic: string;
+  actor?: string;
+  accessToken: string;
+}
+
+function tokenFetch(grants: TokenGrant[]): typeof fetch {
+  let state = '';
+  return async (url, init) => {
+    const target = String(url);
+    const method = init?.method ?? 'GET';
+    if (target.includes('/as/authorize')) {
+      state = new URL(target).searchParams.get('state') ?? '';
+      return json(200, {
+        id: 'flow-1',
+        status: 'USERNAME_PASSWORD_REQUIRED',
+        _links: { 'usernamePassword.check': { href: 'https://auth.example/env-1/flows/flow-1' } },
+      });
+    }
+    if (target.includes('/flows/')) {
+      return json(200, {
+        id: 'flow-1',
+        status: 'COMPLETED',
+        authorizeResponse: { code: 'auth-code', state },
+        _embedded: { user: { id: 'user-1', username: 'ada' } },
+      });
+    }
+    if (target.includes('/as/token')) {
+      const body = new URLSearchParams(String(init?.body));
+      const grant = body.get('grant_type') ?? '';
+      const authorization = new Headers(init?.headers).get('authorization') ?? '';
+      const basic = authorization.startsWith('Basic ')
+        ? Buffer.from(authorization.slice(6), 'base64').toString('utf8')
+        : '';
+      const accessToken =
+        grant === 'client_credentials'
+          ? basic.startsWith('agent-id:')
+            ? 'agent-actor-token'
+            : 'worker-cc-token'
+          : grant.includes('token-exchange')
+            ? 'exchanged-token'
+            : 'user-token';
+      grants.push({ grant, basic, actor: body.get('actor_token') ?? undefined, accessToken });
+      return json(200, { access_token: accessToken, expires_in: 3600, token_type: 'Bearer' });
+    }
+    if (target.includes('/riskEvaluations') && method === 'POST') {
+      return json(200, { id: 'eval-1', result: { level: 'LOW' }, details: {} });
+    }
+    if (method === 'PUT') return new Response('', { status: 200 });
+    return json(500, { message: target });
+  };
+}
 
 function protectPatch(config: ReturnType<typeof parseEnterpriseConfig>): void {
   config.tenant.mode = 'pingone';

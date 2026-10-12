@@ -9,6 +9,7 @@ export function SettingsScreen({ state }: { state: AppState }) {
   const [anthropicApiKey, setAnthropicApiKey] = useState('');
   const [genericApiKey, setGenericApiKey] = useState('');
   const [workerClientSecret, setWorkerClientSecret] = useState('');
+  const [agentClientSecret, setAgentClientSecret] = useState('');
   const [message, setMessage] = useState('');
 
   useEffect(() => {
@@ -37,6 +38,7 @@ export function SettingsScreen({ state }: { state: AppState }) {
               anthropicApiKey: anthropicApiKey || undefined,
               genericApiKey: genericApiKey || undefined,
               workerClientSecret: workerClientSecret || undefined,
+              agentClientSecret: agentClientSecret || undefined,
             })
             .then((saved) => {
               setSettings(saved);
@@ -44,6 +46,7 @@ export function SettingsScreen({ state }: { state: AppState }) {
               setAnthropicApiKey('');
               setGenericApiKey('');
               setWorkerClientSecret('');
+              setAgentClientSecret('');
               setMessage('Saved.');
             })
             .catch((caught: unknown) => setMessage(caught instanceof Error ? caught.message : String(caught)));
@@ -97,8 +100,12 @@ export function SettingsScreen({ state }: { state: AppState }) {
           <input type="password" value={genericApiKey} placeholder="Leave blank to keep the stored key" onChange={(event) => setGenericApiKey(event.target.value)} />
         </Field>
         <Field label={`Worker client secret ${settings.keys.worker ? '(stored)' : '(not set)'}`}>
-          <input type="password" value={workerClientSecret} placeholder="Used for Protect and token exchange" onChange={(event) => setWorkerClientSecret(event.target.value)} />
+          <input type="password" value={workerClientSecret} placeholder="PingOne Protect only" onChange={(event) => setWorkerClientSecret(event.target.value)} />
         </Field>
+        <Field label={`AI Agent client secret ${settings.keys.agent ? '(stored)' : '(not set)'}`}>
+          <input type="password" value={agentClientSecret} placeholder="Token exchange (PINGONE_AGENT_CLIENT_SECRET)" onChange={(event) => setAgentClientSecret(event.target.value)} />
+        </Field>
+        <p className="muted">Protect uses the worker secret. Token exchange uses the AI Agent secret. If that secret is empty, exchange falls back to the worker.</p>
         {message ? <p className="notice">{message}</p> : null}
         <button className="primary" type="submit">
           Save settings
