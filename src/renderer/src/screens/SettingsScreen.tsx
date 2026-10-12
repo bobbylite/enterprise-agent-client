@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { AppState, ProviderId, SettingsView } from '@shared/types';
 import { Field } from '../components/Markdown';
+import { TokenInspector } from './TokenInspector';
 
 export function SettingsScreen({ state }: { state: AppState }) {
   const [settings, setSettings] = useState<SettingsView | null>(null);
@@ -103,6 +104,7 @@ export function SettingsScreen({ state }: { state: AppState }) {
           Save settings
         </button>
       </form>
+      {settings.tokenInspector ? <TokenInspector session={state.session} /> : null}
     </div>
   );
 }

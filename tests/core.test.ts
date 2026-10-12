@@ -6,7 +6,7 @@ import { PiFlowClient, signInStepMessage } from '../src/shared/auth/pi-flow';
 import { waitForLoopbackCode } from '../src/shared/auth/loopback';
 import { classifyAccessToken } from '../src/shared/auth/tokens';
 import { parseBranding } from '../src/shared/branding';
-import { parseEnterpriseConfig } from '../src/shared/config';
+import { parseEnterpriseConfig, tokenInspectorEnabled } from '../src/shared/config';
 import { composeInstructions } from '../src/shared/instructions/compose';
 import { choiceFromUser, previewApproval } from '../src/shared/mcp/approvals';
 import { renderRiskContext } from '../src/shared/protect/context';
@@ -27,6 +27,8 @@ import { assertValidCron, cronMatches } from '../src/shared/schedule/cron';
 import { AudienceTokenCache, exchangeSubjectToken } from '../src/shared/tokens/exchange';
 import { MemorySecretStore } from '../src/shared/secrets';
 import { parseEnv, redactSecrets } from '../src/shared/env';
+import { encodeJsonSegment } from '../src/shared/ids';
+import { inspectJwt } from '../src/shared/tokens/inspect';
 
 describe('branding', () => {
   it('requires an app name and does not invent one', () => {
@@ -596,6 +598,45 @@ describe('config safety', () => {
       EMPTY: '',
     });
     expect(redactSecrets('Authorization: Bearer abc.def')).toContain('[redacted]');
+  });
+
+  it('shows token claims in the inspector and keeps the raw jwt out of that view', () => {
+    const header = encodeJsonSegment({ alg: 'RS256', typ: 'JWT', kid: 'k1' });
+    const payload = encodeJsonSegment({
+      aud: 'https://mcp.example',
+      scope: 'mcp:tools',
+      sub: 'user-1',
+      act: { sub: 'worker' },
+      may_act: { sub: 'agent' },
+      iat: 1_700_000_000,
+      exp: 1_700_003_600,
+    });
+    const token = `${header}.${payload}.signaturevalue`;
+    const inspected = inspectJwt(token, 1_700_000_000_000);
+    expect(inspected.header).toMatchObject({ alg: 'RS256', kid: 'k1' });
+    expect(inspected).toMatchObject({
+      aud: 'https://mcp.example',
+      scope: 'mcp:tools',
+      sub: 'user-1',
+      act: { sub: 'worker' },
+      mayAct: { sub: 'agent' },
+      exp: 1_700_003_600,
+      iat: 1_700_000_000,
+      expiresInMs: 3_600_000,
+    });
+    expect(JSON.stringify(inspected)).not.toContain(token);
+    expect(redactSecrets(`leaked ${token}`)).toBe('leaked [redacted-jwt]');
+
+    const config = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')));
+    expect(config.tokenExchange.inspectTokens).toBe(true);
+    const omitted = structuredClone(config);
+    delete omitted.tokenExchange.inspectTokens;
+    expect(tokenInspectorEnabled(omitted, false)).toBe(true);
+    omitted.tenant.mode = 'pingone';
+    expect(tokenInspectorEnabled(omitted, false)).toBe(false);
+    expect(tokenInspectorEnabled(omitted, true)).toBe(true);
+    omitted.tokenExchange.inspectTokens = false;
+    expect(tokenInspectorEnabled(omitted, true)).toBe(false);
   });
 });
 

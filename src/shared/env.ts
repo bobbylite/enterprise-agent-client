@@ -21,5 +21,6 @@ export function parseEnv(text: string): Record<string, string> {
 export function redactSecrets(text: string): string {
   return text
     .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/g, 'Bearer [redacted]')
-    .replace(/("?(?:access_token|refresh_token|id_token|client_secret)"?\s*[:=]\s*")[^"]+/gi, '$1[redacted]');
+    .replace(/("?(?:access_token|refresh_token|id_token|client_secret)"?\s*[:=]\s*")[^"]+/gi, '$1[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\b/g, '[redacted-jwt]');
 }

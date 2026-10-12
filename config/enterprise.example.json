@@ -16,6 +16,7 @@
   },
   "tokenExchange": {
     "clientId": "",
+    "inspectTokens": true,
     "audiences": [
       {
         "id": "echo-local",

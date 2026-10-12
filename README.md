@@ -242,6 +242,8 @@ For each MCP server or downstream API that should receive an exchanged token:
 
 The exchange request is `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, with `subject_token` and `subject_token_type` / `requested_token_type` set to `urn:ietf:params:oauth:token-type:access_token`, plus `audience` and `scope`. Tokens are cached in the keychain until shortly before `expires_in`.
 
+Settings includes a **Tokens** inspector when `tokenExchange.inspectTokens` is true. If the flag is omitted, the inspector is on for mock mode and for an unpackaged dev launch, and off for a packaged PingOne build. Set it to `false` to hide the panel in an enterprise deployment. The panel lists the PingOne session token and each exchanged audience token, with the decoded header and the `aud`, `scope`, `sub`, `act`, `may_act`, `exp`, and `iat` claims, plus time to expiry. **Re-exchange now** refreshes the session token or discards the cached audience token and exchanges it again. The raw JWT stays hidden until **Reveal token**, and **Copy** is available only after that. Tokens are not written to logs.
+
 ### 4. Protect
 
 | Setting | Value |

@@ -40,6 +40,9 @@ const api: AgentBridge = {
   listRoutineRuns: (id) => ipcRenderer.invoke(Ipc.listRoutineRuns, id),
   getSettings: () => ipcRenderer.invoke(Ipc.getSettings),
   saveSettings: (input) => ipcRenderer.invoke(Ipc.saveSettings, input),
+  listTokens: () => ipcRenderer.invoke(Ipc.listTokens),
+  revealToken: (id) => ipcRenderer.invoke(Ipc.revealToken, id),
+  reexchangeToken: (id) => ipcRenderer.invoke(Ipc.reexchangeToken, id),
   onChatEvent: (listener) => {
     const wrapped = (_event: IpcRendererEvent, payload: ChatEvent) => listener(payload);
     ipcRenderer.on(Ipc.chatEvent, wrapped);

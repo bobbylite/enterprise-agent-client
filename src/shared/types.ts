@@ -242,6 +242,7 @@ export interface SettingsView {
   provider: ProviderId;
   model: string;
   temperature: number | null;
+  tokenInspector: boolean;
   openaiBaseUrl: string;
   anthropicBaseUrl: string;
   genericBaseUrl: string;
@@ -290,6 +291,25 @@ export type ChatEvent =
   | { type: 'approval-required'; request: ApprovalRequest }
   | { type: 'routine-finished'; run: RoutineRun };
 
+export interface InspectedToken {
+  id: string;
+  kind: 'session' | 'exchanged';
+  label: string;
+  audience: string | null;
+  present: boolean;
+  header: Record<string, unknown>;
+  aud: string | null;
+  scope: string | null;
+  sub: string | null;
+  act: unknown;
+  mayAct: unknown;
+  exp: number | null;
+  iat: number | null;
+  expiresAt: number | null;
+  expiresInMs: number | null;
+  error?: string;
+}
+
 export interface AgentBridge {
   getBranding(): Promise<Branding>;
   getState(): Promise<AppState>;
@@ -328,5 +348,8 @@ export interface AgentBridge {
   listRoutineRuns(id: string): Promise<RoutineRun[]>;
   getSettings(): Promise<SettingsView>;
   saveSettings(input: SettingsInput): Promise<SettingsView>;
+  listTokens(): Promise<InspectedToken[]>;
+  revealToken(id: string): Promise<string>;
+  reexchangeToken(id: string): Promise<InspectedToken>;
   onChatEvent(listener: (event: ChatEvent) => void): () => void;
 }

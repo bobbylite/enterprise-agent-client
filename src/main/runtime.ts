@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fillTemplate } from '@shared/branding';
 import type { EnterpriseConfig } from '@shared/config';
-import { riskEvaluationsUrl, tokenEndpoint } from '@shared/config';
+import { riskEvaluationsUrl, tokenEndpoint, tokenInspectorEnabled } from '@shared/config';
 import {
   MFA_STATUSES,
   PiFlowClient,
@@ -28,6 +28,7 @@ import { assertValidCron, cronMatches, minuteKey } from '@shared/schedule/cron';
 import type { SecretStore } from '@shared/secrets';
 import { AudienceTokenCache, fetchClientCredentials, getOrExchange } from '@shared/tokens/exchange';
 import { redactSecrets } from '@shared/env';
+import { inspectJwt } from '@shared/tokens/inspect';
 import type {
   AgentProfile,
   AppState,
@@ -53,6 +54,7 @@ import type {
   SessionView,
   SettingsInput,
   SettingsView,
+  InspectedToken,
 } from '@shared/types';
 import { Repository, type AgentRow, type McpServerRow } from './db';
 import { McpHub } from './mcp';
@@ -97,6 +99,7 @@ export interface RuntimeOptions {
   emit?: (event: ChatEvent) => void;
   mockDelayMs?: number;
   version?: string;
+  dev?: boolean;
 }
 
 const SCENARIOS: MockScenario[] = ['low', 'new_device', 'anomalous_location', 'impossible_travel', 'bot'];
@@ -619,6 +622,7 @@ export class Runtime {
       provider,
       model: this.options.db.getSetting('model') ?? defaultModelFor(provider, this.options.config.provider),
       temperature: storedTemperature(this.options.db.getSetting('temperature'), this.options.config.provider.temperature),
+      tokenInspector: this.inspectorEnabled(),
       openaiBaseUrl: this.options.db.getSetting('openaiBaseUrl') ?? this.options.config.provider.openaiBaseUrl,
       anthropicBaseUrl: this.options.db.getSetting('anthropicBaseUrl') ?? this.options.config.provider.anthropicBaseUrl,
       genericBaseUrl: this.options.db.getSetting('genericBaseUrl') ?? this.options.config.provider.genericBaseUrl,
@@ -657,6 +661,44 @@ export class Runtime {
     await this.maybeSecret('genericApiKey', input.genericApiKey, input.clearKeys?.includes('generic'));
     await this.maybeSecret('workerClientSecret', input.workerClientSecret, input.clearKeys?.includes('worker'));
     return this.getSettingsAsync();
+  }
+
+  async listInspectedTokens(): Promise<InspectedToken[]> {
+    this.assertInspector();
+    this.requireSession();
+    const tokens = [this.describeSession()];
+    for (const audience of this.options.config.tokenExchange.audiences) {
+      tokens.push(await this.describeAudience(audience));
+    }
+    return tokens;
+  }
+
+  async revealInspectedToken(id: string): Promise<string> {
+    this.assertInspector();
+    this.requireSession();
+    if (id === 'session') return this.session?.accessToken ?? '';
+    const audience = this.audienceById(id);
+    const cached = await this.cache.read(audience.audience);
+    if (!cached?.accessToken) throw new Error('That audience has no exchanged token yet.');
+    return cached.accessToken;
+  }
+
+  async reexchangeToken(id: string): Promise<InspectedToken> {
+    this.assertInspector();
+    this.requireSession();
+    if (id === 'session') {
+      await this.refreshSessionToken();
+      return this.describeSession();
+    }
+    const audience = this.audienceById(id);
+    await this.cache.delete(audience.audience);
+    this.exchangeErrors.delete(audience.audience);
+    try {
+      await this.tokenForAudience(audience.audience, audience.scope);
+    } catch (error) {
+      this.exchangeErrors.set(audience.audience, redactSecrets(error instanceof Error ? error.message : String(error)));
+    }
+    return this.describeAudience(audience);
   }
 
   async fireDueRoutines(date: Date): Promise<RoutineRun[]> {
@@ -1083,8 +1125,7 @@ export class Runtime {
     if (this.options.config.tenant.mode === 'mock') {
       const cached = await this.cache.get(audience);
       if (cached) return cached.accessToken;
-      const token = this.mockToken(this.session.userId, audience);
-      token.scope = scope;
+      const token = this.mockToken(this.session.userId, audience, scope);
       await this.cache.put(audience, token);
       return token.accessToken;
     }
@@ -1179,15 +1220,107 @@ export class Runtime {
     }
   }
 
-  private mockToken(userId: string, audience = 'user'): TokenSet {
+  private mockToken(userId: string, audience = 'user', scope?: string): TokenSet {
     const expiresAt = this.now() + 8 * 60 * 60 * 1000;
+    const tokenScope = scope ?? (audience === 'user' ? this.options.config.tenant.scopes.join(' ') : undefined);
     const accessToken = `${encodeJsonSegment({ alg: 'none', typ: 'mock' })}.${encodeJsonSegment({
       sub: userId,
       aud: audience,
+      scope: tokenScope,
+      iat: Math.floor(this.now() / 1000),
       exp: Math.floor(expiresAt / 1000),
+      jti: randomId(),
       mock: true,
     })}.mock`;
-    return { accessToken, expiresAt, tokenType: 'Bearer' };
+    return { accessToken, expiresAt, tokenType: 'Bearer', scope: tokenScope };
+  }
+
+  private inspectorEnabled(): boolean {
+    return tokenInspectorEnabled(this.options.config, this.options.dev ?? false);
+  }
+
+  private assertInspector(): void {
+    if (!this.inspectorEnabled()) throw new Error('Token inspection is turned off.');
+  }
+
+  private audienceById(id: string): EnterpriseConfig['tokenExchange']['audiences'][number] {
+    const audience = this.options.config.tokenExchange.audiences.find((item) => item.id === id);
+    if (!audience) throw new Error('That audience is not configured.');
+    return audience;
+  }
+
+  private describeSession(): InspectedToken {
+    const token = this.session?.accessToken ?? '';
+    return this.describeToken('session', 'session', 'PingOne session', null, token, this.session?.expiresAt);
+  }
+
+  private async describeAudience(
+    audience: EnterpriseConfig['tokenExchange']['audiences'][number],
+  ): Promise<InspectedToken> {
+    const cached = await this.cache.read(audience.audience);
+    const error = this.exchangeErrors.get(audience.audience);
+    return this.describeToken(
+      audience.id,
+      'exchanged',
+      audience.audience,
+      audience.audience,
+      cached?.accessToken ?? '',
+      cached?.expiresAt,
+      cached?.scope ?? audience.scope,
+      error ? redactSecrets(error) : cached ? undefined : 'This audience has not been exchanged yet.',
+    );
+  }
+
+  private describeToken(
+    id: string,
+    kind: InspectedToken['kind'],
+    label: string,
+    audience: string | null,
+    token: string,
+    expiresAt?: number,
+    scope?: string,
+    error?: string,
+  ): InspectedToken {
+    const inspected = token ? inspectJwt(token, this.now(), { scope, expiresAt }) : null;
+    return {
+      id,
+      kind,
+      label,
+      audience,
+      present: Boolean(token),
+      header: inspected?.header ?? {},
+      aud: inspected?.aud ?? null,
+      scope: inspected?.scope ?? scope ?? null,
+      sub: inspected?.sub ?? null,
+      act: inspected?.act ?? null,
+      mayAct: inspected?.mayAct ?? null,
+      exp: inspected?.exp ?? null,
+      iat: inspected?.iat ?? null,
+      expiresAt: inspected?.expiresAt ?? null,
+      expiresInMs: inspected?.expiresInMs ?? null,
+      error,
+    };
+  }
+
+  private async refreshSessionToken(): Promise<void> {
+    if (!this.session) throw new Error('Sign in to continue.');
+    if (this.options.config.tenant.mode === 'mock') {
+      const next = this.mockToken(this.session.userId);
+      this.session = { ...this.session, accessToken: next.accessToken, expiresAt: next.expiresAt, tokenType: next.tokenType };
+      await this.options.secrets.set('session', JSON.stringify(this.session));
+      return;
+    }
+    if (!this.session.refreshToken) throw new Error('This session has no refresh token. Sign in again to replace it.');
+    const next = await this.pi.refresh(this.session.refreshToken);
+    this.session = {
+      ...this.session,
+      accessToken: next.accessToken,
+      refreshToken: next.refreshToken ?? this.session.refreshToken,
+      idToken: next.idToken ?? this.session.idToken,
+      expiresAt: next.expiresAt,
+      tokenType: next.tokenType,
+    };
+    await this.options.secrets.set('session', JSON.stringify(this.session));
   }
 
   private async restoreSession(): Promise<void> {

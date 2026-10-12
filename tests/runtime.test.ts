@@ -115,6 +115,45 @@ describe('mock runtime', () => {
     expect(authors).toContain('Northstar');
     expect(authors).toContain('Reviewer');
   });
+
+  it('lists session and audience tokens and can re-exchange without returning the raw jwt', async () => {
+    const { runtime } = await boot();
+    await runtime.submitCredentials('ada', 'secret', '');
+    const listed = await runtime.listInspectedTokens();
+    const session = listed.find((item) => item.id === 'session');
+    const exchanged = listed.find((item) => item.id === 'echo-local');
+    expect(session).toMatchObject({ kind: 'session', aud: 'user', sub: 'mock:ada', present: true });
+    expect(session?.scope).toContain('openid');
+    expect(session?.header).toMatchObject({ alg: 'none', typ: 'mock' });
+    expect(session?.iat).toEqual(expect.any(Number));
+    expect(session?.expiresInMs).toBeGreaterThan(0);
+    expect(exchanged).toMatchObject({
+      kind: 'exchanged',
+      audience: 'https://mcp.local.echo',
+      aud: 'https://mcp.local.echo',
+      scope: 'mcp:tools',
+      sub: 'mock:ada',
+    });
+    const sessionJwt = await runtime.revealInspectedToken('session');
+    const first = await runtime.revealInspectedToken('echo-local');
+    expect(JSON.stringify(listed)).not.toContain(sessionJwt);
+    expect(JSON.stringify(listed)).not.toContain(first);
+    const refreshed = await runtime.reexchangeToken('echo-local');
+    const second = await runtime.revealInspectedToken('echo-local');
+    expect(second).not.toBe(first);
+    expect(JSON.stringify(refreshed)).not.toContain(second);
+    expect(refreshed.aud).toBe('https://mcp.local.echo');
+  });
+
+  it('hides token inspection when the admin flag is off', async () => {
+    const { runtime } = await boot(0, (config) => {
+      config.tokenExchange.inspectTokens = false;
+    });
+    await runtime.submitCredentials('ada', 'secret', '');
+    expect((await runtime.getSettingsAsync()).tokenInspector).toBe(false);
+    await expect(runtime.listInspectedTokens()).rejects.toThrow(/turned off/);
+    await expect(runtime.revealInspectedToken('session')).rejects.toThrow(/turned off/);
+  });
 });
 
 describe('pi.flow runtime', () => {
