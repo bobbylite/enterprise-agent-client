@@ -14,6 +14,13 @@ import { buildRiskEvent, resolvePublicIp } from '../src/shared/protect/evaluate'
 import { mockRiskPayload } from '../src/shared/protect/mock';
 import { decideRisk, summarizeRisk, unscoredRisk } from '../src/shared/protect/policy';
 import { extractRiskReasons } from '../src/shared/protect/reasons';
+import {
+  createOpenAiProvider,
+  isReasoningModel,
+  openAiChatBody,
+  REASONING_MAX_COMPLETION_TOKENS,
+  unsupportedParameters,
+} from '../src/shared/providers/openai';
 import { parseAnthropicData, parseOpenAiData } from '../src/shared/providers/sse';
 import { mockResult } from '../src/shared/providers/mock';
 import { assertValidCron, cronMatches } from '../src/shared/schedule/cron';
@@ -493,6 +500,87 @@ describe('cron and providers', () => {
       ],
     });
     expect(follow.content).toContain('HIGH');
+  });
+
+  it('omits temperature for gpt-5 and retries once when the API rejects it', async () => {
+    const request = {
+      model: 'gpt-5',
+      system: 'Be brief.',
+      messages: [{ role: 'user' as const, content: 'Hello' }],
+      tools: [],
+      temperature: 0.2,
+      reasoningEffort: 'medium' as const,
+      apiKey: 'test-key',
+    };
+    const body = openAiChatBody(request);
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBeUndefined();
+    expect(body.max_completion_tokens).toBe(REASONING_MAX_COMPLETION_TOKENS);
+    expect(body.reasoning_effort).toBe('medium');
+    expect(isReasoningModel('openai/o3-mini')).toBe(true);
+    expect(isReasoningModel('gpt-4o-mini')).toBe(false);
+    expect(openAiChatBody({ ...request, model: 'gpt-4o', reasoningEffort: undefined }).temperature).toBe(0.2);
+    expect(openAiChatBody({ ...request, model: 'gpt-4o', temperature: undefined, reasoningEffort: undefined }).temperature).toBeUndefined();
+    expect(
+      unsupportedParameters("Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported."),
+    ).toEqual(['temperature']);
+
+    const bodies: Record<string, unknown>[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(sent);
+      if (sent.temperature !== undefined) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: "Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported.",
+            },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'Hello' } }] })}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      );
+    };
+    const result = await createOpenAiProvider(fetchImpl).stream(
+      { ...request, model: 'gpt-4.1', reasoningEffort: undefined },
+      () => undefined,
+    );
+    expect(result.content).toBe('Hello');
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]?.temperature).toBe(0.2);
+    expect(bodies[1]?.temperature).toBeUndefined();
+
+    let calls = 0;
+    const failing: typeof fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { message: "Unsupported parameter: 'temperature'." } }), { status: 400 });
+    };
+    await expect(
+      createOpenAiProvider(failing).stream({ ...request, model: 'gpt-4.1', reasoningEffort: undefined }, () => undefined),
+    ).rejects.toThrow(/temperature/);
+    expect(calls).toBe(2);
+
+    const raw = JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')) as { provider: { temperature?: number } };
+    expect(raw.provider.temperature).toBeUndefined();
+    const configured = parseEnterpriseConfig({
+      ...JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')),
+      provider: {
+        default: 'openai',
+        openaiBaseUrl: 'https://api.openai.com/v1',
+        openaiModel: 'gpt-5',
+        anthropicBaseUrl: 'https://api.anthropic.com',
+        anthropicModel: 'claude-sonnet-4-5',
+        genericBaseUrl: '',
+        genericModel: 'default',
+        reasoningEffort: 'medium',
+      },
+    });
+    expect(configured.provider.openaiModel).toBe('gpt-5');
+    expect(configured.provider.reasoningEffort).toBe('medium');
+    expect(configured.provider.temperature).toBeUndefined();
   });
 });
 

@@ -68,10 +68,15 @@ export function SettingsScreen({ state }: { state: AppState }) {
             min={0}
             max={2}
             step={0.1}
-            value={settings.temperature}
-            onChange={(event) => setSettings({ ...settings, temperature: Number(event.target.value) })}
+            value={settings.temperature ?? ''}
+            placeholder="Model default"
+            onChange={(event) => {
+              const raw = event.target.value;
+              setSettings({ ...settings, temperature: raw === '' ? null : Number(raw) });
+            }}
           />
         </Field>
+        <p className="muted">Leave blank to omit temperature. gpt-5 and o-series models do not accept it.</p>
         <Field label="OpenAI-compatible base URL">
           <input value={settings.openaiBaseUrl} onChange={(event) => setSettings({ ...settings, openaiBaseUrl: event.target.value })} />
         </Field>

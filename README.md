@@ -166,6 +166,31 @@ Provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GENERIC_PROVIDER_API_KEY`
 
 The chat provider in this version is the global settings choice. Per-agent provider values are stored and are not yet what `speak()` uses.
 
+`provider.temperature` is optional. It is sent only when the config or the settings field contains a number. Leave it out to use the model default. Reasoning models (`gpt-5*` and the o-series, such as `o3` and `o4-mini`) never receive `temperature` or `top_p`. Those requests use `max_completion_tokens` and, when set, `provider.reasoningEffort` (`minimal`, `low`, `medium`, or `high`). If the API rejects an unsupported sampling parameter, the client retries that request once without it.
+
+### GPT-5
+
+Set the provider block and put the API key in the environment (it is copied into the OS keychain on launch when that account is empty) or paste it once in Settings:
+
+```json
+"provider": {
+  "default": "openai",
+  "openaiBaseUrl": "https://api.openai.com/v1",
+  "openaiModel": "gpt-5",
+  "anthropicBaseUrl": "https://api.anthropic.com",
+  "anthropicModel": "claude-sonnet-4-5",
+  "genericBaseUrl": "",
+  "genericModel": "default",
+  "reasoningEffort": "medium"
+}
+```
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+Do not set `temperature` for `gpt-5`. The model only accepts the default value.
+
 ## PingOne admin configuration
 
 Use two applications in the same environment. A public PKCE application cannot also be the confidential token-exchange client.

@@ -118,7 +118,8 @@ export const enterpriseConfigSchema = z.object({
     anthropicModel: z.string(),
     genericBaseUrl: z.string(),
     genericModel: z.string(),
-    temperature: z.number().min(0).max(2),
+    temperature: z.number().min(0).max(2).optional(),
+    reasoningEffort: z.enum(['minimal', 'low', 'medium', 'high']).optional(),
   }),
 });
 

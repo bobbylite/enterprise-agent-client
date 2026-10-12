@@ -112,7 +112,6 @@
     "anthropicBaseUrl": "https://api.anthropic.com",
     "anthropicModel": "claude-sonnet-4-5",
     "genericBaseUrl": "",
-    "genericModel": "default",
-    "temperature": 0.2
+    "genericModel": "default"
   }
 }

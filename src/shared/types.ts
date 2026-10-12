@@ -241,7 +241,7 @@ export interface InstructionEditorState {
 export interface SettingsView {
   provider: ProviderId;
   model: string;
-  temperature: number;
+  temperature: number | null;
   openaiBaseUrl: string;
   anthropicBaseUrl: string;
   genericBaseUrl: string;
@@ -256,7 +256,7 @@ export interface SettingsView {
 export interface SettingsInput {
   provider: ProviderId;
   model: string;
-  temperature: number;
+  temperature: number | null;
   openaiBaseUrl: string;
   anthropicBaseUrl: string;
   genericBaseUrl: string;

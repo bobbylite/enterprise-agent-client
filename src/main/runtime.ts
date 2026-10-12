@@ -618,7 +618,7 @@ export class Runtime {
     return {
       provider,
       model: this.options.db.getSetting('model') ?? defaultModelFor(provider, this.options.config.provider),
-      temperature: Number(this.options.db.getSetting('temperature') ?? this.options.config.provider.temperature),
+      temperature: storedTemperature(this.options.db.getSetting('temperature'), this.options.config.provider.temperature),
       openaiBaseUrl: this.options.db.getSetting('openaiBaseUrl') ?? this.options.config.provider.openaiBaseUrl,
       anthropicBaseUrl: this.options.db.getSetting('anthropicBaseUrl') ?? this.options.config.provider.anthropicBaseUrl,
       genericBaseUrl: this.options.db.getSetting('genericBaseUrl') ?? this.options.config.provider.genericBaseUrl,
@@ -643,10 +643,12 @@ export class Runtime {
   }
 
   async saveSettings(input: SettingsInput): Promise<SettingsView> {
-    if (input.temperature < 0 || input.temperature > 2) throw new Error('Temperature must be between 0 and 2.');
+    if (input.temperature != null && (!Number.isFinite(input.temperature) || input.temperature < 0 || input.temperature > 2)) {
+      throw new Error('Temperature must be between 0 and 2.');
+    }
     this.options.db.setSetting('provider', input.provider);
     this.options.db.setSetting('model', input.model.trim() || defaultModelFor(input.provider, this.options.config.provider));
-    this.options.db.setSetting('temperature', String(input.temperature));
+    this.options.db.setSetting('temperature', input.temperature == null ? '' : String(input.temperature));
     this.options.db.setSetting('openaiBaseUrl', input.openaiBaseUrl.trim());
     this.options.db.setSetting('anthropicBaseUrl', input.anthropicBaseUrl.trim());
     this.options.db.setSetting('genericBaseUrl', input.genericBaseUrl.trim());
@@ -767,7 +769,8 @@ export class Runtime {
       request: {
         model: settings.model,
         system: this.systemPrompt(agent, room),
-        temperature: settings.temperature,
+        temperature: settings.temperature ?? undefined,
+        reasoningEffort: this.options.config.provider.reasoningEffort,
         apiKey,
         baseUrl,
       },
@@ -1291,7 +1294,7 @@ export class Runtime {
     }
     this.options.db.setSetting('provider', config.provider.default);
     this.options.db.setSetting('model', defaultModelFor(config.provider.default, config.provider));
-    this.options.db.setSetting('temperature', String(config.provider.temperature));
+    this.options.db.setSetting('temperature', config.provider.temperature == null ? '' : String(config.provider.temperature));
     this.options.db.setSetting('openaiBaseUrl', config.provider.openaiBaseUrl);
     this.options.db.setSetting('anthropicBaseUrl', config.provider.anthropicBaseUrl);
     this.options.db.setSetting('genericBaseUrl', config.provider.genericBaseUrl);
@@ -1355,6 +1358,13 @@ function parseArgs(value: string): string[] {
   if (!trimmed) return [];
   if (trimmed.includes('\n')) return trimmed.split('\n').map((line) => line.trim()).filter(Boolean);
   return trimmed.split(/\s+/);
+}
+
+function storedTemperature(stored: string | null, configured: number | undefined): number | null {
+  if (stored == null) return configured ?? null;
+  if (stored.trim() === '') return null;
+  const value = Number(stored);
+  return Number.isFinite(value) ? value : null;
 }
 
 function stringClaim(value: unknown): string {
