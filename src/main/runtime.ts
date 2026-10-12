@@ -3,7 +3,14 @@ import { basename, join } from 'node:path';
 import { fillTemplate } from '@shared/branding';
 import type { EnterpriseConfig } from '@shared/config';
 import { riskEvaluationsUrl, tokenEndpoint } from '@shared/config';
-import { MFA_STATUSES, PiFlowClient, buildAuthorizeUrl, type FlowSnapshot } from '@shared/auth/pi-flow';
+import {
+  MFA_STATUSES,
+  PiFlowClient,
+  acceptsCredentialSubmit,
+  buildAuthorizeUrl,
+  signInStepMessage,
+  type FlowSnapshot,
+} from '@shared/auth/pi-flow';
 import { createPkce, type PkcePair } from '@shared/auth/pkce';
 import { waitForLoopbackCode } from '@shared/auth/loopback';
 import { classifyAccessToken, type TokenSet } from '@shared/auth/tokens';
@@ -192,7 +199,7 @@ export class Runtime {
         obtainTokens: async () => this.mockToken(`mock:${name}`),
       });
     }
-    if (!this.flow || !this.flow.links['usernamePassword.check']) {
+    if (!this.flow || !acceptsCredentialSubmit(this.flow)) {
       this.pkce = await createPkce();
       this.mfaSatisfied = false;
       this.flow = await this.pi.startAuthorize({
@@ -202,7 +209,8 @@ export class Runtime {
         state: this.pkce.state,
       });
     }
-    const next = await this.pi.submitUsernamePassword(this.flow, name, password);
+    if (!acceptsCredentialSubmit(this.flow)) return this.advance(this.flow, signals);
+    const next = await this.pi.submitCredentials(this.flow, name, password);
     return this.advance(next, signals);
   }
 
@@ -866,7 +874,12 @@ export class Runtime {
 
   private async advance(flow: FlowSnapshot, signals: string): Promise<AppState> {
     this.flow = flow;
-    if (flow.status === 'COMPLETED' || flow.authorizeResponse?.code) {
+    const finished = flow.status === 'COMPLETED' || flow.status === 'COMPLETED_ACCEPTED' || Boolean(flow.authorizeResponse?.code);
+    if (finished && !flow.authorizeResponse?.code && !flow.resumeUrl) {
+      this.login = { phase: 'error', status: flow.status, message: signInStepMessage(flow) };
+      return this.state();
+    }
+    if (finished) {
       const username = flow.user?.username || 'user';
       return this.completeLogin({
         userId: flow.user?.id || `external:${username}`,
@@ -894,20 +907,23 @@ export class Runtime {
   }
 
   private viewForFlow(flow: FlowSnapshot): LoginView {
-    if (flow.links['otp.check'] || MFA_STATUSES.has(flow.status)) {
+    if (
+      flow.status === 'PUSH_CONFIRMATION_REQUIRED' ||
+      flow.status === 'PUSH_CONFIRMATION_TIMED_OUT' ||
+      flow.status === 'ASSERTION_REQUIRED'
+    ) {
+      return { phase: 'error', status: flow.status, message: signInStepMessage(flow) };
+    }
+    if (flow.links['otp.check'] || flow.status === 'OTP_REQUIRED' || flow.status === 'MFA_REQUIRED') {
       return { phase: 'otp', status: flow.status, message: 'Enter the verification code from your organization.' };
     }
-    if (flow.links['device.select']) {
+    if (flow.links['device.select'] || flow.status === 'DEVICE_SELECTION_REQUIRED') {
       return { phase: 'device', status: flow.status, devices: flow.devices, message: 'Choose a verification device.' };
     }
-    if (flow.links['usernamePassword.check']) {
+    if (acceptsCredentialSubmit(flow)) {
       return { phase: 'credentials', status: flow.status };
     }
-    return {
-      phase: 'error',
-      status: flow.status,
-      message: `This sign-in step is not supported yet (${flow.status || 'unknown status'}). Use the system browser fallback if it is enabled.`,
-    };
+    return { phase: 'error', status: flow.status, message: signInStepMessage(flow) };
   }
 
   private async completeLogin(input: PendingLogin & { mfaSatisfied: boolean }): Promise<AppState> {

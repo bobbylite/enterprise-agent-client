@@ -2,16 +2,39 @@ import type { LoginDevice } from '../types';
 import { readTokenResponse, type TokenSet } from './tokens';
 
 const USERNAME_PASSWORD = 'application/vnd.pingidentity.usernamePassword.check+json';
+const USER_LOOKUP = 'application/vnd.pingidentity.user.lookup+json';
+const USERNAME_CHECK = 'application/vnd.pingidentity.username.check+json';
 const OTP_CHECK = 'application/vnd.pingidentity.otp.check+json';
 const DEVICE_SELECT = 'application/vnd.pingidentity.device.select+json';
+
+const IDENTIFIER_STATUSES = new Set(['SIGN_ON_REQUIRED', 'IDENTIFIER_REQUIRED', 'USERNAME_REQUIRED']);
+const PASSWORD_STATUSES = new Set(['USERNAME_PASSWORD_REQUIRED', 'PASSWORD_REQUIRED']);
 
 export const MFA_STATUSES = new Set([
   'OTP_REQUIRED',
   'ASSERTION_REQUIRED',
   'PUSH_CONFIRMATION_REQUIRED',
+  'PUSH_CONFIRMATION_TIMED_OUT',
   'MFA_REQUIRED',
   'VERIFICATION_CODE_REQUIRED',
 ]);
+
+export function acceptsCredentialSubmit(flow: FlowSnapshot): boolean {
+  return passwordStep(flow) || identifierStep(flow) !== null;
+}
+
+function passwordStep(flow: FlowSnapshot): boolean {
+  return Boolean(flow.links['usernamePassword.check']) || (PASSWORD_STATUSES.has(flow.status) && Boolean(flow.id || flow.links.self));
+}
+
+function identifierStep(flow: FlowSnapshot): { link: 'user.lookup' | 'username.check'; mediaType: string } | null {
+  if (flow.links['user.lookup']) return { link: 'user.lookup', mediaType: USER_LOOKUP };
+  if (flow.links['username.check']) return { link: 'username.check', mediaType: USERNAME_CHECK };
+  if (IDENTIFIER_STATUSES.has(flow.status) && (flow.id || flow.links.self)) {
+    return { link: 'user.lookup', mediaType: USER_LOOKUP };
+  }
+  return null;
+}
 
 export interface FlowSnapshot {
   id: string;
@@ -69,15 +92,43 @@ export class PiFlowClient {
   }
 
   async submitUsernamePassword(flow: FlowSnapshot, username: string, password: string): Promise<FlowSnapshot> {
-    return this.postAction(flow, 'usernamePassword.check', USERNAME_PASSWORD, { username, password });
+    return this.postPassword(flow, username, password);
+  }
+
+  /**
+   * Posts the action the current status actually offers.
+   * Identifier-first policies return SIGN_ON_REQUIRED (or IDENTIFIER_REQUIRED)
+   * with user.lookup, then PASSWORD_REQUIRED with usernamePassword.check.
+   * The password is posted only after that second status appears.
+   */
+  async submitCredentials(flow: FlowSnapshot, username: string, password: string): Promise<FlowSnapshot> {
+    if (passwordStep(flow)) return this.postPassword(flow, username, password);
+    const identifier = identifierStep(flow);
+    if (!identifier) throw new Error(rejectedStep(flow, 'usernamePassword.check'));
+    const identified = await this.postAction(
+      flow,
+      identifier.link,
+      identifier.mediaType,
+      { username },
+      !flow.links[identifier.link],
+    );
+    if (!passwordStep(identified)) return identified;
+    return this.postPassword(identified, username, password);
   }
 
   async submitOtp(flow: FlowSnapshot, otp: string): Promise<FlowSnapshot> {
-    return this.postAction(flow, 'otp.check', OTP_CHECK, { otp });
+    const implied = flow.status === 'OTP_REQUIRED' || flow.status === 'MFA_REQUIRED';
+    return this.postAction(flow, 'otp.check', OTP_CHECK, { otp }, !flow.links['otp.check'] && implied);
   }
 
   async selectDevice(flow: FlowSnapshot, deviceId: string): Promise<FlowSnapshot> {
-    return this.postAction(flow, 'device.select', DEVICE_SELECT, { device: { id: deviceId } });
+    return this.postAction(
+      flow,
+      'device.select',
+      DEVICE_SELECT,
+      { device: { id: deviceId } },
+      !flow.links['device.select'] && flow.status === 'DEVICE_SELECTION_REQUIRED',
+    );
   }
 
   async authorizationCode(flow: FlowSnapshot): Promise<{ code: string; state?: string }> {
@@ -142,14 +193,27 @@ export class PiFlowClient {
     return readTokenResponse(parsed, this.now());
   }
 
+  private postPassword(flow: FlowSnapshot, username: string, password: string): Promise<FlowSnapshot> {
+    if (!passwordStep(flow)) throw new Error(rejectedStep(flow, 'usernamePassword.check'));
+    return this.postAction(
+      flow,
+      'usernamePassword.check',
+      USERNAME_PASSWORD,
+      { username, password },
+      !flow.links['usernamePassword.check'],
+    );
+  }
+
   private async postAction(
     flow: FlowSnapshot,
     link: string,
     contentType: string,
     payload: unknown,
+    allowCanonical = false,
   ): Promise<FlowSnapshot> {
-    const href = flow.links[link];
-    if (!href) throw new Error(`This sign-in step does not accept ${link}.`);
+    const raw = flow.links[link];
+    const href = raw ? this.absolute(raw) : allowCanonical ? this.canonical(flow) : '';
+    if (!href) throw new Error(rejectedStep(flow, link));
     return this.readFlow(
       await this.request(href, {
         method: 'POST',
@@ -159,15 +223,28 @@ export class PiFlowClient {
     );
   }
 
+  private canonical(flow: FlowSnapshot): string {
+    if (flow.id) return `${this.base()}/flows/${flow.id}`;
+    return flow.links.self ? this.absolute(flow.links.self) : '';
+  }
+
+  private absolute(href: string): string {
+    if (/^https?:\/\//i.test(href)) return href;
+    return new URL(href, `${this.options.authHost.replace(/\/$/, '')}/`).toString();
+  }
+
   private readFlow(response: HttpText): FlowSnapshot {
     const body = response.text ? (JSON.parse(response.text) as Record<string, unknown>) : {};
     if (response.status >= 400 || (typeof body.code === 'string' && typeof body.message === 'string' && !body.status)) {
       throw new Error(errorMessage(body, response.status));
     }
     const links: Record<string, string> = {};
-    const linkBag = (body._links ?? {}) as Record<string, { href?: string }>;
+    const linkBag = (body._links ?? {}) as Record<string, unknown>;
     for (const [key, value] of Object.entries(linkBag)) {
-      if (value && typeof value.href === 'string') links[key] = value.href;
+      if (typeof value === 'string' && value) links[key] = value;
+      else if (value && typeof value === 'object' && typeof (value as { href?: unknown }).href === 'string') {
+        links[key] = (value as { href: string }).href;
+      }
     }
     const embedded = (body._embedded ?? {}) as {
       user?: { id?: string; username?: string };
@@ -224,6 +301,48 @@ interface HttpText {
   status: number;
   headers: Headers;
   text: string;
+}
+
+export function signInStepMessage(flow: FlowSnapshot): string {
+  const status = flow.status || 'unknown status';
+  switch (flow.status) {
+    case 'EXTERNAL_AUTHENTICATION_REQUIRED':
+      return `This sign-on policy continues at an external identity provider (${status}). Use the system browser to finish sign-in.`;
+    case 'PUSH_CONFIRMATION_REQUIRED':
+    case 'PUSH_CONFIRMATION_TIMED_OUT':
+      return `This sign-on policy is waiting for a push confirmation (${status}). Use the system browser to finish sign-in.`;
+    case 'ASSERTION_REQUIRED':
+      return `This sign-on policy requires a security key or biometric (${status}). Use the system browser to finish sign-in.`;
+    case 'PASSWORD_EXPIRED':
+    case 'MUST_CHANGE_PASSWORD':
+      return `PingOne requires a password change (${status}) before sign-in can finish. Use the system browser.`;
+    case 'RECOVERY_CODE_REQUIRED':
+      return `Password recovery (${status}) is not completed in the app. Use the system browser.`;
+    case 'VERIFICATION_REQUIRED':
+    case 'VERIFICATION_CODE_REQUIRED':
+      return `This account still needs verification (${status}). Use the system browser.`;
+    case 'PROFILE_DATA_REQUIRED':
+    case 'AGREEMENT_CONSENT_REQUIRED':
+    case 'ACCOUNT_LINKING_REQUIRED':
+    case 'ACCOUNT_CONFIRMATION_REQUIRED':
+      return `This sign-on policy needs an extra step the app does not complete (${status}). Use the system browser.`;
+    case 'FAILED':
+      return `Sign-in failed (${status}). Start again or use the system browser.`;
+    case 'COMPLETED_ACCEPTED':
+      return `Sign-in finished without an authorization code (${status}). Start again.`;
+    default: {
+      const actions = Object.keys(flow.links).filter((key) => key !== 'self' && key !== 'session.reset');
+      const available = actions.length > 0 ? ` Available actions: ${actions.join(', ')}.` : '';
+      return `This sign-in step is not supported in the app (${status}).${available} Use the system browser if it is enabled.`;
+    }
+  }
+}
+
+function rejectedStep(flow: FlowSnapshot, link: string): string {
+  const status = flow.status || 'unknown status';
+  const actions = Object.keys(flow.links).filter((key) => key !== 'self' && key !== 'session.reset');
+  const available = actions.length > 0 ? actions.join(', ') : 'none';
+  return `Sign-in status ${status} does not accept ${link}. Available actions: ${available}.`;
 }
 
 function errorMessage(body: unknown, status: number): string {

@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createPkce } from '../src/shared/auth/pkce';
-import { PiFlowClient } from '../src/shared/auth/pi-flow';
+import { PiFlowClient, signInStepMessage } from '../src/shared/auth/pi-flow';
 import { waitForLoopbackCode } from '../src/shared/auth/loopback';
 import { classifyAccessToken } from '../src/shared/auth/tokens';
 import { parseBranding } from '../src/shared/branding';
@@ -127,6 +127,159 @@ describe('pi.flow', () => {
     expect(tokens.refreshToken).toBe('refresh-1');
     expect(tokens.expiresAt).toBe(60_000);
     expect(seen[2]?.body).toContain('code_verifier=verifier');
+  });
+
+  it('posts user.lookup before usernamePassword.check on an identifier-first policy', async () => {
+    const seen: { url: string; cookie?: string; body?: string; contentType?: string }[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const headers = new Headers(init?.headers);
+      seen.push({
+        url: String(url),
+        cookie: headers.get('cookie') ?? undefined,
+        body: typeof init?.body === 'string' ? init.body : undefined,
+        contentType: headers.get('content-type') ?? undefined,
+      });
+      const type = headers.get('content-type') ?? '';
+      if (String(url).includes('/as/authorize')) {
+        return json(200, {
+          id: 'flow-id',
+          status: 'SIGN_ON_REQUIRED',
+          _links: {
+            self: { href: 'https://auth.example/env-1/flows/flow-id' },
+            'user.lookup': { href: 'https://auth.example/env-1/flows/flow-id' },
+          },
+        });
+      }
+      if (type.includes('user.lookup')) {
+        return json(
+          200,
+          {
+            id: 'flow-id',
+            status: 'PASSWORD_REQUIRED',
+            _links: {
+              'usernamePassword.check': { href: 'https://auth.example/env-1/flows/flow-id' },
+            },
+          },
+          ['ST=session; Path=/; HttpOnly'],
+        );
+      }
+      return json(200, {
+        id: 'flow-id',
+        status: 'COMPLETED',
+        authorizeResponse: { code: 'auth-code' },
+        _embedded: { user: { id: 'user-1', username: 'ada' } },
+      });
+    };
+    const client = new PiFlowClient({
+      authHost: 'https://auth.example',
+      environmentId: 'env-1',
+      clientId: 'client-1',
+      fetchImpl,
+    });
+    const flow = await client.startAuthorize({
+      redirectUri: 'http://127.0.0.1:53147/callback',
+      scopes: ['openid'],
+      challenge: 'challenge',
+      state: 'state-1',
+    });
+    const done = await client.submitCredentials(flow, 'ada', 'secret');
+    expect(done.status).toBe('COMPLETED');
+    expect(seen[1]?.url).toBe('https://auth.example/env-1/flows/flow-id');
+    expect(seen[1]?.contentType).toBe('application/vnd.pingidentity.user.lookup+json');
+    expect(JSON.parse(seen[1]?.body ?? '{}')).toEqual({ username: 'ada' });
+    expect(seen[2]?.url).toBe('https://auth.example/env-1/flows/flow-id');
+    expect(seen[2]?.contentType).toBe('application/vnd.pingidentity.usernamePassword.check+json');
+    expect(JSON.parse(seen[2]?.body ?? '{}')).toEqual({ username: 'ada', password: 'secret' });
+    expect(seen[2]?.cookie).toContain('ST=session');
+    expect(seen).toHaveLength(3);
+  });
+
+  it('does not post the password when lookup moves to a one-time code', async () => {
+    const bodies: { body: string; contentType: string }[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const headers = new Headers(init?.headers);
+      if (typeof init?.body === 'string') {
+        bodies.push({ body: init.body, contentType: headers.get('content-type') ?? '' });
+      }
+      if (String(url).includes('/as/authorize')) {
+        return json(200, {
+          id: 'flow-otp',
+          status: 'IDENTIFIER_REQUIRED',
+          _links: { 'username.check': 'https://auth.example/env-1/flows/flow-otp' },
+        });
+      }
+      return json(200, {
+        id: 'flow-otp',
+        status: 'OTP_REQUIRED',
+        _links: { 'otp.check': { href: 'https://auth.example/env-1/flows/flow-otp' } },
+      });
+    };
+    const client = new PiFlowClient({
+      authHost: 'https://auth.example',
+      environmentId: 'env-1',
+      clientId: 'client-1',
+      fetchImpl,
+    });
+    const flow = await client.startAuthorize({
+      redirectUri: 'http://127.0.0.1:53147/callback',
+      scopes: ['openid'],
+      challenge: 'challenge',
+      state: 'state-1',
+    });
+    const next = await client.submitCredentials(flow, 'ada', 'secret');
+    expect(next.status).toBe('OTP_REQUIRED');
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]?.contentType).toBe('application/vnd.pingidentity.username.check+json');
+    expect(JSON.parse(bodies[0]?.body ?? '{}')).toEqual({ username: 'ada' });
+  });
+
+  it('posts usernamePassword.check to the canonical flow url when the link href is missing', async () => {
+    let posted: { url: string; contentType: string } | undefined;
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const headers = new Headers(init?.headers);
+      if (String(url).includes('/as/authorize')) {
+        return json(200, { id: 'flow-9', status: 'USERNAME_PASSWORD_REQUIRED' });
+      }
+      posted = { url: String(url), contentType: headers.get('content-type') ?? '' };
+      return json(200, { id: 'flow-9', status: 'COMPLETED', authorizeResponse: { code: 'auth-code' } });
+    };
+    const client = new PiFlowClient({
+      authHost: 'https://auth.example/',
+      environmentId: 'env-1',
+      clientId: 'client-1',
+      fetchImpl,
+    });
+    const flow = await client.startAuthorize({
+      redirectUri: 'http://127.0.0.1:53147/callback',
+      scopes: ['openid'],
+      challenge: 'challenge',
+      state: 'state-1',
+    });
+    await client.submitCredentials(flow, 'ada', 'secret');
+    expect(posted).toEqual({
+      url: 'https://auth.example/env-1/flows/flow-9',
+      contentType: 'application/vnd.pingidentity.usernamePassword.check+json',
+    });
+  });
+
+  it('names the flow status when the step is not a credential check', async () => {
+    const flow = {
+      id: 'flow-ext',
+      status: 'EXTERNAL_AUTHENTICATION_REQUIRED',
+      rawStatus: 'EXTERNAL_AUTHENTICATION_REQUIRED',
+      links: { authenticate: 'https://auth.example/idp' },
+      devices: [],
+    };
+    await expect(
+      new PiFlowClient({
+        authHost: 'https://auth.example',
+        environmentId: 'env-1',
+        clientId: 'client-1',
+        fetchImpl: async () => json(500, {}),
+      }).submitCredentials(flow, 'ada', 'secret'),
+    ).rejects.toThrow(/EXTERNAL_AUTHENTICATION_REQUIRED/);
+    expect(signInStepMessage(flow)).toMatch(/external identity provider/);
+    expect(signInStepMessage({ ...flow, status: 'ASSERTION_REQUIRED', rawStatus: 'ASSERTION_REQUIRED' })).toMatch(/security key/);
   });
 });
 
