@@ -91,6 +91,21 @@ npm run dev
 
 Mock mode is the committed example, so `npm run dev` signs in locally and does not call PingOne. Any non-empty password is accepted. On the login screen, choose a risk scenario: low, new device, anomalous location, impossible travel, or bot.
 
+### If dev reports "Electron uninstall"
+
+Electron 44's npm package does not download the desktop binary from a `postinstall` script. `electron-vite` then reads `node_modules/electron/path.txt` and throws `Error: Electron uninstall` when that file was never written. A fresh `npm install` on macOS (and on Windows or Linux) hits this before the window opens. The message means the desktop binary was never downloaded.
+
+`postinstall`, `predev`, and the `dev` script itself run `scripts/ensure-electron.mjs`. When the binary for the current OS is missing, that script runs `node node_modules/electron/install.js`, which writes `path.txt` (`Electron.app/Contents/MacOS/Electron` on macOS, `electron.exe` on Windows, `electron` on Linux). `npm install && npm run dev` therefore downloads Electron before `electron-vite` starts.
+
+`npm install --ignore-scripts`, or `ignore-scripts=true` in your npm config, skips `postinstall` and `predev`. The `dev` script still runs the check, because npm executes the script you named even when it skips lifecycle hooks. If you start `electron-vite` directly, run the installer yourself:
+
+```bash
+node node_modules/electron/install.js
+npm run dev
+```
+
+The zip comes from the Electron GitHub releases. Behind a proxy, set `ELECTRON_MIRROR` to a mirror of those releases. `ELECTRON_SKIP_BINARY_DOWNLOAD=1` skips the check on purpose; unset it and run the installer above when you want the app to launch.
+
 To point the app at a real tenant, copy the example config and env file. Do not commit either copy.
 
 ```bash
