@@ -28,14 +28,15 @@
   "protect": {
     "enabled": true,
     "riskPolicySetId": "",
-    "resolvePublicIp": false,
+    "resolvePublicIp": true,
     "reportedIp": "",
     "userType": "EXTERNAL",
     "policy": {
       "levels": {
         "LOW": "allow",
         "MEDIUM": "step_up_mfa",
-        "HIGH": "block"
+        "HIGH": "block",
+        "UNKNOWN": "restrict_tools"
       },
       "reasonOverrides": [
         { "code": "NEW_DEVICE", "action": "step_up_mfa" },

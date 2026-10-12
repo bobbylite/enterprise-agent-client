@@ -30,7 +30,7 @@ export interface Branding {
   persona: InstructionFields;
 }
 
-export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
+export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN';
 export type RiskAction = 'allow' | 'step_up_mfa' | 'restrict_tools' | 'read_only' | 'block';
 export type RiskReasonCode =
   | 'NEW_DEVICE'

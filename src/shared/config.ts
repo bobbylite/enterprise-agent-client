@@ -58,6 +58,7 @@ export const enterpriseConfigSchema = z.object({
         LOW: riskAction,
         MEDIUM: riskAction,
         HIGH: riskAction,
+        UNKNOWN: riskAction.default('restrict_tools'),
       }),
       reasonOverrides: z.array(
         z.object({

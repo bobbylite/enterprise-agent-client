@@ -1,4 +1,4 @@
-import type { RiskAction, RiskLevel, RiskReason } from '../types';
+import type { RiskAction, RiskLevel, RiskReason, RiskView } from '../types';
 import type { RiskPolicyConfig } from '../config';
 
 const SEVERITY: Record<RiskAction, number> = {
@@ -21,6 +21,26 @@ export function decideRisk(policy: RiskPolicyConfig, level: RiskLevel, reasons: 
 export function summarizeRisk(level: RiskLevel, action: RiskAction, reasons: RiskReason[]): string {
   const why = reasons.length > 0 ? reasons.map((reason) => reason.label).join(', ') : 'no elevated predictors';
   return `${level} risk (${why}). Policy: ${actionLabel(action)}.`;
+}
+
+export function unscoredRisk(policy: RiskPolicyConfig, evaluatedAt: number, signalsCollected: boolean): RiskView {
+  const reasons: RiskReason[] = [
+    {
+      code: 'OTHER',
+      label: 'Client IP unavailable',
+      detail: 'Public IP lookup failed, and Protect did not accept a risk evaluation without an IP.',
+    },
+  ];
+  const level: RiskLevel = 'UNKNOWN';
+  const action = decideRisk(policy, level, reasons);
+  return {
+    level,
+    action,
+    reasons,
+    summary: summarizeRisk(level, action, reasons),
+    signalsCollected,
+    evaluatedAt,
+  };
 }
 
 export function actionLabel(action: RiskAction): string {

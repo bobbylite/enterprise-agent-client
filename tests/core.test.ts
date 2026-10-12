@@ -10,8 +10,9 @@ import { parseEnterpriseConfig } from '../src/shared/config';
 import { composeInstructions } from '../src/shared/instructions/compose';
 import { choiceFromUser, previewApproval } from '../src/shared/mcp/approvals';
 import { renderRiskContext } from '../src/shared/protect/context';
+import { buildRiskEvent, resolvePublicIp } from '../src/shared/protect/evaluate';
 import { mockRiskPayload } from '../src/shared/protect/mock';
-import { decideRisk, summarizeRisk } from '../src/shared/protect/policy';
+import { decideRisk, summarizeRisk, unscoredRisk } from '../src/shared/protect/policy';
 import { extractRiskReasons } from '../src/shared/protect/reasons';
 import { parseAnthropicData, parseOpenAiData } from '../src/shared/providers/sse';
 import { mockResult } from '../src/shared/providers/mock';
@@ -377,6 +378,52 @@ describe('protect policy', () => {
     expect(text).toContain('New device');
     expect(text).toContain('Policy action: step_up_mfa');
     expect(text).toContain('Northstar');
+  });
+
+  it('defaults unknown risk to restricted tools and tells the agent', () => {
+    const raw = JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')) as {
+      protect: { resolvePublicIp: boolean; policy: { levels: { UNKNOWN?: string } } };
+    };
+    expect(raw.protect.resolvePublicIp).toBe(true);
+    delete raw.protect.policy.levels.UNKNOWN;
+    const parsed = parseEnterpriseConfig(raw);
+    expect(parsed.protect.policy.levels.UNKNOWN).toBe('restrict_tools');
+    const risk = unscoredRisk(parsed.protect.policy, 0, false);
+    expect(risk.level).toBe('UNKNOWN');
+    expect(risk.action).toBe('restrict_tools');
+    const text = renderRiskContext(risk, 'Northstar');
+    expect(text).toContain('Protect did not score this sign-in');
+    expect(text).toContain('Client IP unavailable');
+    expect(text).toContain('Policy action: restrict_tools');
+  });
+});
+
+describe('public IP lookup', () => {
+  it('uses the fallback address when the first lookup fails', async () => {
+    const seen: string[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      seen.push(String(url));
+      expect(init?.signal).toBeTruthy();
+      if (String(url).includes('ipify')) throw new Error('timed out');
+      return new Response('203.0.113.8\n', { status: 200 });
+    };
+    await expect(resolvePublicIp(fetchImpl, 50)).resolves.toBe('203.0.113.8');
+    expect(seen[0]).toContain('api.ipify.org');
+    expect(seen[1]).toContain('checkip.amazonaws.com');
+  });
+
+  it('omits ip from the risk event when lookup cannot produce one', async () => {
+    const fetchImpl: typeof fetch = async () => new Response('nope', { status: 500 });
+    await expect(resolvePublicIp(fetchImpl, 50)).rejects.toThrow(/IP lookup failed/);
+    const event = buildRiskEvent({
+      userId: 'user-1',
+      username: 'ada',
+      userType: 'EXTERNAL',
+      userAgent: 'test',
+      targetId: 'desktop',
+      targetName: 'Desk',
+    });
+    expect(event.ip).toBeUndefined();
   });
 });
 

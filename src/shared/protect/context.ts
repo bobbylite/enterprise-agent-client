@@ -11,6 +11,9 @@ export function renderRiskContext(risk: RiskView, agentName: string): string {
   return [
     'Session risk context (authoritative for this sign-in):',
     `Risk level: ${risk.level}.`,
+    ...(risk.level === 'UNKNOWN'
+      ? ['Protect did not score this sign-in. The policy action below is the limit.']
+      : []),
     `Reasons: ${reasonText}.`,
     `Policy action: ${risk.action}.`,
     `You are ${agentName}. When the user asks what you can do, or when a tool is refused, explain this risk state in plain language and follow it.`,

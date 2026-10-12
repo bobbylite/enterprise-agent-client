@@ -19,7 +19,7 @@ import { composeInstructions } from '@shared/instructions/compose';
 import { toolKey } from '@shared/mcp/approvals';
 import { buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
 import { mockRiskPayload } from '@shared/protect/mock';
-import { decideRisk, summarizeRisk } from '@shared/protect/policy';
+import { decideRisk, summarizeRisk, unscoredRisk } from '@shared/protect/policy';
 import { extractRiskReasons, riskLevel } from '@shared/protect/reasons';
 import { renderRiskContext } from '@shared/protect/context';
 import { createProvider, defaultModelFor } from '@shared/providers/index';
@@ -1009,34 +1009,39 @@ export class Runtime {
     }
     const ip = await this.clientIp();
     const worker = await this.workerAccessToken();
-    const evaluation = await createRiskEvaluation({
-      url: riskEvaluationsUrl(this.options.config),
-      accessToken: worker,
-      riskPolicySetId: this.options.config.protect.riskPolicySetId || undefined,
-      fetchImpl: this.options.fetchImpl,
-      event: buildRiskEvent({
-        ip,
-        userId,
-        username,
-        userType: this.options.config.protect.userType,
-        userAgent: `${this.options.branding.appName}/${this.options.version ?? '0.1.0'} (${process.platform})`,
-        targetId: this.options.config.tenant.clientId || 'desktop-agent',
-        targetName: this.options.branding.appName,
-        signals: signals || undefined,
-      }),
-    });
-    const reasons = extractRiskReasons(evaluation.details);
-    const level = riskLevel(evaluation.level);
-    const action = decideRisk(this.options.config.protect.policy, level, reasons);
-    return {
-      evaluationId: evaluation.id,
-      level,
-      action,
-      reasons,
-      summary: summarizeRisk(level, action, reasons),
-      signalsCollected: Boolean(signals),
-      evaluatedAt,
-    };
+    try {
+      const evaluation = await createRiskEvaluation({
+        url: riskEvaluationsUrl(this.options.config),
+        accessToken: worker,
+        riskPolicySetId: this.options.config.protect.riskPolicySetId || undefined,
+        fetchImpl: this.options.fetchImpl,
+        event: buildRiskEvent({
+          ip,
+          userId,
+          username,
+          userType: this.options.config.protect.userType,
+          userAgent: `${this.options.branding.appName}/${this.options.version ?? '0.1.0'} (${process.platform})`,
+          targetId: this.options.config.tenant.clientId || 'desktop-agent',
+          targetName: this.options.branding.appName,
+          signals: signals || undefined,
+        }),
+      });
+      const reasons = extractRiskReasons(evaluation.details);
+      const level = riskLevel(evaluation.level);
+      const action = decideRisk(this.options.config.protect.policy, level, reasons);
+      return {
+        evaluationId: evaluation.id,
+        level,
+        action,
+        reasons,
+        summary: summarizeRisk(level, action, reasons),
+        signalsCollected: Boolean(signals),
+        evaluatedAt,
+      };
+    } catch (error) {
+      if (ip) throw error;
+      return unscoredRisk(this.options.config.protect.policy, evaluatedAt, Boolean(signals));
+    }
   }
 
   private async activate(tokens: TokenSet, userId: string, username: string): Promise<void> {
@@ -1141,10 +1146,15 @@ export class Runtime {
     return this.workerToken.accessToken;
   }
 
-  private async clientIp(): Promise<string> {
-    if (this.options.config.protect.reportedIp) return this.options.config.protect.reportedIp;
-    if (this.options.config.protect.resolvePublicIp) return resolvePublicIp(this.options.fetchImpl);
-    throw new Error('Set protect.reportedIp or protect.resolvePublicIp so risk evaluation has a client IP.');
+  private async clientIp(): Promise<string | undefined> {
+    const reported = this.options.config.protect.reportedIp.trim();
+    if (reported) return reported;
+    if (!this.options.config.protect.resolvePublicIp) return undefined;
+    try {
+      return await resolvePublicIp(this.options.fetchImpl);
+    } catch {
+      return undefined;
+    }
   }
 
   private async markRisk(status: 'SUCCESS' | 'FAILED'): Promise<void> {
