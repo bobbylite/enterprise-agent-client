@@ -36,5 +36,8 @@ export const Ipc = {
   listRoutineRuns: 'routines:runs',
   getSettings: 'settings:get',
   saveSettings: 'settings:save',
+  listTokens: 'tokens:list',
+  revealToken: 'tokens:reveal',
+  reexchangeToken: 'tokens:reexchange',
   chatEvent: 'chat:event',
 } as const;

@@ -8,7 +8,7 @@ export interface RiskEvaluationResult {
 }
 
 export function buildRiskEvent(input: {
-  ip: string;
+  ip?: string;
   userId: string;
   username: string;
   userType: 'PING_ONE' | 'EXTERNAL';
@@ -19,12 +19,12 @@ export function buildRiskEvent(input: {
   sessionId?: string;
 }): Record<string, unknown> {
   const event: Record<string, unknown> = {
-    ip: input.ip,
     flow: { type: 'AUTHENTICATION', subtype: 'USER_PASSWORD' },
     user: { id: input.userId, name: input.username, type: input.userType },
     browser: { userAgent: input.userAgent },
     targetResource: { id: input.targetId, name: input.targetName },
   };
+  if (input.ip) event.ip = input.ip;
   if (input.signals) event.sdk = { signals: { data: input.signals } };
   if (input.sessionId) event.session = { id: input.sessionId };
   return event;
@@ -91,10 +91,42 @@ export async function updateRiskEvaluation(input: {
   }
 }
 
-export async function resolvePublicIp(fetchImpl: typeof fetch = fetch): Promise<string> {
-  const response = await fetchImpl('https://api.ipify.org?format=json');
+export const PUBLIC_IP_LOOKUP_TIMEOUT_MS = 2000;
+
+const PUBLIC_IP_SOURCES = ['https://api.ipify.org?format=json', 'https://checkip.amazonaws.com/'];
+
+export async function resolvePublicIp(
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = PUBLIC_IP_LOOKUP_TIMEOUT_MS,
+): Promise<string> {
+  const errors: string[] = [];
+  for (const url of PUBLIC_IP_SOURCES) {
+    try {
+      const ip = await readPublicIp(fetchImpl, url, timeoutMs);
+      if (ip) return ip;
+      errors.push('IP lookup did not return an address.');
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  throw new Error(errors[0] || 'Public IP lookup failed.');
+}
+
+async function readPublicIp(fetchImpl: typeof fetch, url: string, timeoutMs: number): Promise<string | undefined> {
+  const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`IP lookup failed (${response.status}).`);
-  const body = (await response.json()) as { ip?: string };
-  if (!body.ip) throw new Error('IP lookup did not return an address.');
-  return body.ip;
+  const text = (await response.text()).trim();
+  if (text.startsWith('{')) {
+    const body = JSON.parse(text) as { ip?: unknown };
+    return typeof body.ip === 'string' && isIpAddress(body.ip) ? body.ip : undefined;
+  }
+  const line = text.split(/\s+/)[0] ?? '';
+  return isIpAddress(line) ? line : undefined;
+}
+
+function isIpAddress(value: string): boolean {
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value)) {
+    return value.split('.').every((part) => Number(part) <= 255);
+  }
+  return value.includes(':') && /^[0-9a-fA-F:]+$/.test(value);
 }

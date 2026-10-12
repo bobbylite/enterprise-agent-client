@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fillTemplate } from '@shared/branding';
 import type { EnterpriseConfig } from '@shared/config';
-import { riskEvaluationsUrl, tokenEndpoint } from '@shared/config';
+import { riskEvaluationsUrl, tokenEndpoint, tokenInspectorEnabled } from '@shared/config';
 import {
   MFA_STATUSES,
   PiFlowClient,
@@ -19,7 +19,7 @@ import { composeInstructions } from '@shared/instructions/compose';
 import { toolKey } from '@shared/mcp/approvals';
 import { buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
 import { mockRiskPayload } from '@shared/protect/mock';
-import { decideRisk, summarizeRisk } from '@shared/protect/policy';
+import { decideRisk, summarizeRisk, unscoredRisk } from '@shared/protect/policy';
 import { extractRiskReasons, riskLevel } from '@shared/protect/reasons';
 import { renderRiskContext } from '@shared/protect/context';
 import { createProvider, defaultModelFor } from '@shared/providers/index';
@@ -28,6 +28,7 @@ import { assertValidCron, cronMatches, minuteKey } from '@shared/schedule/cron';
 import type { SecretStore } from '@shared/secrets';
 import { AudienceTokenCache, fetchClientCredentials, getOrExchange } from '@shared/tokens/exchange';
 import { redactSecrets } from '@shared/env';
+import { inspectJwt } from '@shared/tokens/inspect';
 import type {
   AgentProfile,
   AppState,
@@ -53,6 +54,7 @@ import type {
   SessionView,
   SettingsInput,
   SettingsView,
+  InspectedToken,
 } from '@shared/types';
 import { Repository, type AgentRow, type McpServerRow } from './db';
 import { McpHub } from './mcp';
@@ -97,6 +99,7 @@ export interface RuntimeOptions {
   emit?: (event: ChatEvent) => void;
   mockDelayMs?: number;
   version?: string;
+  dev?: boolean;
 }
 
 const SCENARIOS: MockScenario[] = ['low', 'new_device', 'anomalous_location', 'impossible_travel', 'bot'];
@@ -618,7 +621,8 @@ export class Runtime {
     return {
       provider,
       model: this.options.db.getSetting('model') ?? defaultModelFor(provider, this.options.config.provider),
-      temperature: Number(this.options.db.getSetting('temperature') ?? this.options.config.provider.temperature),
+      temperature: storedTemperature(this.options.db.getSetting('temperature'), this.options.config.provider.temperature),
+      tokenInspector: this.inspectorEnabled(),
       openaiBaseUrl: this.options.db.getSetting('openaiBaseUrl') ?? this.options.config.provider.openaiBaseUrl,
       anthropicBaseUrl: this.options.db.getSetting('anthropicBaseUrl') ?? this.options.config.provider.anthropicBaseUrl,
       genericBaseUrl: this.options.db.getSetting('genericBaseUrl') ?? this.options.config.provider.genericBaseUrl,
@@ -643,10 +647,12 @@ export class Runtime {
   }
 
   async saveSettings(input: SettingsInput): Promise<SettingsView> {
-    if (input.temperature < 0 || input.temperature > 2) throw new Error('Temperature must be between 0 and 2.');
+    if (input.temperature != null && (!Number.isFinite(input.temperature) || input.temperature < 0 || input.temperature > 2)) {
+      throw new Error('Temperature must be between 0 and 2.');
+    }
     this.options.db.setSetting('provider', input.provider);
     this.options.db.setSetting('model', input.model.trim() || defaultModelFor(input.provider, this.options.config.provider));
-    this.options.db.setSetting('temperature', String(input.temperature));
+    this.options.db.setSetting('temperature', input.temperature == null ? '' : String(input.temperature));
     this.options.db.setSetting('openaiBaseUrl', input.openaiBaseUrl.trim());
     this.options.db.setSetting('anthropicBaseUrl', input.anthropicBaseUrl.trim());
     this.options.db.setSetting('genericBaseUrl', input.genericBaseUrl.trim());
@@ -655,6 +661,44 @@ export class Runtime {
     await this.maybeSecret('genericApiKey', input.genericApiKey, input.clearKeys?.includes('generic'));
     await this.maybeSecret('workerClientSecret', input.workerClientSecret, input.clearKeys?.includes('worker'));
     return this.getSettingsAsync();
+  }
+
+  async listInspectedTokens(): Promise<InspectedToken[]> {
+    this.assertInspector();
+    this.requireSession();
+    const tokens = [this.describeSession()];
+    for (const audience of this.options.config.tokenExchange.audiences) {
+      tokens.push(await this.describeAudience(audience));
+    }
+    return tokens;
+  }
+
+  async revealInspectedToken(id: string): Promise<string> {
+    this.assertInspector();
+    this.requireSession();
+    if (id === 'session') return this.session?.accessToken ?? '';
+    const audience = this.audienceById(id);
+    const cached = await this.cache.read(audience.audience);
+    if (!cached?.accessToken) throw new Error('That audience has no exchanged token yet.');
+    return cached.accessToken;
+  }
+
+  async reexchangeToken(id: string): Promise<InspectedToken> {
+    this.assertInspector();
+    this.requireSession();
+    if (id === 'session') {
+      await this.refreshSessionToken();
+      return this.describeSession();
+    }
+    const audience = this.audienceById(id);
+    await this.cache.delete(audience.audience);
+    this.exchangeErrors.delete(audience.audience);
+    try {
+      await this.tokenForAudience(audience.audience, audience.scope);
+    } catch (error) {
+      this.exchangeErrors.set(audience.audience, redactSecrets(error instanceof Error ? error.message : String(error)));
+    }
+    return this.describeAudience(audience);
   }
 
   async fireDueRoutines(date: Date): Promise<RoutineRun[]> {
@@ -767,7 +811,8 @@ export class Runtime {
       request: {
         model: settings.model,
         system: this.systemPrompt(agent, room),
-        temperature: settings.temperature,
+        temperature: settings.temperature ?? undefined,
+        reasoningEffort: this.options.config.provider.reasoningEffort,
         apiKey,
         baseUrl,
       },
@@ -1009,34 +1054,39 @@ export class Runtime {
     }
     const ip = await this.clientIp();
     const worker = await this.workerAccessToken();
-    const evaluation = await createRiskEvaluation({
-      url: riskEvaluationsUrl(this.options.config),
-      accessToken: worker,
-      riskPolicySetId: this.options.config.protect.riskPolicySetId || undefined,
-      fetchImpl: this.options.fetchImpl,
-      event: buildRiskEvent({
-        ip,
-        userId,
-        username,
-        userType: this.options.config.protect.userType,
-        userAgent: `${this.options.branding.appName}/${this.options.version ?? '0.1.0'} (${process.platform})`,
-        targetId: this.options.config.tenant.clientId || 'desktop-agent',
-        targetName: this.options.branding.appName,
-        signals: signals || undefined,
-      }),
-    });
-    const reasons = extractRiskReasons(evaluation.details);
-    const level = riskLevel(evaluation.level);
-    const action = decideRisk(this.options.config.protect.policy, level, reasons);
-    return {
-      evaluationId: evaluation.id,
-      level,
-      action,
-      reasons,
-      summary: summarizeRisk(level, action, reasons),
-      signalsCollected: Boolean(signals),
-      evaluatedAt,
-    };
+    try {
+      const evaluation = await createRiskEvaluation({
+        url: riskEvaluationsUrl(this.options.config),
+        accessToken: worker,
+        riskPolicySetId: this.options.config.protect.riskPolicySetId || undefined,
+        fetchImpl: this.options.fetchImpl,
+        event: buildRiskEvent({
+          ip,
+          userId,
+          username,
+          userType: this.options.config.protect.userType,
+          userAgent: `${this.options.branding.appName}/${this.options.version ?? '0.1.0'} (${process.platform})`,
+          targetId: this.options.config.tenant.clientId || 'desktop-agent',
+          targetName: this.options.branding.appName,
+          signals: signals || undefined,
+        }),
+      });
+      const reasons = extractRiskReasons(evaluation.details);
+      const level = riskLevel(evaluation.level);
+      const action = decideRisk(this.options.config.protect.policy, level, reasons);
+      return {
+        evaluationId: evaluation.id,
+        level,
+        action,
+        reasons,
+        summary: summarizeRisk(level, action, reasons),
+        signalsCollected: Boolean(signals),
+        evaluatedAt,
+      };
+    } catch (error) {
+      if (ip) throw error;
+      return unscoredRisk(this.options.config.protect.policy, evaluatedAt, Boolean(signals));
+    }
   }
 
   private async activate(tokens: TokenSet, userId: string, username: string): Promise<void> {
@@ -1075,8 +1125,7 @@ export class Runtime {
     if (this.options.config.tenant.mode === 'mock') {
       const cached = await this.cache.get(audience);
       if (cached) return cached.accessToken;
-      const token = this.mockToken(this.session.userId, audience);
-      token.scope = scope;
+      const token = this.mockToken(this.session.userId, audience, scope);
       await this.cache.put(audience, token);
       return token.accessToken;
     }
@@ -1141,10 +1190,15 @@ export class Runtime {
     return this.workerToken.accessToken;
   }
 
-  private async clientIp(): Promise<string> {
-    if (this.options.config.protect.reportedIp) return this.options.config.protect.reportedIp;
-    if (this.options.config.protect.resolvePublicIp) return resolvePublicIp(this.options.fetchImpl);
-    throw new Error('Set protect.reportedIp or protect.resolvePublicIp so risk evaluation has a client IP.');
+  private async clientIp(): Promise<string | undefined> {
+    const reported = this.options.config.protect.reportedIp.trim();
+    if (reported) return reported;
+    if (!this.options.config.protect.resolvePublicIp) return undefined;
+    try {
+      return await resolvePublicIp(this.options.fetchImpl);
+    } catch {
+      return undefined;
+    }
   }
 
   private async markRisk(status: 'SUCCESS' | 'FAILED'): Promise<void> {
@@ -1166,15 +1220,107 @@ export class Runtime {
     }
   }
 
-  private mockToken(userId: string, audience = 'user'): TokenSet {
+  private mockToken(userId: string, audience = 'user', scope?: string): TokenSet {
     const expiresAt = this.now() + 8 * 60 * 60 * 1000;
+    const tokenScope = scope ?? (audience === 'user' ? this.options.config.tenant.scopes.join(' ') : undefined);
     const accessToken = `${encodeJsonSegment({ alg: 'none', typ: 'mock' })}.${encodeJsonSegment({
       sub: userId,
       aud: audience,
+      scope: tokenScope,
+      iat: Math.floor(this.now() / 1000),
       exp: Math.floor(expiresAt / 1000),
+      jti: randomId(),
       mock: true,
     })}.mock`;
-    return { accessToken, expiresAt, tokenType: 'Bearer' };
+    return { accessToken, expiresAt, tokenType: 'Bearer', scope: tokenScope };
+  }
+
+  private inspectorEnabled(): boolean {
+    return tokenInspectorEnabled(this.options.config, this.options.dev ?? false);
+  }
+
+  private assertInspector(): void {
+    if (!this.inspectorEnabled()) throw new Error('Token inspection is turned off.');
+  }
+
+  private audienceById(id: string): EnterpriseConfig['tokenExchange']['audiences'][number] {
+    const audience = this.options.config.tokenExchange.audiences.find((item) => item.id === id);
+    if (!audience) throw new Error('That audience is not configured.');
+    return audience;
+  }
+
+  private describeSession(): InspectedToken {
+    const token = this.session?.accessToken ?? '';
+    return this.describeToken('session', 'session', 'PingOne session', null, token, this.session?.expiresAt);
+  }
+
+  private async describeAudience(
+    audience: EnterpriseConfig['tokenExchange']['audiences'][number],
+  ): Promise<InspectedToken> {
+    const cached = await this.cache.read(audience.audience);
+    const error = this.exchangeErrors.get(audience.audience);
+    return this.describeToken(
+      audience.id,
+      'exchanged',
+      audience.audience,
+      audience.audience,
+      cached?.accessToken ?? '',
+      cached?.expiresAt,
+      cached?.scope ?? audience.scope,
+      error ? redactSecrets(error) : cached ? undefined : 'This audience has not been exchanged yet.',
+    );
+  }
+
+  private describeToken(
+    id: string,
+    kind: InspectedToken['kind'],
+    label: string,
+    audience: string | null,
+    token: string,
+    expiresAt?: number,
+    scope?: string,
+    error?: string,
+  ): InspectedToken {
+    const inspected = token ? inspectJwt(token, this.now(), { scope, expiresAt }) : null;
+    return {
+      id,
+      kind,
+      label,
+      audience,
+      present: Boolean(token),
+      header: inspected?.header ?? {},
+      aud: inspected?.aud ?? null,
+      scope: inspected?.scope ?? scope ?? null,
+      sub: inspected?.sub ?? null,
+      act: inspected?.act ?? null,
+      mayAct: inspected?.mayAct ?? null,
+      exp: inspected?.exp ?? null,
+      iat: inspected?.iat ?? null,
+      expiresAt: inspected?.expiresAt ?? null,
+      expiresInMs: inspected?.expiresInMs ?? null,
+      error,
+    };
+  }
+
+  private async refreshSessionToken(): Promise<void> {
+    if (!this.session) throw new Error('Sign in to continue.');
+    if (this.options.config.tenant.mode === 'mock') {
+      const next = this.mockToken(this.session.userId);
+      this.session = { ...this.session, accessToken: next.accessToken, expiresAt: next.expiresAt, tokenType: next.tokenType };
+      await this.options.secrets.set('session', JSON.stringify(this.session));
+      return;
+    }
+    if (!this.session.refreshToken) throw new Error('This session has no refresh token. Sign in again to replace it.');
+    const next = await this.pi.refresh(this.session.refreshToken);
+    this.session = {
+      ...this.session,
+      accessToken: next.accessToken,
+      refreshToken: next.refreshToken ?? this.session.refreshToken,
+      idToken: next.idToken ?? this.session.idToken,
+      expiresAt: next.expiresAt,
+      tokenType: next.tokenType,
+    };
+    await this.options.secrets.set('session', JSON.stringify(this.session));
   }
 
   private async restoreSession(): Promise<void> {
@@ -1281,7 +1427,7 @@ export class Runtime {
     }
     this.options.db.setSetting('provider', config.provider.default);
     this.options.db.setSetting('model', defaultModelFor(config.provider.default, config.provider));
-    this.options.db.setSetting('temperature', String(config.provider.temperature));
+    this.options.db.setSetting('temperature', config.provider.temperature == null ? '' : String(config.provider.temperature));
     this.options.db.setSetting('openaiBaseUrl', config.provider.openaiBaseUrl);
     this.options.db.setSetting('anthropicBaseUrl', config.provider.anthropicBaseUrl);
     this.options.db.setSetting('genericBaseUrl', config.provider.genericBaseUrl);
@@ -1345,6 +1491,13 @@ function parseArgs(value: string): string[] {
   if (!trimmed) return [];
   if (trimmed.includes('\n')) return trimmed.split('\n').map((line) => line.trim()).filter(Boolean);
   return trimmed.split(/\s+/);
+}
+
+function storedTemperature(stored: string | null, configured: number | undefined): number | null {
+  if (stored == null) return configured ?? null;
+  if (stored.trim() === '') return null;
+  const value = Number(stored);
+  return Number.isFinite(value) ? value : null;
 }
 
 function stringClaim(value: unknown): string {

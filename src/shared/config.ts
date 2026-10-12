@@ -38,6 +38,7 @@ export const enterpriseConfigSchema = z.object({
   }),
   tokenExchange: z.object({
     clientId: z.string(),
+    inspectTokens: z.boolean().optional(),
     audiences: z.array(
       z.object({
         id: z.string().min(1),
@@ -58,6 +59,7 @@ export const enterpriseConfigSchema = z.object({
         LOW: riskAction,
         MEDIUM: riskAction,
         HIGH: riskAction,
+        UNKNOWN: riskAction.default('restrict_tools'),
       }),
       reasonOverrides: z.array(
         z.object({
@@ -117,12 +119,18 @@ export const enterpriseConfigSchema = z.object({
     anthropicModel: z.string(),
     genericBaseUrl: z.string(),
     genericModel: z.string(),
-    temperature: z.number().min(0).max(2),
+    temperature: z.number().min(0).max(2).optional(),
+    reasoningEffort: z.enum(['minimal', 'low', 'medium', 'high']).optional(),
   }),
 });
 
 export type EnterpriseConfig = z.infer<typeof enterpriseConfigSchema>;
 export type RiskPolicyConfig = EnterpriseConfig['protect']['policy'];
+
+export function tokenInspectorEnabled(config: EnterpriseConfig, dev: boolean): boolean {
+  if (typeof config.tokenExchange.inspectTokens === 'boolean') return config.tokenExchange.inspectTokens;
+  return config.tenant.mode === 'mock' || dev;
+}
 
 const SECRET_KEY = /secret|password|api[-_]?key|access[-_]?token|refresh[-_]?token|private[-_]?key/i;
 

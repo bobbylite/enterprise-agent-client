@@ -16,6 +16,7 @@
   },
   "tokenExchange": {
     "clientId": "",
+    "inspectTokens": true,
     "audiences": [
       {
         "id": "echo-local",
@@ -28,14 +29,15 @@
   "protect": {
     "enabled": true,
     "riskPolicySetId": "",
-    "resolvePublicIp": false,
+    "resolvePublicIp": true,
     "reportedIp": "",
     "userType": "EXTERNAL",
     "policy": {
       "levels": {
         "LOW": "allow",
         "MEDIUM": "step_up_mfa",
-        "HIGH": "block"
+        "HIGH": "block",
+        "UNKNOWN": "restrict_tools"
       },
       "reasonOverrides": [
         { "code": "NEW_DEVICE", "action": "step_up_mfa" },
@@ -111,7 +113,6 @@
     "anthropicBaseUrl": "https://api.anthropic.com",
     "anthropicModel": "claude-sonnet-4-5",
     "genericBaseUrl": "",
-    "genericModel": "default",
-    "temperature": 0.2
+    "genericModel": "default"
   }
 }

@@ -14,6 +14,7 @@ async function boot(
   delayMs = 0,
   patch?: (config: ReturnType<typeof parseEnterpriseConfig>) => void,
   fetchImpl?: typeof fetch,
+  secrets = new MemorySecretStore(),
 ) {
   const rawBranding = JSON.parse(readFileSync('branding/default.json', 'utf8')) as Record<string, unknown>;
   const branding = parseBranding(
@@ -28,7 +29,7 @@ async function boot(
     config,
     branding,
     db,
-    secrets: new MemorySecretStore(),
+    secrets,
     appRoot: process.cwd(),
     attachmentsDir: mkdtempSync(join(tmpdir(), 'agent-')),
     encryptionAvailable: true,
@@ -114,6 +115,45 @@ describe('mock runtime', () => {
     expect(authors).toContain('Northstar');
     expect(authors).toContain('Reviewer');
   });
+
+  it('lists session and audience tokens and can re-exchange without returning the raw jwt', async () => {
+    const { runtime } = await boot();
+    await runtime.submitCredentials('ada', 'secret', '');
+    const listed = await runtime.listInspectedTokens();
+    const session = listed.find((item) => item.id === 'session');
+    const exchanged = listed.find((item) => item.id === 'echo-local');
+    expect(session).toMatchObject({ kind: 'session', aud: 'user', sub: 'mock:ada', present: true });
+    expect(session?.scope).toContain('openid');
+    expect(session?.header).toMatchObject({ alg: 'none', typ: 'mock' });
+    expect(session?.iat).toEqual(expect.any(Number));
+    expect(session?.expiresInMs).toBeGreaterThan(0);
+    expect(exchanged).toMatchObject({
+      kind: 'exchanged',
+      audience: 'https://mcp.local.echo',
+      aud: 'https://mcp.local.echo',
+      scope: 'mcp:tools',
+      sub: 'mock:ada',
+    });
+    const sessionJwt = await runtime.revealInspectedToken('session');
+    const first = await runtime.revealInspectedToken('echo-local');
+    expect(JSON.stringify(listed)).not.toContain(sessionJwt);
+    expect(JSON.stringify(listed)).not.toContain(first);
+    const refreshed = await runtime.reexchangeToken('echo-local');
+    const second = await runtime.revealInspectedToken('echo-local');
+    expect(second).not.toBe(first);
+    expect(JSON.stringify(refreshed)).not.toContain(second);
+    expect(refreshed.aud).toBe('https://mcp.local.echo');
+  });
+
+  it('hides token inspection when the admin flag is off', async () => {
+    const { runtime } = await boot(0, (config) => {
+      config.tokenExchange.inspectTokens = false;
+    });
+    await runtime.submitCredentials('ada', 'secret', '');
+    expect((await runtime.getSettingsAsync()).tokenInspector).toBe(false);
+    await expect(runtime.listInspectedTokens()).rejects.toThrow(/turned off/);
+    await expect(runtime.revealInspectedToken('session')).rejects.toThrow(/turned off/);
+  });
 });
 
 describe('pi.flow runtime', () => {
@@ -184,7 +224,102 @@ describe('pi.flow runtime', () => {
     expect(state.login.message).toMatch(/external identity provider/);
     expect(posted).toEqual([]);
   });
+
+  it('signs in with unknown risk when the public IP cannot be resolved', async () => {
+    const events: { ip?: string }[] = [];
+    const { runtime } = await boot(0, protectPatch, protectFetch({ events, ip: 'fail', riskStatus: 400 }), await workerSecrets());
+    const signedIn = await runtime.submitCredentials('ada', 'secret', '');
+    expect(signedIn.session?.username).toBe('ada');
+    expect(signedIn.login.phase).not.toBe('blocked');
+    expect(signedIn.risk?.level).toBe('UNKNOWN');
+    expect(signedIn.risk?.action).toBe('restrict_tools');
+    expect(signedIn.risk?.summary).toContain('Client IP unavailable');
+    expect(events[0]?.ip).toBeUndefined();
+  });
+
+  it('sends the fallback public IP and keeps the Protect level', async () => {
+    const events: { ip?: string }[] = [];
+    const { runtime } = await boot(
+      0,
+      protectPatch,
+      protectFetch({ events, ip: '203.0.113.8', riskStatus: 200 }),
+      await workerSecrets(),
+    );
+    const signedIn = await runtime.submitCredentials('ada', 'secret', '');
+    expect(signedIn.session?.username).toBe('ada');
+    expect(signedIn.risk?.level).toBe('LOW');
+    expect(signedIn.risk?.action).toBe('allow');
+    expect(events[0]?.ip).toBe('203.0.113.8');
+  });
+
+  it('scores a sign-in without an IP when Protect accepts that event', async () => {
+    const events: { ip?: string }[] = [];
+    const { runtime } = await boot(0, protectPatch, protectFetch({ events, ip: 'fail', riskStatus: 200 }), await workerSecrets());
+    const signedIn = await runtime.submitCredentials('ada', 'secret', '');
+    expect(signedIn.risk?.level).toBe('LOW');
+    expect(signedIn.session?.username).toBe('ada');
+    expect(events[0]?.ip).toBeUndefined();
+  });
 });
+
+function protectPatch(config: ReturnType<typeof parseEnterpriseConfig>): void {
+  config.tenant.mode = 'pingone';
+  config.tenant.authHost = 'https://auth.example';
+  config.tenant.apiHost = 'https://api.example';
+  config.tenant.environmentId = 'env-1';
+  config.tenant.clientId = 'client-1';
+  config.tokenExchange.clientId = 'worker';
+  config.tokenExchange.audiences = [];
+  config.protect.enabled = true;
+  config.protect.resolvePublicIp = true;
+  config.protect.reportedIp = '';
+}
+
+async function workerSecrets(): Promise<MemorySecretStore> {
+  const secrets = new MemorySecretStore();
+  await secrets.set('workerClientSecret', 'worker-secret');
+  return secrets;
+}
+
+function protectFetch(input: { events: { ip?: string }[]; ip: 'fail' | string; riskStatus: number }): typeof fetch {
+  let state = '';
+  return async (url, init) => {
+    const target = String(url);
+    const method = init?.method ?? 'GET';
+    if (target.includes('ipify')) throw new Error('timed out');
+    if (target.includes('checkip.amazonaws.com')) {
+      if (input.ip === 'fail') throw new Error('timed out');
+      return new Response(`${input.ip}\n`, { status: 200 });
+    }
+    if (target.includes('/as/authorize')) {
+      state = new URL(target).searchParams.get('state') ?? '';
+      return json(200, {
+        id: 'flow-1',
+        status: 'USERNAME_PASSWORD_REQUIRED',
+        _links: { 'usernamePassword.check': { href: 'https://auth.example/env-1/flows/flow-1' } },
+      });
+    }
+    if (target.includes('/flows/')) {
+      return json(200, {
+        id: 'flow-1',
+        status: 'COMPLETED',
+        authorizeResponse: { code: 'auth-code', state },
+        _embedded: { user: { id: 'user-1', username: 'ada' } },
+      });
+    }
+    if (target.includes('/as/token')) {
+      return json(200, { access_token: 'token', expires_in: 3600, token_type: 'Bearer' });
+    }
+    if (target.includes('/riskEvaluations') && method === 'POST') {
+      const body = JSON.parse(String(init?.body)) as { event?: { ip?: string } };
+      input.events.push({ ip: body.event?.ip });
+      if (input.riskStatus >= 400) return json(input.riskStatus, { message: 'ip is required' });
+      return json(200, { id: 'eval-1', result: { level: 'LOW' }, details: {} });
+    }
+    if (method === 'PUT') return new Response('', { status: 200 });
+    return json(500, { message: target });
+  };
+}
 
 async function waitFor(events: ChatEvent[], predicate: (event: ChatEvent) => boolean): Promise<ChatEvent> {
   const started = Date.now();

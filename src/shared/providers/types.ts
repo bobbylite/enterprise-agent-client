@@ -26,12 +26,15 @@ export interface ProviderTool {
   inputSchema: Record<string, unknown>;
 }
 
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high';
+
 export interface ProviderRequest {
   model: string;
   system: string;
   messages: ProviderMessage[];
   tools: ProviderTool[];
-  temperature: number;
+  temperature?: number;
+  reasoningEffort?: ReasoningEffort;
   apiKey?: string;
   baseUrl?: string;
 }

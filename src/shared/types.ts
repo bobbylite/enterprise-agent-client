@@ -30,7 +30,7 @@ export interface Branding {
   persona: InstructionFields;
 }
 
-export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
+export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN';
 export type RiskAction = 'allow' | 'step_up_mfa' | 'restrict_tools' | 'read_only' | 'block';
 export type RiskReasonCode =
   | 'NEW_DEVICE'
@@ -241,7 +241,8 @@ export interface InstructionEditorState {
 export interface SettingsView {
   provider: ProviderId;
   model: string;
-  temperature: number;
+  temperature: number | null;
+  tokenInspector: boolean;
   openaiBaseUrl: string;
   anthropicBaseUrl: string;
   genericBaseUrl: string;
@@ -256,7 +257,7 @@ export interface SettingsView {
 export interface SettingsInput {
   provider: ProviderId;
   model: string;
-  temperature: number;
+  temperature: number | null;
   openaiBaseUrl: string;
   anthropicBaseUrl: string;
   genericBaseUrl: string;
@@ -289,6 +290,25 @@ export type ChatEvent =
   | { type: 'error'; conversationId: string; message: string }
   | { type: 'approval-required'; request: ApprovalRequest }
   | { type: 'routine-finished'; run: RoutineRun };
+
+export interface InspectedToken {
+  id: string;
+  kind: 'session' | 'exchanged';
+  label: string;
+  audience: string | null;
+  present: boolean;
+  header: Record<string, unknown>;
+  aud: string | null;
+  scope: string | null;
+  sub: string | null;
+  act: unknown;
+  mayAct: unknown;
+  exp: number | null;
+  iat: number | null;
+  expiresAt: number | null;
+  expiresInMs: number | null;
+  error?: string;
+}
 
 export interface AgentBridge {
   getBranding(): Promise<Branding>;
@@ -328,5 +348,8 @@ export interface AgentBridge {
   listRoutineRuns(id: string): Promise<RoutineRun[]>;
   getSettings(): Promise<SettingsView>;
   saveSettings(input: SettingsInput): Promise<SettingsView>;
+  listTokens(): Promise<InspectedToken[]>;
+  revealToken(id: string): Promise<string>;
+  reexchangeToken(id: string): Promise<InspectedToken>;
   onChatEvent(listener: (event: ChatEvent) => void): () => void;
 }

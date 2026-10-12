@@ -83,6 +83,7 @@ async function boot(): Promise<void> {
     encryptionAvailable,
     env: process.env,
     version: app.getVersion(),
+    dev: !app.isPackaged,
     openExternal: (url) => shell.openExternal(url),
     pickFiles: async () => {
       const chosen = await dialog.showOpenDialog({

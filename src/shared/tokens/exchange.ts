@@ -94,11 +94,20 @@ export class AudienceTokenCache {
   ) {}
 
   async get(audience: string): Promise<TokenSet | null> {
-    const raw = await this.store.get(account(audience));
-    if (!raw) return null;
-    const token = JSON.parse(raw) as TokenSet;
+    const token = await this.read(audience);
+    if (!token) return null;
     if (classifyAccessToken(token, this.now(), this.skewMs) !== 'valid') return null;
     return token;
+  }
+
+  async read(audience: string): Promise<TokenSet | null> {
+    const raw = await this.store.get(account(audience));
+    if (!raw) return null;
+    return JSON.parse(raw) as TokenSet;
+  }
+
+  async delete(audience: string): Promise<void> {
+    await this.store.delete(account(audience));
   }
 
   async put(audience: string, token: TokenSet): Promise<void> {

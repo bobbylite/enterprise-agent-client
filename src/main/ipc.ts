@@ -61,4 +61,7 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
   handle(Ipc.listRoutineRuns, (id: string) => runtime.listRoutineRuns(id));
   handle(Ipc.getSettings, () => runtime.getSettingsAsync());
   handle(Ipc.saveSettings, (input: SettingsInput) => runtime.saveSettings(input));
+  handle(Ipc.listTokens, () => runtime.listInspectedTokens());
+  handle(Ipc.revealToken, (id: string) => runtime.revealInspectedToken(id));
+  handle(Ipc.reexchangeToken, (id: string) => runtime.reexchangeToken(id));
 }

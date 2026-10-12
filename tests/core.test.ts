@@ -6,19 +6,29 @@ import { PiFlowClient, signInStepMessage } from '../src/shared/auth/pi-flow';
 import { waitForLoopbackCode } from '../src/shared/auth/loopback';
 import { classifyAccessToken } from '../src/shared/auth/tokens';
 import { parseBranding } from '../src/shared/branding';
-import { parseEnterpriseConfig } from '../src/shared/config';
+import { parseEnterpriseConfig, tokenInspectorEnabled } from '../src/shared/config';
 import { composeInstructions } from '../src/shared/instructions/compose';
 import { choiceFromUser, previewApproval } from '../src/shared/mcp/approvals';
 import { renderRiskContext } from '../src/shared/protect/context';
+import { buildRiskEvent, resolvePublicIp } from '../src/shared/protect/evaluate';
 import { mockRiskPayload } from '../src/shared/protect/mock';
-import { decideRisk, summarizeRisk } from '../src/shared/protect/policy';
+import { decideRisk, summarizeRisk, unscoredRisk } from '../src/shared/protect/policy';
 import { extractRiskReasons } from '../src/shared/protect/reasons';
+import {
+  createOpenAiProvider,
+  isReasoningModel,
+  openAiChatBody,
+  REASONING_MAX_COMPLETION_TOKENS,
+  unsupportedParameters,
+} from '../src/shared/providers/openai';
 import { parseAnthropicData, parseOpenAiData } from '../src/shared/providers/sse';
 import { mockResult } from '../src/shared/providers/mock';
 import { assertValidCron, cronMatches } from '../src/shared/schedule/cron';
 import { AudienceTokenCache, exchangeSubjectToken } from '../src/shared/tokens/exchange';
 import { MemorySecretStore } from '../src/shared/secrets';
 import { parseEnv, redactSecrets } from '../src/shared/env';
+import { encodeJsonSegment } from '../src/shared/ids';
+import { inspectJwt } from '../src/shared/tokens/inspect';
 
 describe('branding', () => {
   it('requires an app name and does not invent one', () => {
@@ -378,6 +388,52 @@ describe('protect policy', () => {
     expect(text).toContain('Policy action: step_up_mfa');
     expect(text).toContain('Northstar');
   });
+
+  it('defaults unknown risk to restricted tools and tells the agent', () => {
+    const raw = JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')) as {
+      protect: { resolvePublicIp: boolean; policy: { levels: { UNKNOWN?: string } } };
+    };
+    expect(raw.protect.resolvePublicIp).toBe(true);
+    delete raw.protect.policy.levels.UNKNOWN;
+    const parsed = parseEnterpriseConfig(raw);
+    expect(parsed.protect.policy.levels.UNKNOWN).toBe('restrict_tools');
+    const risk = unscoredRisk(parsed.protect.policy, 0, false);
+    expect(risk.level).toBe('UNKNOWN');
+    expect(risk.action).toBe('restrict_tools');
+    const text = renderRiskContext(risk, 'Northstar');
+    expect(text).toContain('Protect did not score this sign-in');
+    expect(text).toContain('Client IP unavailable');
+    expect(text).toContain('Policy action: restrict_tools');
+  });
+});
+
+describe('public IP lookup', () => {
+  it('uses the fallback address when the first lookup fails', async () => {
+    const seen: string[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      seen.push(String(url));
+      expect(init?.signal).toBeTruthy();
+      if (String(url).includes('ipify')) throw new Error('timed out');
+      return new Response('203.0.113.8\n', { status: 200 });
+    };
+    await expect(resolvePublicIp(fetchImpl, 50)).resolves.toBe('203.0.113.8');
+    expect(seen[0]).toContain('api.ipify.org');
+    expect(seen[1]).toContain('checkip.amazonaws.com');
+  });
+
+  it('omits ip from the risk event when lookup cannot produce one', async () => {
+    const fetchImpl: typeof fetch = async () => new Response('nope', { status: 500 });
+    await expect(resolvePublicIp(fetchImpl, 50)).rejects.toThrow(/IP lookup failed/);
+    const event = buildRiskEvent({
+      userId: 'user-1',
+      username: 'ada',
+      userType: 'EXTERNAL',
+      userAgent: 'test',
+      targetId: 'desktop',
+      targetName: 'Desk',
+    });
+    expect(event.ip).toBeUndefined();
+  });
 });
 
 describe('instructions and approvals', () => {
@@ -447,6 +503,87 @@ describe('cron and providers', () => {
     });
     expect(follow.content).toContain('HIGH');
   });
+
+  it('omits temperature for gpt-5 and retries once when the API rejects it', async () => {
+    const request = {
+      model: 'gpt-5',
+      system: 'Be brief.',
+      messages: [{ role: 'user' as const, content: 'Hello' }],
+      tools: [],
+      temperature: 0.2,
+      reasoningEffort: 'medium' as const,
+      apiKey: 'test-key',
+    };
+    const body = openAiChatBody(request);
+    expect(body.temperature).toBeUndefined();
+    expect(body.top_p).toBeUndefined();
+    expect(body.max_completion_tokens).toBe(REASONING_MAX_COMPLETION_TOKENS);
+    expect(body.reasoning_effort).toBe('medium');
+    expect(isReasoningModel('openai/o3-mini')).toBe(true);
+    expect(isReasoningModel('gpt-4o-mini')).toBe(false);
+    expect(openAiChatBody({ ...request, model: 'gpt-4o', reasoningEffort: undefined }).temperature).toBe(0.2);
+    expect(openAiChatBody({ ...request, model: 'gpt-4o', temperature: undefined, reasoningEffort: undefined }).temperature).toBeUndefined();
+    expect(
+      unsupportedParameters("Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported."),
+    ).toEqual(['temperature']);
+
+    const bodies: Record<string, unknown>[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const sent = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(sent);
+      if (sent.temperature !== undefined) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              message: "Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported.",
+            },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'Hello' } }] })}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      );
+    };
+    const result = await createOpenAiProvider(fetchImpl).stream(
+      { ...request, model: 'gpt-4.1', reasoningEffort: undefined },
+      () => undefined,
+    );
+    expect(result.content).toBe('Hello');
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]?.temperature).toBe(0.2);
+    expect(bodies[1]?.temperature).toBeUndefined();
+
+    let calls = 0;
+    const failing: typeof fetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { message: "Unsupported parameter: 'temperature'." } }), { status: 400 });
+    };
+    await expect(
+      createOpenAiProvider(failing).stream({ ...request, model: 'gpt-4.1', reasoningEffort: undefined }, () => undefined),
+    ).rejects.toThrow(/temperature/);
+    expect(calls).toBe(2);
+
+    const raw = JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')) as { provider: { temperature?: number } };
+    expect(raw.provider.temperature).toBeUndefined();
+    const configured = parseEnterpriseConfig({
+      ...JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')),
+      provider: {
+        default: 'openai',
+        openaiBaseUrl: 'https://api.openai.com/v1',
+        openaiModel: 'gpt-5',
+        anthropicBaseUrl: 'https://api.anthropic.com',
+        anthropicModel: 'claude-sonnet-4-5',
+        genericBaseUrl: '',
+        genericModel: 'default',
+        reasoningEffort: 'medium',
+      },
+    });
+    expect(configured.provider.openaiModel).toBe('gpt-5');
+    expect(configured.provider.reasoningEffort).toBe('medium');
+    expect(configured.provider.temperature).toBeUndefined();
+  });
 });
 
 describe('config safety', () => {
@@ -461,6 +598,45 @@ describe('config safety', () => {
       EMPTY: '',
     });
     expect(redactSecrets('Authorization: Bearer abc.def')).toContain('[redacted]');
+  });
+
+  it('shows token claims in the inspector and keeps the raw jwt out of that view', () => {
+    const header = encodeJsonSegment({ alg: 'RS256', typ: 'JWT', kid: 'k1' });
+    const payload = encodeJsonSegment({
+      aud: 'https://mcp.example',
+      scope: 'mcp:tools',
+      sub: 'user-1',
+      act: { sub: 'worker' },
+      may_act: { sub: 'agent' },
+      iat: 1_700_000_000,
+      exp: 1_700_003_600,
+    });
+    const token = `${header}.${payload}.signaturevalue`;
+    const inspected = inspectJwt(token, 1_700_000_000_000);
+    expect(inspected.header).toMatchObject({ alg: 'RS256', kid: 'k1' });
+    expect(inspected).toMatchObject({
+      aud: 'https://mcp.example',
+      scope: 'mcp:tools',
+      sub: 'user-1',
+      act: { sub: 'worker' },
+      mayAct: { sub: 'agent' },
+      exp: 1_700_003_600,
+      iat: 1_700_000_000,
+      expiresInMs: 3_600_000,
+    });
+    expect(JSON.stringify(inspected)).not.toContain(token);
+    expect(redactSecrets(`leaked ${token}`)).toBe('leaked [redacted-jwt]');
+
+    const config = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')));
+    expect(config.tokenExchange.inspectTokens).toBe(true);
+    const omitted = structuredClone(config);
+    delete omitted.tokenExchange.inspectTokens;
+    expect(tokenInspectorEnabled(omitted, false)).toBe(true);
+    omitted.tenant.mode = 'pingone';
+    expect(tokenInspectorEnabled(omitted, false)).toBe(false);
+    expect(tokenInspectorEnabled(omitted, true)).toBe(true);
+    omitted.tokenExchange.inspectTokens = false;
+    expect(tokenInspectorEnabled(omitted, true)).toBe(false);
   });
 });
 

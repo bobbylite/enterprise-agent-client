@@ -128,6 +128,22 @@ button.nav.selected, button.list-item.selected { background: rgba(255, 255, 255,
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin: 16px 0; }
 .card { background: white; border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
 .card.locked textarea { background: #f3eee6; }
+.token-inspector { margin-top: 28px; display: flex; flex-direction: column; gap: 12px; }
+.token-card { display: flex; flex-direction: column; gap: 10px; }
+.claims { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; margin: 0; font-size: 13px; }
+.claims dt { color: #6d645b; }
+.claims dd { margin: 0; word-break: break-word; }
+.jwt {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: #f6f1ea;
+  border-radius: 8px;
+  padding: 10px;
+}
 .status { border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #eee; }
 .status.connected { background: #e5f6ea; color: var(--good); }
 .status.error { background: #fde8e6; color: var(--danger); }

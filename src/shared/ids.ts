@@ -25,11 +25,20 @@ export function encodeJsonSegment(value: unknown): string {
   return base64UrlEncode(new TextEncoder().encode(JSON.stringify(value)));
 }
 
+export function decodeJwtHeader(token: string): Record<string, unknown> {
+  return decodeJwtSegment(token.split('.')[0] ?? '');
+}
+
 export function decodeJwtPayload(token: string): Record<string, unknown> {
   const parts = token.split('.');
   if (parts.length < 2) return {};
+  return decodeJwtSegment(parts[1] ?? '');
+}
+
+function decodeJwtSegment(segment: string): Record<string, unknown> {
+  if (!segment) return {};
   try {
-    const parsed = JSON.parse(decodeBase64Url(parts[1])) as unknown;
+    const parsed = JSON.parse(decodeBase64Url(segment)) as unknown;
     return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
   } catch {
     return {};

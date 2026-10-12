@@ -166,6 +166,31 @@ Provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GENERIC_PROVIDER_API_KEY`
 
 The chat provider in this version is the global settings choice. Per-agent provider values are stored and are not yet what `speak()` uses.
 
+`provider.temperature` is optional. It is sent only when the config or the settings field contains a number. Leave it out to use the model default. Reasoning models (`gpt-5*` and the o-series, such as `o3` and `o4-mini`) never receive `temperature` or `top_p`. Those requests use `max_completion_tokens` and, when set, `provider.reasoningEffort` (`minimal`, `low`, `medium`, or `high`). If the API rejects an unsupported sampling parameter, the client retries that request once without it.
+
+### GPT-5
+
+Set the provider block and put the API key in the environment (it is copied into the OS keychain on launch when that account is empty) or paste it once in Settings:
+
+```json
+"provider": {
+  "default": "openai",
+  "openaiBaseUrl": "https://api.openai.com/v1",
+  "openaiModel": "gpt-5",
+  "anthropicBaseUrl": "https://api.anthropic.com",
+  "anthropicModel": "claude-sonnet-4-5",
+  "genericBaseUrl": "",
+  "genericModel": "default",
+  "reasoningEffort": "medium"
+}
+```
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+Do not set `temperature` for `gpt-5`. The model only accepts the default value.
+
 ## PingOne admin configuration
 
 Use two applications in the same environment. A public PKCE application cannot also be the confidential token-exchange client.
@@ -217,6 +242,8 @@ For each MCP server or downstream API that should receive an exchanged token:
 
 The exchange request is `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, with `subject_token` and `subject_token_type` / `requested_token_type` set to `urn:ietf:params:oauth:token-type:access_token`, plus `audience` and `scope`. Tokens are cached in the keychain until shortly before `expires_in`.
 
+Settings includes a **Tokens** inspector when `tokenExchange.inspectTokens` is true. If the flag is omitted, the inspector is on for mock mode and for an unpackaged dev launch, and off for a packaged PingOne build. Set it to `false` to hide the panel in an enterprise deployment. The panel lists the PingOne session token and each exchanged audience token, with the decoded header and the `aud`, `scope`, `sub`, `act`, `may_act`, `exp`, and `iat` claims, plus time to expiry. **Re-exchange now** refreshes the session token or discards the cached audience token and exchanges it again. The raw JWT stays hidden until **Reveal token**, and **Copy** is available only after that. Tokens are not written to logs.
+
 ### 4. Protect
 
 | Setting | Value |
@@ -228,9 +255,9 @@ The exchange request is `grant_type=urn:ietf:params:oauth:grant-type:token-excha
 
 The client `POST`s `{apiHost}/v1/environments/{envId}/riskEvaluations`. The event includes `ip`, `user.id`, `user.type` (`EXTERNAL` by default), and `sdk.signals.data` from the Signals SDK when the login mode is `pingone`. Mock mode does not load the SDK and does not call PingOne.
 
-IP handling: if `protect.reportedIp` is set, that value is sent. Otherwise `protect.resolvePublicIp` may call `https://api.ipify.org`. In real mode with both unset, evaluation fails closed. After the session is allowed, the client `PUT`s the evaluation with `completionStatus` `SUCCESS`. A block or a failed sign-in sends `FAILED`.
+IP handling: the example config sets `protect.resolvePublicIp` to `true`. The main process calls `https://api.ipify.org` with a 2 second timeout, then `https://checkip.amazonaws.com` if that lookup fails. `protect.reportedIp`, when set, is sent instead and no lookup runs. If no address is available, the client still `POST`s the risk evaluation without `ip`. When PingOne accepts that event, its level is used. When PingOne rejects it, sign-in continues at level `UNKNOWN` and the action configured for that level. The example maps `UNKNOWN` to `restrict_tools`: the session is created, every tool call needs a fresh approval, and the system prompt tells the agent that Protect did not score the sign-in. A Protect error after an IP was sent still stops sign-in. After the session is allowed, the client `PUT`s the evaluation with `completionStatus` `SUCCESS`. A block or a failed sign-in sends `FAILED`.
 
-Map levels and reason codes in `protect.policy`. Reason codes the policy understands: `NEW_DEVICE`, `ANOMALOUS_LOCATION`, `IMPOSSIBLE_TRAVEL`, `BOT`, `ANONYMOUS_NETWORK`. Unknown predictor output is still shown to the user and the agent.
+Map levels and reason codes in `protect.policy`. Levels are `LOW`, `MEDIUM`, `HIGH`, and `UNKNOWN` (default `restrict_tools` when the key is omitted). Reason codes the policy understands: `NEW_DEVICE`, `ANOMALOUS_LOCATION`, `IMPOSSIBLE_TRAVEL`, `BOT`, `ANONYMOUS_NETWORK`. Unknown predictor output is still shown to the user and the agent.
 
 The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-security policy allows the regional PingOne app, auth, and API hosts plus `api.ipify.org`.
 
