@@ -38,7 +38,6 @@ export const enterpriseConfigSchema = z.object({
   }),
   tokenExchange: z.object({
     clientId: z.string(),
-    delegation: z.boolean().default(false),
     inspectTokens: z.boolean().optional(),
     audiences: z.array(
       z.object({

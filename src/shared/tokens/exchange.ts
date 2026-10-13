@@ -14,7 +14,7 @@ export interface ExchangeRequest {
   scope?: string;
   clientId: string;
   clientSecret: string;
-  /** Agent client-credentials token. Sent as RFC 8693 actor_token when delegation is on. */
+  /** AI Agent client-credentials token, sent as RFC 8693 actor_token. */
   actorToken?: string;
   fetchImpl?: typeof fetch;
   now?: () => number;

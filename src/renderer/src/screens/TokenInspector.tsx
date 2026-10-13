@@ -48,7 +48,9 @@ export function TokenInspector({ session }: { session: SessionView | null }) {
         delete copy[id];
         return copy;
       });
-      setNotice(id === 'session' ? 'Session token replaced.' : 'Audience token re-exchanged.');
+      setNotice(
+        id === 'session' ? 'Session token replaced.' : id === 'agent' ? 'Agent token refreshed.' : 'Audience token re-exchanged.',
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -92,15 +94,17 @@ export function TokenInspector({ session }: { session: SessionView | null }) {
     <section className="token-inspector">
       <header className="pane-head">
         <h2>Tokens</h2>
-        <p>PingOne session and RFC 8693 audience tokens for this sign-in. Raw tokens stay hidden until you reveal them.</p>
+        <p>The user access token and the AI Agent access token are the exchange inputs. Each later card is the token returned for one audience. Raw tokens stay hidden until you reveal them.</p>
       </header>
       {!session ? <p className="muted">Sign in to inspect tokens.</p> : null}
+      {notice ? <p className="notice">{notice}</p> : null}
+      {error ? <p className="error">{error}</p> : null}
       {tokens.map((token) => {
         const raw = revealed[token.id];
         return (
           <article key={token.id} className="card token-card">
             <div className="row">
-              <strong>{token.kind === 'session' ? 'PingOne session' : 'Exchanged token'}</strong>
+              <strong>{tokenTitle(token.kind)}</strong>
               <span className="muted">{token.label}</span>
             </div>
             <dl className="claims">
@@ -126,7 +130,7 @@ export function TokenInspector({ session }: { session: SessionView | null }) {
             {token.error ? <p className="error">{token.error}</p> : null}
             <div className="row">
               <button type="button" className="ghost" disabled={busy === token.id || !session} onClick={() => void reexchange(token.id)}>
-                Re-exchange now
+                {refreshLabel(token.kind)}
               </button>
               <button type="button" className="ghost" disabled={busy === token.id || !token.present} onClick={() => void toggleReveal(token.id)}>
                 {raw ? 'Hide token' : 'Reveal token'}
@@ -141,10 +145,20 @@ export function TokenInspector({ session }: { session: SessionView | null }) {
           </article>
         );
       })}
-      {notice ? <p className="notice">{notice}</p> : null}
-      {error ? <p className="error">{error}</p> : null}
     </section>
   );
+}
+
+function tokenTitle(kind: InspectedToken['kind']): string {
+  if (kind === 'session') return 'User access token';
+  if (kind === 'agent') return 'AI Agent access token';
+  return 'Exchanged token';
+}
+
+function refreshLabel(kind: InspectedToken['kind']): string {
+  if (kind === 'session') return 'Refresh session token';
+  if (kind === 'agent') return 'Refresh agent token';
+  return 'Re-exchange now';
 }
 
 function formatHeader(header: Record<string, unknown>): string {
