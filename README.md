@@ -14,7 +14,9 @@ This is the foundation: a runnable Electron app with PingOne sign-in (including 
 | --- | --- |
 | Shell | Electron 44, React 19, TypeScript, Vite via electron-vite |
 | MCP | `@modelcontextprotocol/client` 2.x (stdio, Streamable HTTP, SSE fallback) |
-| Local data | `node:sqlite` (`DatabaseSync`) in the user-data directory |
+| Agent runtime | LangGraph.js in the Electron main process. No Python runtime. |
+| Models | LangChain chat models for OpenAI (including GPT-5 reasoning), Anthropic (extended thinking), the generic HTTP provider, and mock mode |
+| Local data | `node:sqlite` (`DatabaseSync`) in the user-data directory, including the LangGraph thread checkpointer |
 | Secrets | Electron `safeStorage` (macOS Keychain, Windows DPAPI, Linux libsecret). Encrypted blobs sit in SQLite. If encryption is unavailable, secrets stay in memory for that process and are not written to disk. |
 | Platforms | The same code path targets macOS, Windows, and Linux. CI runs on Linux. Installers and code signing are not in this version. |
 
@@ -46,7 +48,11 @@ flowchart TB
     Risk[Protect evaluation]
     Policy[Risk policy]
     Hub[MCP hub]
-    Models[Model providers]
+    Graph[LangGraph.js]
+    Model[Model node]
+    Tools[Tool node]
+    Interrupt[Approval interrupt]
+    Check[(SQLite checkpointer)]
     Cron[Cron scheduler]
   end
   Branding[branding JSON]
@@ -64,10 +70,18 @@ flowchart TB
   Runtime --> Risk
   Risk --> Policy
   Policy --> Runtime
-  Runtime --> Hub
-  Runtime --> Models
+  Runtime --> Graph
+  Graph --> Model
+  Graph --> Tools
+  Tools --> Interrupt
+  Graph --> Check
+  Tools --> Hub
+  Tools --> Exchange
+  Tools --> Policy
   Cron --> Runtime
 ```
+
+A turn is one LangGraph. The model node calls a LangChain chat model and streams tokens, reasoning, and phase changes. The tool node is the only place a tool can run: it applies the Protect action (block, read-only, restrict, or the remembered choice), pauses with `interrupt` for allow once / always / deny, and only then exchanges a token (user subject plus agent actor) and passes that token into the MCP call. Enterprise, persona, user, room, and risk instructions are fields on the graph state. The model node composes them, with the locked enterprise layer first. Group rooms are the same graph with a turn-taking step across each member, and each member keeps its own instructions. Routines and cron start that graph. Threads are checkpointed in SQLite (`langgraph.sqlite` next to attachments) so an approval can resume on a new graph instance. The checkpointer uses `node:sqlite` rather than `better-sqlite3`, which does not load in Electron.
 
 Sign-in, in order:
 
@@ -327,12 +341,12 @@ The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-
 - App shell: login, chat, rooms, routines, tools, instructions, settings.
 - Mock PingOne sign-in with the five risk scenarios, plus the real pi.flow and loopback clients.
 - Keychain session storage, refresh when a refresh token exists, re-auth otherwise.
-- RFC 8693 exchange on the AI Agent client, with the user access token as `subject_token` and the agent's cached client-credentials token as `actor_token`. Worker credentials remain the fallback. Audience tokens are injected into MCP connections.
+- RFC 8693 exchange on the AI Agent client, with the user access token as `subject_token` and the agent's cached client-credentials token as `actor_token`. Worker credentials remain the fallback. The LangGraph tool node exchanges the audience token and injects it into the MCP call.
 - Protect evaluation client, reason extraction, policy engine, and risk text in the system prompt.
 - MCP stdio, Streamable HTTP, and SSE fallback. Server management UI. Per-tool allow once / always / deny. Tool cards in the transcript.
-- Streaming chat for every provider, with a collapsible Thinking panel, live tool status, and stop that keeps the partial answer. `provider.showReasoning` (default true) hides reasoning for an enterprise policy. Chats can be deleted from the list or the open chat. Deleting a room's history leaves the room, its agents, instructions, and routines in place.
+- LangGraph.js turns for chat, group rooms, and routines. Streaming still feeds the Thinking panel, live tool status, and stop that keeps the partial answer. `provider.showReasoning` (default true) hides reasoning for an enterprise policy. Chats can be deleted from the list or the open chat. Deleting a room's history leaves the room, its agents, instructions, and routines in place.
 - Layered instructions. The enterprise layer is read-only in the UI. Persona resets to the branding file. The user layer is editable.
-- Group rooms with a sequential reply from each member, room instructions, routines, and cron while the window is open, with run history.
+- Group rooms as one turn-taking LangGraph over each member, room instructions, routines, and cron while the window is open, with run history. A SQLite checkpointer stores the thread so an approval interrupt can resume.
 - Unit tests, lint, typecheck, and a GitHub Actions workflow.
 
 ## What is stubbed

@@ -14,14 +14,13 @@ import { createPkce, type PkcePair } from '@shared/auth/pkce';
 import { waitForLoopbackCode } from '@shared/auth/loopback';
 import { classifyAccessToken, type TokenSet } from '@shared/auth/tokens';
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
-import { composeInstructions } from '@shared/instructions/compose';
 import { toolKey } from '@shared/mcp/approvals';
 import { buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
 import { mockRiskPayload } from '@shared/protect/mock';
 import { decideRisk, summarizeRisk, unscoredRisk } from '@shared/protect/policy';
 import { extractRiskReasons, riskLevel } from '@shared/protect/reasons';
 import { renderRiskContext } from '@shared/protect/context';
-import { createProvider, defaultModelFor } from '@shared/providers/index';
+import { defaultModelFor } from '@shared/providers/index';
 import type { ProviderMessage } from '@shared/providers/types';
 import { assertValidCron, cronMatches, minuteKey } from '@shared/schedule/cron';
 import type { SecretStore } from '@shared/secrets';
@@ -58,9 +57,10 @@ import type {
   SettingsView,
   InspectedToken,
 } from '@shared/types';
+import { compileAgentGraph, runAgentGraph, type AgentGraph, type GraphParticipant } from './agent-graph';
+import { openCheckpointer, type NodeSqliteSaver } from './checkpoint-sqlite';
 import { Repository, type AgentRow, type McpServerRow } from './db';
 import { McpHub } from './mcp';
-import { runAgentTurn } from './turn';
 
 interface StoredSession {
   accessToken: string;
@@ -102,6 +102,7 @@ export interface RuntimeOptions {
   mockDelayMs?: number;
   version?: string;
   dev?: boolean;
+  checkpointPath?: string;
 }
 
 const SCENARIOS: MockScenario[] = ['low', 'new_device', 'anomalous_location', 'impossible_travel', 'bot'];
@@ -127,6 +128,8 @@ export class Runtime {
   private readonly pi: PiFlowClient;
   private readonly cache: AudienceTokenCache;
   private readonly hub: McpHub;
+  private readonly checkpointer: NodeSqliteSaver;
+  private readonly agentGraph: AgentGraph;
   private firing = false;
   private activeTurn: AbortController | null = null;
   private activeConversationId = '';
@@ -142,6 +145,8 @@ export class Runtime {
     });
     this.cache = new AudienceTokenCache(options.secrets, 60_000, options.now);
     this.hub = new McpHub({ name: options.branding.appName, version: options.version ?? '0.1.0' });
+    this.checkpointer = openCheckpointer(options.checkpointPath ?? join(options.attachmentsDir, 'langgraph.sqlite'));
+    this.agentGraph = compileAgentGraph(this.checkpointer);
   }
 
   static async create(options: RuntimeOptions): Promise<Runtime> {
@@ -153,6 +158,7 @@ export class Runtime {
   async dispose(): Promise<void> {
     this.browserAbort?.abort();
     await this.hub.disconnectAll();
+    this.checkpointer.close();
   }
 
   private now(): number {
@@ -386,7 +392,7 @@ export class Runtime {
     const agent = this.options.db.getAgent(conversation.agentId ?? '') ?? this.defaultAgent();
     this.cancelledConversations.delete(conversationId);
     try {
-      await this.speak(conversationId, agent, undefined);
+      await this.runGraph(conversationId, [{ agent }]);
     } catch (error) {
       if (isCancellation(error)) return;
       const message = redactSecrets(error instanceof Error ? error.message : String(error));
@@ -529,12 +535,11 @@ export class Runtime {
     });
     this.options.db.touchConversation(snapshot.conversation.id, now);
     this.cancelledConversations.delete(snapshot.conversation.id);
-    for (const agentId of room.agentIds) {
-      if (this.cancelledConversations.has(snapshot.conversation.id)) break;
+    const participants = room.agentIds.flatMap((agentId) => {
       const agent = this.options.db.getAgent(agentId);
-      if (!agent) continue;
-      await this.speak(snapshot.conversation.id, agent, room.instructions);
-    }
+      return agent ? [{ agent, room: room.instructions }] : [];
+    });
+    await this.runGraph(snapshot.conversation.id, participants);
   }
 
   stopGeneration(conversationId: string): void {
@@ -847,11 +852,11 @@ export class Runtime {
           createdAt: this.now(),
         });
         const room = this.options.db.getRoom(routine.targetId);
-        for (const agentId of room?.agentIds ?? []) {
+        const participants = (room?.agentIds ?? []).flatMap((agentId) => {
           const agent = this.options.db.getAgent(agentId);
-          if (!agent) continue;
-          output = await this.speak(snapshot.conversation.id, agent, room?.instructions);
-        }
+          return agent ? [{ agent, room: room?.instructions }] : [];
+        });
+        output = await this.runGraph(snapshot.conversation.id, participants);
       } else {
         const agent = this.options.db.getAgent(routine.targetId) ?? this.defaultAgent();
         const now = this.now();
@@ -874,7 +879,7 @@ export class Runtime {
           content: routine.prompt,
           createdAt: now,
         });
-        output = await this.speak(conversation.id, agent, undefined);
+        output = await this.runGraph(conversation.id, [{ agent }]);
       }
       const finished = { finishedAt: this.now(), status: 'success' as const, output, error: null };
       this.options.db.finishRun(run.id, finished);
@@ -891,12 +896,9 @@ export class Runtime {
     }
   }
 
-  private async speak(conversationId: string, agent: AgentRow, room: string | undefined): Promise<string> {
+  private async runGraph(conversationId: string, participants: { agent: AgentRow; room?: string }[]): Promise<string> {
+    if (participants.length === 0 || this.cancelledConversations.has(conversationId)) return '';
     const settings = await this.getSettingsAsync();
-    const provider = createProvider(settings.provider, {
-      fetchImpl: this.options.fetchImpl,
-      delayMs: this.options.mockDelayMs ?? 12,
-    });
     const apiKey = await this.apiKey(settings.provider);
     const baseUrl =
       settings.provider === 'openai'
@@ -906,51 +908,62 @@ export class Runtime {
           : settings.provider === 'generic'
             ? settings.genericBaseUrl
             : undefined;
-    if (this.cancelledConversations.has(conversationId)) return '';
-    const history = this.providerHistory(conversationId);
     const controller = new AbortController();
     this.activeTurn = controller;
     this.activeConversationId = conversationId;
+    const runId = randomId();
     try {
-    return await runAgentTurn({
-      provider,
-      request: {
-        model: settings.model,
-        system: this.systemPrompt(agent, room),
-        temperature: settings.temperature ?? undefined,
-        reasoningEffort: this.options.config.provider.reasoningEffort,
-        showReasoning: this.options.config.provider.showReasoning,
-        apiKey,
-        baseUrl,
-      },
-      messages: history,
-      tools: this.hub.allTools(),
-      conversationId,
-      author: { id: agent.id, name: agent.name },
-      riskAction: this.risk?.action ?? 'allow',
-      remembered: (serverId, toolName) => this.options.db.getToolPreference(serverId, toolName) ?? undefined,
-      rememberAlways: (serverId, toolName) => this.options.db.setToolPreference(serverId, toolName, 'always'),
-      requestApproval: (request) => this.askApproval(request),
-      callTool: (tool, args) => this.hub.call(tool.serverId, tool.name, args),
-      persistMessage: (message) => {
-        this.options.db.insertMessage({
-          id: message.id,
+      return await runAgentGraph({
+        graph: this.agentGraph,
+        checkpointer: this.checkpointer,
+        threadId: `${conversationId}:${runId}`,
+        runId,
+        deps: {
+          provider: settings.provider,
+          model: settings.model,
+          temperature: settings.temperature ?? undefined,
+          reasoningEffort: this.options.config.provider.reasoningEffort,
+          showReasoning: this.options.config.provider.showReasoning,
+          apiKey,
+          baseUrl,
+          delayMs: this.options.mockDelayMs ?? 12,
+          fetchImpl: this.options.fetchImpl,
+          signal: controller.signal,
+          now: () => this.now(),
+          emit: (event) => this.emit(event),
+          requestApproval: (request) => this.askApproval(request),
+          rememberAlways: (serverId, toolName) => this.options.db.setToolPreference(serverId, toolName, 'always'),
+          tokenForServer: (serverId) => this.tokenForServer(serverId),
+          callTool: (tool, args, accessToken) => this.hub.call(tool.serverId, tool.name, args, accessToken),
+          persistMessage: (message) => {
+            this.options.db.insertMessage({
+              id: message.id,
+              conversationId,
+              role: 'assistant',
+              authorId: message.authorId,
+              authorName: message.authorName,
+              content: message.content,
+              reasoning: message.reasoning,
+              reasoningMs: message.reasoningMs,
+              createdAt: this.now(),
+            });
+          },
+          persistTool: (tool) => this.options.db.insertToolInvocation(tool),
+        },
+        initial: {
+          messages: this.providerHistory(conversationId),
+          participants: participants.map((item) => this.participant(item.agent, item.room)),
+          availableTools: this.hub.allTools(),
+          riskAction: this.risk?.action ?? 'allow',
+          remembered: this.rememberedMap(),
+          agentIndex: 0,
+          rounds: 0,
+          toolIndex: 0,
           conversationId,
-          role: 'assistant',
-          authorId: message.authorId,
-          authorName: message.authorName,
-          content: message.content,
-          reasoning: message.reasoning,
-          reasoningMs: message.reasoningMs,
-          createdAt: this.now(),
-        });
-      },
-      persistTool: (tool) => this.options.db.insertToolInvocation(tool),
-      emit: (event) => this.emit(event),
-      showReasoning: this.options.config.provider.showReasoning,
-      signal: controller.signal,
-      now: () => this.now(),
-    });
+          cancelled: false,
+          finalText: '',
+        },
+      });
     } finally {
       if (this.activeTurn === controller) {
         this.activeTurn = null;
@@ -959,25 +972,42 @@ export class Runtime {
     }
   }
 
+  private participant(agent: AgentRow, room?: string): GraphParticipant {
+    const risk = this.risk
+      ? renderRiskContext(this.risk, agent.nameFromBranding ? this.options.branding.agentName : agent.name)
+      : undefined;
+    return {
+      id: agent.id,
+      name: agent.name,
+      appName: this.options.branding.appName,
+      agentName: agent.name,
+      enterprise: this.options.config.enterpriseInstructions,
+      persona: agent.instructions ?? (agent.nameFromBranding ? this.options.branding.persona : emptyFields()),
+      user: agent.userInstructions ?? emptyFields(),
+      room,
+      risk,
+    };
+  }
+
+  private rememberedMap(): Record<string, 'always' | 'deny'> {
+    const remembered: Record<string, 'always' | 'deny'> = {};
+    for (const tool of this.hub.allTools()) {
+      const preference = this.options.db.getToolPreference(tool.serverId, tool.name);
+      if (preference) remembered[`${tool.serverId}\0${tool.name}`] = preference;
+    }
+    return remembered;
+  }
+
+  private async tokenForServer(serverId: string): Promise<string> {
+    const server = this.options.db.listMcpServers().find((item) => item.id === serverId);
+    if (!server?.audience) return '';
+    return this.tokenForAudience(server.audience, server.scope);
+  }
+
   private askApproval(request: ApprovalRequest): Promise<ApprovalChoice> {
     return new Promise((resolve) => {
       this.approvals.set(request.id, resolve);
       this.emit({ type: 'approval-required', request });
-    });
-  }
-
-  private systemPrompt(agent: AgentRow, room?: string): string {
-    const persona = agent.instructions ?? (agent.nameFromBranding ? this.options.branding.persona : emptyFields());
-    const risk = this.risk
-      ? renderRiskContext(this.risk, agent.nameFromBranding ? this.options.branding.agentName : agent.name)
-      : undefined;
-    return composeInstructions({
-      branding: { appName: this.options.branding.appName, agentName: agent.name },
-      enterprise: this.options.config.enterpriseInstructions,
-      persona,
-      user: agent.userInstructions ?? emptyFields(),
-      room,
-      risk,
     });
   }
 

@@ -237,6 +237,93 @@ describe('mock runtime', () => {
     expect(authors).toContain('Reviewer');
   });
 
+  it('runs each agent’s instructions, routines, and cron through the graph', async () => {
+    const systems: string[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      systems.push(JSON.parse(String(init?.body)).system as string);
+      return new Response(JSON.stringify({ content: 'Noted.' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        config.provider.default = 'generic';
+        config.provider.genericBaseUrl = 'https://llm.example/generate';
+      },
+      fetchImpl,
+    );
+    try {
+      await runtime.submitCredentials('ada', 'secret', '');
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      expect(branded?.name).toBe('Northstar');
+      const brandedPage = runtime.openAgent(branded!.id);
+      runtime.saveAgent({
+        id: branded!.id,
+        name: branded!.name,
+        provider: 'mock',
+        model: 'mock-1',
+        persona: brandedPage.persona,
+        user: { ...brandedPage.user, communicationStyle: 'Branded user layer.' },
+      });
+      const reviewer = runtime.openAgent('reviewer');
+      runtime.saveAgent({
+        id: reviewer.profile.id,
+        name: reviewer.profile.name,
+        provider: 'mock',
+        model: 'mock-1',
+        persona: { ...reviewer.persona, persona: 'Reviewer persona only.' },
+        user: { ...reviewer.user, communicationStyle: 'Reviewer user layer.' },
+      });
+
+      await runtime.sendRoomMessage(runtime.listRooms()[0].id, 'What should we watch for?');
+      expect(systems).toHaveLength(2);
+      const brandedTurn = systems.find((system) => system.includes('Branded user layer.'));
+      const reviewerTurn = systems.find((system) => system.includes('Reviewer persona only.'));
+      expect(brandedTurn).toBeTruthy();
+      expect(brandedTurn).not.toContain('Reviewer user layer.');
+      expect(brandedTurn).not.toContain('Reviewer persona only.');
+      expect(reviewerTurn).toContain('Reviewer user layer.');
+      expect(reviewerTurn).not.toContain('Branded user layer.');
+
+      systems.length = 0;
+      const routine = runtime.saveRoutine({
+        name: 'Branded check',
+        prompt: 'Check the branded agent only.',
+        agentId: branded!.id,
+        targetType: 'agent',
+        targetId: branded!.id,
+        cron: '0 9 * * 1-5',
+        enabled: false,
+      });
+      const manual = await runtime.runRoutine(routine.id);
+      expect(manual.status).toBe('success');
+      expect(systems).toHaveLength(1);
+      expect(systems[0]).toContain('Branded user layer.');
+      expect(systems[0]).not.toContain('Reviewer user layer.');
+
+      systems.length = 0;
+      const cron = runtime.saveRoutine({
+        name: 'Branded cron',
+        prompt: 'Cron the branded agent.',
+        agentId: branded!.id,
+        targetType: 'agent',
+        targetId: branded!.id,
+        cron: '* * * * *',
+        enabled: true,
+      });
+      const fired = await runtime.fireDueRoutines(new Date('2026-10-13T12:00:00Z'));
+      expect(fired.map((item) => item.routineId)).toEqual([cron.id]);
+      expect(fired[0]?.status).toBe('success');
+      expect(systems).toHaveLength(1);
+      expect(systems[0]).toContain('Branded user layer.');
+      expect(systems[0]).not.toContain('Reviewer persona only.');
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
   it('lists session and audience tokens and can re-exchange without returning the raw jwt', async () => {
     const { runtime } = await boot();
     await runtime.submitCredentials('ada', 'secret', '');
