@@ -64,11 +64,14 @@ export function openAiTurnFields(input: {
     useResponsesApi: reasoning && input.showReasoning && !omit.has('responses'),
   };
   if (!reasoning && input.temperature !== undefined && !omit.has('temperature')) fields.temperature = input.temperature;
-  if (reasoning && input.reasoningEffort && !omit.has('reasoning_effort')) {
-    fields.reasoning = {
-      effort: input.reasoningEffort,
-      ...(input.showReasoning ? { summary: 'auto' as const } : {}),
-    };
+  if (reasoning && !omit.has('reasoning_effort')) {
+    const effort = input.reasoningEffort ?? (input.showReasoning ? 'medium' : undefined);
+    if (effort) {
+      fields.reasoning = {
+        effort,
+        ...(input.showReasoning ? { summary: 'auto' as const } : {}),
+      };
+    }
   }
   return fields;
 }
@@ -233,6 +236,10 @@ async function consumeModel(
   return { content, toolCalls: [...calls.values()] };
 }
 
+export function readModelChunk(chunk: AIMessageChunk): { text: string; reasoning: string } {
+  return readChunk(chunk);
+}
+
 function readChunk(chunk: AIMessageChunk): { text: string; reasoning: string } {
   let text = '';
   let reasoning = '';
@@ -240,24 +247,41 @@ function readChunk(chunk: AIMessageChunk): { text: string; reasoning: string } {
   if (blocks.length > 0) {
     for (const block of blocks) {
       if (block.type === 'text') text += block.text ?? '';
-      if (block.type === 'reasoning') reasoning += block.reasoning ?? '';
+      else reasoning += reasoningBlockText(block);
     }
   } else if (typeof chunk.content === 'string') {
     text += chunk.content;
   } else if (Array.isArray(chunk.content)) {
     for (const block of chunk.content) {
       if (typeof block === 'string') text += block;
-      else if (block && typeof block === 'object' && 'type' in block) {
-        const record = block as { type?: string; text?: string; reasoning?: string };
+      else if (block && typeof block === 'object') {
+        const record = block as { type?: string; text?: string };
         if (record.type === 'text' && record.text) text += record.text;
-        if (record.type === 'reasoning' && record.reasoning) reasoning += record.reasoning;
+        else reasoning += reasoningBlockText(record);
       }
     }
   }
-  if (!reasoning && typeof chunk.additional_kwargs?.reasoning === 'string') {
-    reasoning += chunk.additional_kwargs.reasoning;
-  }
+  if (!reasoning) reasoning = reasoningSummary(chunk.additional_kwargs?.reasoning);
   return { text, reasoning };
+}
+
+function reasoningBlockText(block: object): string {
+  const record = block as { type?: string; reasoning?: unknown; thinking?: unknown; summary?: unknown };
+  if (record.type !== 'reasoning' && record.type !== 'thinking') return '';
+  if (typeof record.reasoning === 'string' && record.reasoning) return record.reasoning;
+  if (typeof record.thinking === 'string' && record.thinking) return record.thinking;
+  return reasoningSummary(record);
+}
+
+function reasoningSummary(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return '';
+  const summary = (value as { summary?: unknown }).summary;
+  if (typeof summary === 'string') return summary;
+  if (!Array.isArray(summary)) return '';
+  return summary
+    .map((part) => (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : ''))
+    .join('');
 }
 
 function toLangChainMessages(system: string, messages: ModelTurnMessage[]): BaseMessage[] {
