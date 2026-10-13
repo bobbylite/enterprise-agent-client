@@ -103,6 +103,7 @@ export interface RuntimeOptions {
 }
 
 const SCENARIOS: MockScenario[] = ['low', 'new_device', 'anomalous_location', 'impossible_travel', 'bot'];
+const AGENT_TOKEN_ACCOUNT = 'agentAccessToken';
 
 export class Runtime {
   private session: StoredSession | null = null;
@@ -670,7 +671,7 @@ export class Runtime {
   async listInspectedTokens(): Promise<InspectedToken[]> {
     this.assertInspector();
     this.requireSession();
-    const tokens = [this.describeSession()];
+    const tokens = [this.describeSession(), await this.describeAgent()];
     for (const audience of this.options.config.tokenExchange.audiences) {
       tokens.push(await this.describeAudience(audience));
     }
@@ -681,6 +682,11 @@ export class Runtime {
     this.assertInspector();
     this.requireSession();
     if (id === 'session') return this.session?.accessToken ?? '';
+    if (id === 'agent') {
+      const cached = await this.readAgentToken();
+      if (!cached?.accessToken) throw new Error('The AI Agent access token has not been minted yet.');
+      return cached.accessToken;
+    }
     const audience = this.audienceById(id);
     const cached = await this.cache.read(audience.audience);
     if (!cached?.accessToken) throw new Error('That audience has no exchanged token yet.');
@@ -693,6 +699,17 @@ export class Runtime {
     if (id === 'session') {
       await this.refreshSessionToken();
       return this.describeSession();
+    }
+    if (id === 'agent') {
+      await this.options.secrets.delete(AGENT_TOKEN_ACCOUNT);
+      this.agentActorToken = null;
+      this.exchangeErrors.delete('agent');
+      try {
+        await this.actorAccessToken();
+      } catch (error) {
+        this.exchangeErrors.set('agent', redactSecrets(error instanceof Error ? error.message : String(error)));
+      }
+      return this.describeAgent();
     }
     const audience = this.audienceById(id);
     await this.cache.delete(audience.audience);
@@ -1114,6 +1131,12 @@ export class Runtime {
 
   private async exchangeAudiences(): Promise<void> {
     if (!this.session) return;
+    try {
+      await this.actorAccessToken();
+      this.exchangeErrors.delete('agent');
+    } catch (error) {
+      this.exchangeErrors.set('agent', error instanceof Error ? error.message : String(error));
+    }
     for (const audience of this.options.config.tokenExchange.audiences) {
       try {
         await this.tokenForAudience(audience.audience, audience.scope);
@@ -1126,18 +1149,16 @@ export class Runtime {
 
   private async tokenForAudience(audience: string, scope: string): Promise<string> {
     if (!this.session) throw new Error('Sign in before requesting an audience token.');
+    const actorToken = await this.actorAccessToken();
     if (this.options.config.tenant.mode === 'mock') {
       const cached = await this.cache.get(audience);
       if (cached) return cached.accessToken;
-      const token = this.mockToken(this.session.userId, audience, scope);
+      const token = this.mockToken(this.session.userId, audience, scope, true);
       await this.cache.put(audience, token);
       return token.accessToken;
     }
     const subject = await this.subjectToken();
     const client = await this.exchangeClient();
-    const actorToken = this.options.config.tokenExchange.delegation
-      ? await this.actorAccessToken(client.clientId, client.clientSecret)
-      : undefined;
     const token = await getOrExchange({
       cache: this.cache,
       tokenEndpoint: tokenEndpoint(this.options.config),
@@ -1165,18 +1186,37 @@ export class Runtime {
     );
   }
 
-  private async actorAccessToken(clientId: string, clientSecret: string): Promise<string> {
-    if (this.agentActorToken && classifyAccessToken(this.agentActorToken, this.now()) === 'valid') {
-      return this.agentActorToken.accessToken;
+  private async actorAccessToken(): Promise<string> {
+    const cached = await this.readAgentToken();
+    if (cached && classifyAccessToken(cached, this.now()) === 'valid') {
+      this.agentActorToken = cached;
+      return cached.accessToken;
     }
-    this.agentActorToken = await fetchClientCredentials({
+    const fresh =
+      this.options.config.tenant.mode === 'mock'
+        ? this.mockAgentToken()
+        : await this.fetchAgentToken();
+    this.agentActorToken = fresh;
+    await this.options.secrets.set(AGENT_TOKEN_ACCOUNT, JSON.stringify(fresh));
+    return fresh.accessToken;
+  }
+
+  private async fetchAgentToken(): Promise<TokenSet> {
+    const client = await this.exchangeClient();
+    return fetchClientCredentials({
       tokenEndpoint: tokenEndpoint(this.options.config),
-      clientId,
-      clientSecret,
+      clientId: client.clientId,
+      clientSecret: client.clientSecret,
       fetchImpl: this.options.fetchImpl,
       now: () => this.now(),
     });
-    return this.agentActorToken.accessToken;
+  }
+
+  private async readAgentToken(): Promise<TokenSet | null> {
+    if (this.agentActorToken) return this.agentActorToken;
+    const raw = await this.options.secrets.get(AGENT_TOKEN_ACCOUNT);
+    if (!raw) return null;
+    return JSON.parse(raw) as TokenSet;
   }
 
   private async subjectToken(): Promise<string> {
@@ -1258,7 +1298,16 @@ export class Runtime {
     }
   }
 
-  private mockToken(userId: string, audience = 'user', scope?: string): TokenSet {
+  private mockAgentToken(): TokenSet {
+    const clientId = this.agentClientId();
+    return this.mockToken(clientId, clientId);
+  }
+
+  private agentClientId(): string {
+    return this.options.config.tokenExchange.clientId.trim() || 'agent';
+  }
+
+  private mockToken(userId: string, audience = 'user', scope?: string, includeAct = false): TokenSet {
     const expiresAt = this.now() + 8 * 60 * 60 * 1000;
     const tokenScope = scope ?? (audience === 'user' ? this.options.config.tenant.scopes.join(' ') : undefined);
     const claims: Record<string, unknown> = {
@@ -1270,9 +1319,7 @@ export class Runtime {
       jti: randomId(),
       mock: true,
     };
-    if (audience !== 'user' && this.options.config.tokenExchange.delegation) {
-      claims.act = { sub: this.options.config.tokenExchange.clientId || 'agent' };
-    }
+    if (includeAct) claims.act = { sub: this.agentClientId() };
     const accessToken = `${encodeJsonSegment({ alg: 'none', typ: 'mock' })}.${encodeJsonSegment(claims)}.mock`;
     return { accessToken, expiresAt, tokenType: 'Bearer', scope: tokenScope };
   }
@@ -1293,7 +1340,22 @@ export class Runtime {
 
   private describeSession(): InspectedToken {
     const token = this.session?.accessToken ?? '';
-    return this.describeToken('session', 'session', 'PingOne session', null, token, this.session?.expiresAt);
+    return this.describeToken('session', 'session', 'SSO subject token', null, token, this.session?.expiresAt);
+  }
+
+  private async describeAgent(): Promise<InspectedToken> {
+    const cached = await this.readAgentToken();
+    const error = this.exchangeErrors.get('agent');
+    return this.describeToken(
+      'agent',
+      'agent',
+      'client_credentials actor token',
+      null,
+      cached?.accessToken ?? '',
+      cached?.expiresAt,
+      cached?.scope,
+      error ? redactSecrets(error) : cached ? undefined : 'The AI Agent access token has not been minted yet.',
+    );
   }
 
   private async describeAudience(

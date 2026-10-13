@@ -16,7 +16,6 @@
   },
   "tokenExchange": {
     "clientId": "",
-    "delegation": false,
     "inspectTokens": true,
     "audiences": [
       {

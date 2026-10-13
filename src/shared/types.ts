@@ -295,7 +295,7 @@ export type ChatEvent =
 
 export interface InspectedToken {
   id: string;
-  kind: 'session' | 'exchanged';
+  kind: 'session' | 'agent' | 'exchanged';
   label: string;
   audience: string | null;
   present: boolean;

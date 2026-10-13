@@ -655,7 +655,7 @@ describe('config safety', () => {
 
     const config = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')));
     expect(config.tokenExchange.inspectTokens).toBe(true);
-    expect(config.tokenExchange.delegation).toBe(false);
+    expect(config.tokenExchange).not.toHaveProperty('delegation');
     const omitted = structuredClone(config);
     delete omitted.tokenExchange.inspectTokens;
     expect(tokenInspectorEnabled(omitted, false)).toBe(true);

@@ -170,14 +170,24 @@ describe('mock runtime', () => {
     expect(await secrets.get('agentClientSecret')).toBe('typed-agent');
   });
 
-  it('puts an act claim on mock audience tokens when delegation is on', async () => {
+  it('lists the user token, the agent token, and an exchanged token that carries act', async () => {
     const { runtime } = await boot(0, (config) => {
-      config.tokenExchange.delegation = true;
       config.tokenExchange.clientId = 'agent-id';
     });
     await runtime.submitCredentials('ada', 'secret', '');
-    const exchanged = (await runtime.listInspectedTokens()).find((item) => item.id === 'echo-local');
+    const listed = await runtime.listInspectedTokens();
+    const session = listed.find((item) => item.id === 'session');
+    const agent = listed.find((item) => item.id === 'agent');
+    const exchanged = listed.find((item) => item.id === 'echo-local');
+    expect(listed.map((item) => item.kind)).toEqual(['session', 'agent', 'exchanged']);
+    expect(session?.act).toBeNull();
+    expect(agent).toMatchObject({ kind: 'agent', sub: 'agent-id', present: true, act: null });
     expect(exchanged?.act).toEqual({ sub: 'agent-id' });
+    const agentJwt = await runtime.revealInspectedToken('agent');
+    expect(JSON.stringify(listed)).not.toContain(agentJwt);
+    const refreshed = await runtime.reexchangeToken('agent');
+    expect(refreshed.kind).toBe('agent');
+    expect(await runtime.revealInspectedToken('agent')).not.toBe(agentJwt);
   });
 
   it('hides token inspection when the admin flag is off', async () => {
@@ -296,37 +306,35 @@ describe('pi.flow runtime', () => {
     expect(events[0]?.ip).toBeUndefined();
   });
 
-  it('exchanges with the AI Agent client and keeps Protect on the worker', async () => {
-    const grants = await captureGrants({ delegation: false });
+  it('exchanges every audience with one cached AI Agent token as actor_token', async () => {
+    const grants = await captureGrants({ audiences: 2 });
     const exchanged = grants.filter((grant) => grant.grant.includes('token-exchange'));
-    const credentials = grants.filter((grant) => grant.grant === 'client_credentials');
-    expect(exchanged).toHaveLength(1);
-    expect(exchanged[0]?.basic).toBe('agent-id:agent-secret');
-    expect(exchanged[0]?.actor).toBeUndefined();
-    expect(credentials.map((grant) => grant.basic)).toContain('worker-id:worker-secret');
-    expect(credentials.some((grant) => grant.basic.startsWith('agent-id:'))).toBe(false);
+    const agentCalls = grants.filter((grant) => grant.grant === 'client_credentials' && grant.basic === 'agent-id:agent-secret');
+    const workerCalls = grants.filter((grant) => grant.grant === 'client_credentials' && grant.basic === 'worker-id:worker-secret');
+    expect(agentCalls).toHaveLength(1);
+    expect(agentCalls[0]?.accessToken).toBe('agent-actor-token');
+    expect(workerCalls.length).toBeGreaterThan(0);
+    expect(exchanged).toHaveLength(2);
+    for (const grant of exchanged) {
+      expect(grant.basic).toBe('agent-id:agent-secret');
+      expect(grant.subject).toBe('user-token');
+      expect(grant.subjectType).toBe('urn:ietf:params:oauth:token-type:access_token');
+      expect(grant.actor).toBe('agent-actor-token');
+      expect(grant.actorType).toBe('urn:ietf:params:oauth:token-type:access_token');
+    }
   });
 
   it('falls back to the worker client when the AI Agent secret is absent', async () => {
-    const grants = await captureGrants({ delegation: false, agentSecret: false });
+    const grants = await captureGrants({ agentSecret: false });
     const exchanged = grants.filter((grant) => grant.grant.includes('token-exchange'));
     expect(exchanged).toHaveLength(1);
     expect(exchanged[0]?.basic).toBe('worker-id:worker-secret');
-  });
-
-  it('sends the AI Agent client-credentials token as actor_token when delegation is on', async () => {
-    const grants = await captureGrants({ delegation: true });
-    const exchanged = grants.find((grant) => grant.grant.includes('token-exchange'));
-    const actor = grants.find((grant) => grant.grant === 'client_credentials' && grant.basic === 'agent-id:agent-secret');
-    const worker = grants.find((grant) => grant.grant === 'client_credentials' && grant.basic === 'worker-id:worker-secret');
-    expect(actor?.accessToken).toBe('agent-actor-token');
-    expect(worker?.accessToken).toBe('worker-cc-token');
-    expect(exchanged?.basic).toBe('agent-id:agent-secret');
-    expect(exchanged?.actor).toBe('agent-actor-token');
+    expect(exchanged[0]?.actor).toBe('worker-cc-token');
+    expect(exchanged[0]?.subject).toBe('user-token');
   });
 });
 
-async function captureGrants(input: { delegation: boolean; agentSecret?: boolean }): Promise<TokenGrant[]> {
+async function captureGrants(input: { agentSecret?: boolean; audiences?: number }): Promise<TokenGrant[]> {
   const grants: TokenGrant[] = [];
   const secrets = new MemorySecretStore();
   await secrets.set('workerClientSecret', 'worker-secret');
@@ -340,8 +348,11 @@ async function captureGrants(input: { delegation: boolean; agentSecret?: boolean
       config.tenant.environmentId = 'env-1';
       config.tenant.clientId = 'public-client';
       config.tokenExchange.clientId = 'agent-id';
-      config.tokenExchange.delegation = input.delegation;
-      config.tokenExchange.audiences = [{ id: 'echo', audience: 'https://mcp.example', scope: 'mcp:tools' }];
+      config.tokenExchange.audiences = Array.from({ length: input.audiences ?? 1 }, (_, index) => ({
+        id: `echo-${index}`,
+        audience: `https://mcp.example/${index}`,
+        scope: 'mcp:tools',
+      }));
       config.protect.enabled = true;
       config.protect.reportedIp = '203.0.113.9';
       config.protect.resolvePublicIp = false;
@@ -359,6 +370,9 @@ interface TokenGrant {
   grant: string;
   basic: string;
   actor?: string;
+  actorType?: string;
+  subject?: string;
+  subjectType?: string;
   accessToken: string;
 }
 
@@ -398,7 +412,15 @@ function tokenFetch(grants: TokenGrant[]): typeof fetch {
           : grant.includes('token-exchange')
             ? 'exchanged-token'
             : 'user-token';
-      grants.push({ grant, basic, actor: body.get('actor_token') ?? undefined, accessToken });
+      grants.push({
+        grant,
+        basic,
+        actor: body.get('actor_token') ?? undefined,
+        actorType: body.get('actor_token_type') ?? undefined,
+        subject: body.get('subject_token') ?? undefined,
+        subjectType: body.get('subject_token_type') ?? undefined,
+        accessToken,
+      });
       return json(200, { access_token: accessToken, expires_in: 3600, token_type: 'Bearer' });
     }
     if (target.includes('/riskEvaluations') && method === 'POST') {
