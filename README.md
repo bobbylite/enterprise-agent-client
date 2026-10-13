@@ -76,7 +76,7 @@ Sign-in, in order:
 3. Protect runs a risk evaluation before the session is stored. Policy maps the level and reason codes to one action: allow, step-up MFA, restrict tools, read-only, or block. The most restrictive matching action wins.
 4. A blocked result never stores a session. Step-up restarts the flow with `acr_values` when that value is configured. Mock mode accepts any 6-digit one-time code for the new-device scenario.
 5. The user token is stored in the keychain. If a refresh token exists, expiry refreshes it. Otherwise the user signs in again.
-6. Each configured audience is exchanged (RFC 8693) and cached until expiry. MCP connections receive that token: HTTP and SSE via the client auth provider, stdio via `MCP_ACCESS_TOKEN`.
+6. Each configured audience is exchanged (RFC 8693) with the AI Agent application and cached until expiry. MCP connections receive that token: HTTP and SSE via the client auth provider, stdio via `MCP_ACCESS_TOKEN`. When `tokenExchange.delegation` is on, the exchange also sends the agent application's own client-credentials token as `actor_token`.
 
 The agent is risk-aware. The composed system prompt is enterprise policy, then persona, then the user layer, then optional room instructions, then the current risk context (level, reasons, and the behaviour the policy requires).
 
@@ -113,7 +113,14 @@ cp config/enterprise.example.json config/enterprise.json
 cp .env.example .env
 ```
 
-In `config/enterprise.json` set `tenant.mode` to `pingone` and fill the hosts, environment id, and public client id. Put the worker client id and secret in `.env` (`PINGONE_WORKER_CLIENT_ID`, `PINGONE_WORKER_CLIENT_SECRET`). The settings screen can also store the worker secret in the OS keychain. Config parsing rejects secret-looking keys so a client secret cannot be committed inside JSON.
+In `config/enterprise.json` set `tenant.mode` to `pingone` and fill the hosts, environment id, and public client id. Protect and token exchange use different confidential applications:
+
+| Purpose | Client id | Secret |
+| --- | --- | --- |
+| PingOne Protect | `PINGONE_WORKER_CLIENT_ID` | `PINGONE_WORKER_CLIENT_SECRET` |
+| RFC 8693 token exchange | `tokenExchange.clientId` | `PINGONE_AGENT_CLIENT_SECRET` |
+
+Both secrets are copied into the OS keychain on launch when that account is empty (`workerClientSecret` and `agentClientSecret`). Settings can store either secret as well. If `tokenExchange.clientId` or `PINGONE_AGENT_CLIENT_SECRET` is unset, token exchange falls back to the worker id and secret, so a deployment that still uses one confidential application keeps working. When both are set, exchange uses the AI Agent application and Protect stays on the worker. Config parsing rejects secret-looking keys so a client secret cannot be committed inside JSON.
 
 `BRANDING_PATH` overrides the branding file. `ENTERPRISE_CONFIG` overrides the enterprise file. The defaults are `branding/default.json` and, when present, `config/enterprise.json`, otherwise the example.
 
@@ -193,7 +200,7 @@ Do not set `temperature` for `gpt-5`. The model only accepts the default value.
 
 ## PingOne admin configuration
 
-Use two applications in the same environment. A public PKCE application cannot also be the confidential token-exchange client.
+Use three applications in the same environment. The public PKCE application cannot be the confidential token-exchange client, and the Protect worker is a different application from the AI Agent that holds the Token Exchange grant.
 
 ### 1. Native or single-page application (interactive login)
 
@@ -221,30 +228,82 @@ pi.flow actions are `POST`ed to the `_links` href for that action. When the stat
 
 `COMPLETED` (and `COMPLETED_ACCEPTED` when it carries a code) is read from `authorizeResponse.code` or from the resume URL. The code is exchanged at `{authHost}/{envId}/as/token` with `grant_type=authorization_code`, the PKCE verifier, and no client secret.
 
-### 2. Worker application (token exchange and Protect)
+### 2. Worker application (Protect only)
 
 | Setting | Value |
 | --- | --- |
 | Application type | Worker |
-| Grant types | Token Exchange, Client Credentials |
+| Grant types | Client Credentials |
+| Token endpoint authentication | `CLIENT_SECRET_BASIC` |
+| Role | A custom role that can create and update risk evaluations. Do not grant Environment Admin. |
+
+Store the client id in `PINGONE_WORKER_CLIENT_ID` and the secret in `PINGONE_WORKER_CLIENT_SECRET` (or paste the secret in Settings). Client credentials mint the worker token used as the bearer on Protect. This application does not need the Token Exchange grant. Sending its credentials to the token endpoint returns `Unsupported grant type`.
+
+### 3. AI Agent application (token exchange)
+
+In the PingOne admin console, open **Applications → AI Agents** and register the desktop agent (the sample branding calls this app Pingy; the product name comes from your branding file).
+
+| Setting | Value |
+| --- | --- |
+| Application type | AI Agent |
+| Grant types | Token Exchange. Also Client Credentials when `tokenExchange.delegation` is true |
 | Token endpoint authentication | `CLIENT_SECRET_BASIC` |
 | Resource grants | Each custom resource the desktop should call |
 
-Store the client id and secret in the environment or the keychain, not in git. Client credentials mint the worker token used as the bearer on Protect. Token exchange uses the same worker identity as the confidential client, with the user's access token as the subject.
+Put that application's client id in `tokenExchange.clientId`. Put the secret in `PINGONE_AGENT_CLIENT_SECRET`. The secret is stored in the keychain and is never written to the enterprise JSON. Leave `tokenExchange.delegation` false until the attribute mappings below are in place.
 
-### 3. Custom resources (audiences)
+```json
+"tokenExchange": {
+  "clientId": "<AI Agent application client id>",
+  "delegation": false,
+  "inspectTokens": true,
+  "audiences": []
+}
+```
+
+```bash
+PINGONE_WORKER_CLIENT_ID=<Protect worker client id>
+PINGONE_WORKER_CLIENT_SECRET=<Protect worker secret>
+PINGONE_AGENT_CLIENT_SECRET=<AI Agent application secret>
+```
+
+### 4. Custom resources (audiences)
 
 For each MCP server or downstream API that should receive an exchanged token:
 
 - Create a custom resource. The audience URL must not contain `pingone` or `pingidentity`.
-- Grant the worker application that resource and the scopes the server expects.
+- Grant the **AI Agent** application that resource and the scopes the server expects. The Protect worker does not need these grants.
 - Add an entry under `tokenExchange.audiences` with `audience`, `scope`, and the `serverId` of the MCP server that should receive the token.
 
-The exchange request is `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, with `subject_token` and `subject_token_type` / `requested_token_type` set to `urn:ietf:params:oauth:token-type:access_token`, plus `audience` and `scope`. Tokens are cached in the keychain until shortly before `expires_in`.
+The exchange request is `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, with `subject_token` and `subject_token_type` / `requested_token_type` set to `urn:ietf:params:oauth:token-type:access_token`, plus `audience` and `scope`. The confidential client on that request is the AI Agent application (HTTP Basic). Tokens are cached in the keychain until shortly before `expires_in`.
+
+### 5. Delegation and the `act` claim
+
+Set `tokenExchange.delegation` to `true` to send the AI Agent application's own client-credentials access token as `actor_token`, with `actor_token_type` set to `urn:ietf:params:oauth:token-type:access_token`. That token is minted from `tokenExchange.clientId` and `PINGONE_AGENT_CLIENT_SECRET`. It is not the Protect worker token.
+
+PingOne does not add an `act` claim unless you map it. The subject token must already contain `may_act.sub` equal to the AI Agent application's client id. A required `act` mapping then fails the exchange when the actor does not match.
+
+On the resource that issues the user's access token, map `may_act` so a pure client-credentials token omits it and a user token names this application:
+
+```
+(#root.context.requestData.grantType == "client_credentials")?null:({ "sub": #root.context.appConfig.clientId })
+```
+
+On the custom resource that the exchange calls, map `sub` from the subject token:
+
+```
+#root.context.requestData.subjectToken.sub
+```
+
+Map `act` on that same resource. Mark it required if a mismatch should fail the exchange. The `"noActor"` branch keeps a client-credentials call to this resource from copying a user actor:
+
+```
+(#root.context.requestData.grantType == "client_credentials")?"noActor":((#root.context.requestData.subjectToken.may_act.sub == #root.context.requestData.actorToken.client_id)?#root.context.requestData.subjectToken.may_act:null)
+```
 
 Settings includes a **Tokens** inspector when `tokenExchange.inspectTokens` is true. If the flag is omitted, the inspector is on for mock mode and for an unpackaged dev launch, and off for a packaged PingOne build. Set it to `false` to hide the panel in an enterprise deployment. The panel lists the PingOne session token and each exchanged audience token, with the decoded header and the `aud`, `scope`, `sub`, `act`, `may_act`, `exp`, and `iat` claims, plus time to expiry. **Re-exchange now** refreshes the session token or discards the cached audience token and exchanges it again. The raw JWT stays hidden until **Reveal token**, and **Copy** is available only after that. Tokens are not written to logs.
 
-### 4. Protect
+### 6. Protect
 
 | Setting | Value |
 | --- | --- |
@@ -267,7 +326,7 @@ The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-
 - App shell: login, chat, rooms, routines, tools, instructions, settings.
 - Mock PingOne sign-in with the five risk scenarios, plus the real pi.flow and loopback clients.
 - Keychain session storage, refresh when a refresh token exists, re-auth otherwise.
-- RFC 8693 exchange and audience cache, injected into MCP connections.
+- RFC 8693 exchange with a separate AI Agent client (worker credentials remain the fallback), optional `actor_token` delegation, and an audience cache injected into MCP connections.
 - Protect evaluation client, reason extraction, policy engine, and risk text in the system prompt.
 - MCP stdio, Streamable HTTP, and SSE fallback. Server management UI. Per-tool allow once / always / deny. Tool cards in the transcript.
 - Streaming chat, markdown, history, attachments, and providers: mock (default), OpenAI-compatible, Anthropic, and a generic HTTP provider.

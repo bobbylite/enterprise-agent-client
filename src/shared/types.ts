@@ -251,6 +251,7 @@ export interface SettingsView {
     anthropic: boolean;
     generic: boolean;
     worker: boolean;
+    agent: boolean;
   };
 }
 
@@ -265,7 +266,8 @@ export interface SettingsInput {
   anthropicApiKey?: string;
   genericApiKey?: string;
   workerClientSecret?: string;
-  clearKeys?: Array<'openai' | 'anthropic' | 'generic' | 'worker'>;
+  agentClientSecret?: string;
+  clearKeys?: Array<'openai' | 'anthropic' | 'generic' | 'worker' | 'agent'>;
 }
 
 export interface ApprovalRequest {

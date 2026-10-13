@@ -346,6 +346,32 @@ describe('token exchange', () => {
     expect(await cache.get('https://mcp.example')).toBeNull();
     expect(calls).toBe(1);
   });
+
+  it('adds actor_token only when an actor token is supplied', async () => {
+    const bodies: string[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      bodies.push(String(init?.body));
+      const authorization = new Headers(init?.headers).get('authorization') ?? '';
+      expect(Buffer.from(authorization.replace(/^Basic /, ''), 'base64').toString('utf8')).toBe('agent-id:agent-secret');
+      return json(200, { access_token: 'aud-token', expires_in: 120, token_type: 'Bearer' });
+    };
+    const request = {
+      tokenEndpoint: 'https://auth.example/env/as/token',
+      subjectToken: 'user-token',
+      audience: 'https://mcp.example',
+      clientId: 'agent-id',
+      clientSecret: 'agent-secret',
+      fetchImpl,
+    };
+    await exchangeSubjectToken(request);
+    await exchangeSubjectToken({ ...request, actorToken: 'agent-actor-token' });
+    const plain = new URLSearchParams(bodies[0]);
+    const delegated = new URLSearchParams(bodies[1]);
+    expect(plain.get('actor_token')).toBeNull();
+    expect(plain.get('actor_token_type')).toBeNull();
+    expect(delegated.get('actor_token')).toBe('agent-actor-token');
+    expect(delegated.get('actor_token_type')).toBe('urn:ietf:params:oauth:token-type:access_token');
+  });
 });
 
 describe('protect policy', () => {
@@ -629,6 +655,7 @@ describe('config safety', () => {
 
     const config = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')));
     expect(config.tokenExchange.inspectTokens).toBe(true);
+    expect(config.tokenExchange.delegation).toBe(false);
     const omitted = structuredClone(config);
     delete omitted.tokenExchange.inspectTokens;
     expect(tokenInspectorEnabled(omitted, false)).toBe(true);

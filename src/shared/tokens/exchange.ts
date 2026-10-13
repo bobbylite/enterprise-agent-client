@@ -14,6 +14,8 @@ export interface ExchangeRequest {
   scope?: string;
   clientId: string;
   clientSecret: string;
+  /** Agent client-credentials token. Sent as RFC 8693 actor_token when delegation is on. */
+  actorToken?: string;
   fetchImpl?: typeof fetch;
   now?: () => number;
 }
@@ -30,6 +32,10 @@ export async function exchangeSubjectToken(input: ExchangeRequest): Promise<Toke
     client_id: input.clientId,
   });
   if (input.scope) body.set('scope', input.scope);
+  if (input.actorToken) {
+    body.set('actor_token', input.actorToken);
+    body.set('actor_token_type', ACCESS_TOKEN_TYPE);
+  }
   const basic = btoa(`${input.clientId}:${input.clientSecret}`);
   const response = await fetchImpl(input.tokenEndpoint, {
     method: 'POST',

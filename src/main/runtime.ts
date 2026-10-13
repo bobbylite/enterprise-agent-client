@@ -118,6 +118,7 @@ export class Runtime {
   private pendingSignals = '';
   private browserAbort: AbortController | null = null;
   private workerToken: TokenSet | null = null;
+  private agentActorToken: TokenSet | null = null;
   private readonly exchangeErrors = new Map<string, string>();
   private readonly approvals = new Map<string, (choice: ApprovalChoice) => void>();
   private readonly pi: PiFlowClient;
@@ -631,6 +632,7 @@ export class Runtime {
         anthropic: false,
         generic: false,
         worker: false,
+        agent: false,
       },
     };
   }
@@ -642,6 +644,7 @@ export class Runtime {
       anthropic: Boolean(await this.options.secrets.get('anthropicApiKey')),
       generic: Boolean(await this.options.secrets.get('genericApiKey')),
       worker: Boolean(await this.options.secrets.get('workerClientSecret')),
+      agent: Boolean(await this.options.secrets.get('agentClientSecret')),
     };
     return view;
   }
@@ -660,6 +663,7 @@ export class Runtime {
     await this.maybeSecret('anthropicApiKey', input.anthropicApiKey, input.clearKeys?.includes('anthropic'));
     await this.maybeSecret('genericApiKey', input.genericApiKey, input.clearKeys?.includes('generic'));
     await this.maybeSecret('workerClientSecret', input.workerClientSecret, input.clearKeys?.includes('worker'));
+    await this.maybeSecret('agentClientSecret', input.agentClientSecret, input.clearKeys?.includes('agent'));
     return this.getSettingsAsync();
   }
 
@@ -1130,23 +1134,49 @@ export class Runtime {
       return token.accessToken;
     }
     const subject = await this.subjectToken();
-    const clientId = this.env('PINGONE_WORKER_CLIENT_ID') || this.options.config.tokenExchange.clientId;
-    const clientSecret = await this.options.secrets.get('workerClientSecret');
-    if (!clientId || !clientSecret) {
-      throw new Error('Configure the worker client id and secret used for token exchange.');
-    }
+    const client = await this.exchangeClient();
+    const actorToken = this.options.config.tokenExchange.delegation
+      ? await this.actorAccessToken(client.clientId, client.clientSecret)
+      : undefined;
     const token = await getOrExchange({
       cache: this.cache,
       tokenEndpoint: tokenEndpoint(this.options.config),
       subjectToken: subject,
       audience,
       scope,
+      clientId: client.clientId,
+      clientSecret: client.clientSecret,
+      actorToken,
+      fetchImpl: this.options.fetchImpl,
+      now: () => this.now(),
+    });
+    return token.accessToken;
+  }
+
+  private async exchangeClient(): Promise<{ clientId: string; clientSecret: string }> {
+    const configuredId = this.options.config.tokenExchange.clientId.trim();
+    const agentSecret = (await this.options.secrets.get('agentClientSecret'))?.trim() ?? '';
+    if (configuredId && agentSecret) return { clientId: configuredId, clientSecret: agentSecret };
+    const workerId = this.env('PINGONE_WORKER_CLIENT_ID') || configuredId;
+    const workerSecret = (await this.options.secrets.get('workerClientSecret'))?.trim() ?? '';
+    if (workerId && workerSecret) return { clientId: workerId, clientSecret: workerSecret };
+    throw new Error(
+      'Configure tokenExchange.clientId and PINGONE_AGENT_CLIENT_SECRET for token exchange. When the AI Agent client is not configured, the Protect worker id and secret are used.',
+    );
+  }
+
+  private async actorAccessToken(clientId: string, clientSecret: string): Promise<string> {
+    if (this.agentActorToken && classifyAccessToken(this.agentActorToken, this.now()) === 'valid') {
+      return this.agentActorToken.accessToken;
+    }
+    this.agentActorToken = await fetchClientCredentials({
+      tokenEndpoint: tokenEndpoint(this.options.config),
       clientId,
       clientSecret,
       fetchImpl: this.options.fetchImpl,
       now: () => this.now(),
     });
-    return token.accessToken;
+    return this.agentActorToken.accessToken;
   }
 
   private async subjectToken(): Promise<string> {
@@ -1175,19 +1205,27 @@ export class Runtime {
     if (this.workerToken && classifyAccessToken(this.workerToken, this.now()) === 'valid') {
       return this.workerToken.accessToken;
     }
-    const clientId = this.env('PINGONE_WORKER_CLIENT_ID') || this.options.config.tokenExchange.clientId;
-    const clientSecret = await this.options.secrets.get('workerClientSecret');
-    if (!clientId || !clientSecret) {
-      throw new Error('Configure the worker client id and secret used for Protect and token exchange.');
-    }
+    const client = await this.workerClient();
     this.workerToken = await fetchClientCredentials({
       tokenEndpoint: tokenEndpoint(this.options.config),
-      clientId,
-      clientSecret,
+      clientId: client.clientId,
+      clientSecret: client.clientSecret,
       fetchImpl: this.options.fetchImpl,
       now: () => this.now(),
     });
     return this.workerToken.accessToken;
+  }
+
+  private async workerClient(): Promise<{ clientId: string; clientSecret: string }> {
+    const configuredId = this.options.config.tokenExchange.clientId.trim();
+    const workerId = this.env('PINGONE_WORKER_CLIENT_ID') || configuredId;
+    const workerSecret = (await this.options.secrets.get('workerClientSecret'))?.trim() ?? '';
+    if (workerId && workerSecret) return { clientId: workerId, clientSecret: workerSecret };
+    const agentSecret = (await this.options.secrets.get('agentClientSecret'))?.trim() ?? '';
+    if (!this.env('PINGONE_WORKER_CLIENT_ID') && !workerSecret && configuredId && agentSecret) {
+      return { clientId: configuredId, clientSecret: agentSecret };
+    }
+    throw new Error('Configure the worker client id and secret used for Protect.');
   }
 
   private async clientIp(): Promise<string | undefined> {
@@ -1223,7 +1261,7 @@ export class Runtime {
   private mockToken(userId: string, audience = 'user', scope?: string): TokenSet {
     const expiresAt = this.now() + 8 * 60 * 60 * 1000;
     const tokenScope = scope ?? (audience === 'user' ? this.options.config.tenant.scopes.join(' ') : undefined);
-    const accessToken = `${encodeJsonSegment({ alg: 'none', typ: 'mock' })}.${encodeJsonSegment({
+    const claims: Record<string, unknown> = {
       sub: userId,
       aud: audience,
       scope: tokenScope,
@@ -1231,7 +1269,11 @@ export class Runtime {
       exp: Math.floor(expiresAt / 1000),
       jti: randomId(),
       mock: true,
-    })}.mock`;
+    };
+    if (audience !== 'user' && this.options.config.tokenExchange.delegation) {
+      claims.act = { sub: this.options.config.tokenExchange.clientId || 'agent' };
+    }
+    const accessToken = `${encodeJsonSegment({ alg: 'none', typ: 'mock' })}.${encodeJsonSegment(claims)}.mock`;
     return { accessToken, expiresAt, tokenType: 'Bearer', scope: tokenScope };
   }
 
@@ -1362,6 +1404,7 @@ export class Runtime {
 
   private async hydrateSecrets(): Promise<void> {
     await this.copyEnvSecret('workerClientSecret', 'PINGONE_WORKER_CLIENT_SECRET');
+    await this.copyEnvSecret('agentClientSecret', 'PINGONE_AGENT_CLIENT_SECRET');
     await this.copyEnvSecret('openaiApiKey', 'OPENAI_API_KEY');
     await this.copyEnvSecret('anthropicApiKey', 'ANTHROPIC_API_KEY');
     await this.copyEnvSecret('genericApiKey', 'GENERIC_PROVIDER_API_KEY');
