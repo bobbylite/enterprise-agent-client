@@ -155,6 +155,26 @@ export interface AgentProfile {
   nameFromBranding: boolean;
 }
 
+export interface AgentPage {
+  profile: AgentProfile;
+  enterprise: InstructionFields;
+  persona: InstructionFields;
+  user: InstructionFields;
+  enterpriseLocked: true;
+  routines: Routine[];
+  /** Assigned skill ids. Empty until skill assignment is added. */
+  skillIds: string[];
+}
+
+export interface AgentInput {
+  id?: string;
+  name: string;
+  provider: ProviderId;
+  model: string;
+  persona: InstructionFields;
+  user: InstructionFields;
+}
+
 export interface Room {
   id: string;
   name: string;
@@ -174,6 +194,8 @@ export interface Routine {
   id: string;
   name: string;
   prompt: string;
+  /** Agent that owns this routine. Cron tasks are edited on that agent's page. */
+  agentId: string;
   targetType: 'agent' | 'room';
   targetId: string;
   cron: string;
@@ -185,6 +207,7 @@ export interface RoutineInput {
   id?: string;
   name: string;
   prompt: string;
+  agentId?: string;
   targetType: 'agent' | 'room';
   targetId: string;
   cron: string;
@@ -343,6 +366,9 @@ export interface AgentBridge {
   deleteRoomHistory(roomId: string): Promise<void>;
   pickAttachments(): Promise<Attachment[]>;
   listAgents(): Promise<AgentProfile[]>;
+  openAgent(id: string): Promise<AgentPage>;
+  saveAgent(input: AgentInput): Promise<AgentPage>;
+  deleteAgent(id: string): Promise<void>;
   listRooms(): Promise<Room[]>;
   saveRoom(input: RoomInput): Promise<Room>;
   deleteRoom(id: string): Promise<void>;

@@ -66,7 +66,7 @@ export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
       <div className="conversation">
         <header className="pane-head">
           <h2>{selected ? selected.name : 'New room'}</h2>
-          <p>Several agents share the room instructions and reply in turn.</p>
+          <p>Pick agents from the Agents list. They share these room instructions and reply in turn.</p>
         </header>
         <form
           className="stack compact"

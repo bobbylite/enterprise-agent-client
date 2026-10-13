@@ -165,7 +165,7 @@ A missing `appName` throws. The app does not substitute a built-in name.
 
 ## Enterprise config
 
-`config/enterprise.example.json` holds the tenant, token-exchange audiences, Protect policy, locked enterprise instructions, agents, rooms, MCP servers, routines, and provider defaults.
+`config/enterprise.example.json` holds the tenant, token-exchange audiences, Protect policy, locked enterprise instructions, the starting agents, rooms, MCP servers, routines, and provider defaults. After the first run, agents, their instructions, and their routines are edited in the Agents view. The branding agent (the sample theme's `agentName`) is created on first launch. Existing global instruction layers and routines are moved onto that agent. Each agent page has Instructions, Routines, Cron, and Skills tabs. Skills is a placeholder: every agent stores a skill id list that starts empty. Enterprise policy stays read-only on every agent. Group rooms choose from the same agent list.
 
 Risk actions, from least to most restrictive: `allow`, `step_up_mfa`, `restrict_tools`, `read_only`, `block`. A reason override replaces the level default when it is more restrictive. `restrict_tools` hides "always allow". `read_only` denies tools that are not marked `readOnlyHint`. `block` denies every tool and does not create a session. Step-up gates entry; after MFA the session stays active and step-up does not also restrict tools.
 
