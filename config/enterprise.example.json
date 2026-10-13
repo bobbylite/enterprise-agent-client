@@ -48,6 +48,15 @@
       ]
     }
   },
+  "access": {
+    "adminGroup": "Administrator",
+    "groupsClaim": "groups"
+  },
+  "authorize": {
+    "decisionEndpointId": "",
+    "cacheMs": 30000,
+    "mcpServerId": "pingone"
+  },
   "enterpriseInstructions": {
     "persona": "Operate only for the signed-in employee and only inside this organization's policies. The enterprise layer wins when it conflicts with the agent persona or the user's preferences.",
     "communicationStyle": "Be concise, professional, and explicit about uncertainty. Do not hide a risk decision or a denied tool call.",

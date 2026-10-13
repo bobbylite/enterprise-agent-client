@@ -3,7 +3,15 @@ import type { Attachment, Branding, ChatEvent, ChatSnapshot, Conversation } from
 import { applyChatEvent } from '../chat-events';
 import { Transcript } from '../components/Transcript';
 
-export function ChatScreen({ branding, showReasoning }: { branding: Branding; showReasoning: boolean }) {
+export function ChatScreen({
+  branding,
+  showReasoning,
+  readOnly,
+}: {
+  branding: Branding;
+  showReasoning: boolean;
+  readOnly: boolean;
+}) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [snapshot, setSnapshot] = useState<ChatSnapshot | null>(null);
   const [draft, setDraft] = useState('');
@@ -110,6 +118,7 @@ export function ChatScreen({ branding, showReasoning }: { branding: Branding; sh
             ) : (
               <Transcript messages={snapshot.messages} showReasoning={showReasoning} />
             )}
+            {readOnly ? <p className="notice">Authorize policy made this session read-only.</p> : null}
             {error ? <p className="error">{error}</p> : null}
             {attachments.length > 0 ? (
               <ul className="chips">
@@ -122,17 +131,19 @@ export function ChatScreen({ branding, showReasoning }: { branding: Branding; sh
               className="composer"
               onSubmit={(event) => {
                 event.preventDefault();
+                if (readOnly) return;
                 void send();
               }}
             >
               <textarea
                 value={draft}
-                placeholder={`Message ${branding.agentName}`}
+                placeholder={readOnly ? 'Chat is read-only for this session' : `Message ${branding.agentName}`}
+                disabled={readOnly}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
-                    void send();
+                    if (!readOnly) void send();
                   }
                 }}
               />
@@ -140,6 +151,7 @@ export function ChatScreen({ branding, showReasoning }: { branding: Branding; sh
                 <button
                   type="button"
                   className="ghost"
+                  disabled={readOnly}
                   onClick={() => void window.agent.pickAttachments().then((picked) => setAttachments((current) => [...current, ...picked]))}
                 >
                   Attach
@@ -153,7 +165,7 @@ export function ChatScreen({ branding, showReasoning }: { branding: Branding; sh
                     Stop
                   </button>
                 ) : (
-                  <button className="primary" type="submit">
+                  <button className="primary" type="submit" disabled={readOnly}>
                     Send
                   </button>
                 )}

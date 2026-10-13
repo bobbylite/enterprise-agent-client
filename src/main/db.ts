@@ -1,7 +1,9 @@
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
+import type { AuthorizePolicy } from '@shared/authorize/policy';
 import type {
   AgentProfile,
   Attachment,
+  AuditView,
   ChatMessage,
   Conversation,
   InstructionFields,
@@ -10,6 +12,19 @@ import type {
   RoutineRun,
   ToolInvocation,
 } from '@shared/types';
+
+export interface SkillRow {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  files: { path: string; text: string }[];
+  requiredGroups: string[];
+  requiresAdmin: boolean;
+  builtin: boolean;
+  enabled: boolean;
+  createdAt: number;
+}
 
 export interface McpServerRow {
   id: string;
@@ -172,6 +187,39 @@ export class Repository {
       CREATE TABLE IF NOT EXISTS instruction_layers (
         id TEXT PRIMARY KEY,
         fields_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS skills (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        instructions TEXT NOT NULL,
+        files_json TEXT NOT NULL,
+        required_groups_json TEXT NOT NULL,
+        requires_admin INTEGER NOT NULL,
+        builtin INTEGER NOT NULL,
+        enabled INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS authorize_policies (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        enabled INTEGER NOT NULL,
+        updated_at INTEGER,
+        updated_by TEXT,
+        scaffold INTEGER NOT NULL,
+        remote_id TEXT,
+        when_json TEXT NOT NULL,
+        effect_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS admin_audit (
+        id TEXT PRIMARY KEY,
+        at INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        agent_id TEXT,
+        action TEXT NOT NULL,
+        detail TEXT NOT NULL
       );
     `);
     this.ensureColumn('messages', 'reasoning', "TEXT NOT NULL DEFAULT ''");
@@ -628,6 +676,103 @@ export class Repository {
       )
       .run(id, JSON.stringify(fields));
   }
+
+  listSkills(): SkillRow[] {
+    return this.db.prepare('SELECT * FROM skills ORDER BY builtin DESC, name COLLATE NOCASE').all().map(mapSkill);
+  }
+
+  getSkill(id: string): SkillRow | null {
+    const row = this.db.prepare('SELECT * FROM skills WHERE id = ?').get(id);
+    return row ? mapSkill(row) : null;
+  }
+
+  upsertSkill(skill: SkillRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO skills(id, name, description, instructions, files_json, required_groups_json, requires_admin, builtin, enabled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           description = excluded.description,
+           instructions = excluded.instructions,
+           files_json = excluded.files_json,
+           required_groups_json = excluded.required_groups_json,
+           requires_admin = excluded.requires_admin,
+           builtin = excluded.builtin,
+           enabled = excluded.enabled`,
+      )
+      .run(
+        skill.id,
+        skill.name,
+        skill.description,
+        skill.instructions,
+        JSON.stringify(skill.files),
+        JSON.stringify(skill.requiredGroups),
+        skill.requiresAdmin ? 1 : 0,
+        skill.builtin ? 1 : 0,
+        skill.enabled ? 1 : 0,
+        skill.createdAt,
+      );
+  }
+
+  deleteSkill(id: string): void {
+    this.db.prepare('DELETE FROM skills WHERE id = ?').run(id);
+  }
+
+  listPolicies(): AuthorizePolicy[] {
+    return this.db.prepare('SELECT * FROM authorize_policies ORDER BY name COLLATE NOCASE').all().map(mapPolicy);
+  }
+
+  upsertPolicy(policy: AuthorizePolicy): void {
+    this.db
+      .prepare(
+        `INSERT INTO authorize_policies(id, name, description, enabled, updated_at, updated_by, scaffold, remote_id, when_json, effect_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           description = excluded.description,
+           enabled = excluded.enabled,
+           updated_at = excluded.updated_at,
+           updated_by = excluded.updated_by,
+           scaffold = excluded.scaffold,
+           remote_id = excluded.remote_id,
+           when_json = excluded.when_json,
+           effect_json = excluded.effect_json`,
+      )
+      .run(
+        policy.id,
+        policy.name,
+        policy.description,
+        policy.enabled ? 1 : 0,
+        policy.updatedAt,
+        policy.updatedBy,
+        policy.scaffold ? 1 : 0,
+        policy.remoteId,
+        JSON.stringify(policy.when),
+        JSON.stringify(policy.effect),
+      );
+  }
+
+  insertAudit(event: AuditView): void {
+    this.db
+      .prepare('INSERT INTO admin_audit(id, at, user_id, username, agent_id, action, detail) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(event.id, event.at, event.userId, event.username, event.agentId, event.action, event.detail);
+  }
+
+  listAudit(): AuditView[] {
+    return this.db
+      .prepare('SELECT * FROM admin_audit ORDER BY at DESC')
+      .all()
+      .map((row) => ({
+        id: text(row.id),
+        at: num(row.at),
+        userId: text(row.user_id),
+        username: text(row.username),
+        agentId: row.agent_id === null ? null : text(row.agent_id),
+        action: text(row.action),
+        detail: text(row.detail),
+      }));
+  }
 }
 
 function mapConversation(row: Record<string, SQLOutputValue>): Conversation {
@@ -687,6 +832,36 @@ function mapRoutine(row: Record<string, SQLOutputValue>): RoutineRow {
     enabled: bool(row.enabled),
     createdAt: num(row.created_at),
     lastFiredMinute: row.last_fired_minute === null ? null : text(row.last_fired_minute),
+  };
+}
+
+function mapSkill(row: Record<string, SQLOutputValue>): SkillRow {
+  return {
+    id: text(row.id),
+    name: text(row.name),
+    description: text(row.description),
+    instructions: text(row.instructions),
+    files: JSON.parse(text(row.files_json) || '[]') as SkillRow['files'],
+    requiredGroups: JSON.parse(text(row.required_groups_json) || '[]') as string[],
+    requiresAdmin: bool(row.requires_admin),
+    builtin: bool(row.builtin),
+    enabled: bool(row.enabled),
+    createdAt: num(row.created_at),
+  };
+}
+
+function mapPolicy(row: Record<string, SQLOutputValue>): AuthorizePolicy {
+  return {
+    id: text(row.id),
+    name: text(row.name),
+    description: text(row.description),
+    enabled: bool(row.enabled),
+    updatedAt: row.updated_at === null ? null : num(row.updated_at),
+    updatedBy: row.updated_by === null ? null : text(row.updated_by),
+    scaffold: bool(row.scaffold),
+    remoteId: row.remote_id === null ? null : text(row.remote_id),
+    when: JSON.parse(text(row.when_json) || '{}') as AuthorizePolicy['when'],
+    effect: JSON.parse(text(row.effect_json) || '{}') as AuthorizePolicy['effect'],
   };
 }
 

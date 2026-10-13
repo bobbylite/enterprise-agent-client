@@ -262,23 +262,158 @@ function AgentEditor({
       ) : null}
       {tab === 'routines' ? <AgentRoutines mode="routines" agentId={profile.id} routines={page.routines} onSaved={() => onSaved(profile.id)} onError={onError} /> : null}
       {tab === 'cron' ? <AgentRoutines mode="cron" agentId={profile.id} routines={page.routines} onSaved={() => onSaved(profile.id)} onError={onError} /> : null}
-      {tab === 'skills' ? <SkillsPlaceholder skillIds={page.skillIds} /> : null}
+      {tab === 'skills' ? (
+        <SkillsPanel page={page} onChange={onChange} onSaved={() => onSaved(profile.id)} onError={onError} />
+      ) : null}
     </>
   );
 }
 
-function SkillsPlaceholder({ skillIds }: { skillIds: string[] }) {
+function SkillsPanel({
+  page,
+  onChange,
+  onSaved,
+  onError,
+}: {
+  page: AgentPage;
+  onChange: (page: AgentPage) => void;
+  onSaved: () => void;
+  onError: (message: string) => void;
+}) {
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [instructions, setInstructions] = useState('');
+  const [requiredGroups, setRequiredGroups] = useState('');
+  const assigned = page.skills.filter((skill) => skill.assigned);
+
+  function fail(caught: unknown): void {
+    onError(caught instanceof Error ? caught.message : String(caught));
+  }
+
   return (
-    <section className="stack card">
-      <h3>Skills</h3>
-      <p className="muted">Skills assigned to this agent will be listed here. Uploading and assigning skills is not available yet.</p>
-      {skillIds.length === 0 ? <p>No skills assigned.</p> : (
-        <ul className="tools">
-          {skillIds.map((id) => (
-            <li key={id}>{id}</li>
-          ))}
-        </ul>
-      )}
+    <section className="stack">
+      <div className="card stack">
+        <h3>Skills</h3>
+        <p className="muted">
+          Upload a SKILL.md file or a zip that contains one, or write a skill here. Assigned skills are added to this agent&apos;s prompt when this sign-in is allowed to use them.
+        </p>
+        {page.skills.length === 0 ? <p>No skills are available for this sign-in.</p> : null}
+        {page.skills.map((skill) => (
+          <article key={skill.id} className="stack">
+            <div className="row">
+              <strong>{skill.name}</strong>
+              {skill.builtin ? <span className="muted">Built in</span> : null}
+              {skill.requiresAdmin ? <span className="muted">Administrators</span> : null}
+              {!skill.enabled ? <span className="muted">Disabled</span> : null}
+            </div>
+            <p className="muted">{skill.description}</p>
+            {skill.requiredGroups.length > 0 ? <p className="muted">Groups: {skill.requiredGroups.join(', ')}</p> : null}
+            <details>
+              <summary>Instructions</summary>
+              <pre>{skill.instructions}</pre>
+            </details>
+            <div className="row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={skill.assigned}
+                  onChange={(event) => {
+                    void window.agent
+                      .assignSkill(page.profile.id, skill.id, event.target.checked)
+                      .then(onChange)
+                      .catch(fail);
+                  }}
+                />
+                Assigned to this agent
+              </label>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => {
+                  void window.agent
+                    .setSkillEnabled(skill.id, !skill.enabled)
+                    .then(() => onSaved())
+                    .catch(fail);
+                }}
+              >
+                {skill.enabled ? 'Disable' : 'Enable'}
+              </button>
+              {skill.builtin ? null : (
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => {
+                    if (!window.confirm(`Delete ${skill.name}?`)) return;
+                    void window.agent
+                      .deleteSkill(skill.id)
+                      .then(() => onSaved())
+                      .catch(fail);
+                  }}
+                >
+                  Delete
+                </button>
+              )}
+            </div>
+          </article>
+        ))}
+        {assigned.length === 0 ? <p className="muted">No skills assigned.</p> : null}
+      </div>
+      <form
+        className="card stack"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void window.agent
+            .importSkill({
+              name,
+              description,
+              instructions,
+              requiredGroups: requiredGroups.split(',').map((group) => group.trim()).filter(Boolean),
+            })
+            .then(() => {
+              setName('');
+              setDescription('');
+              setInstructions('');
+              setRequiredGroups('');
+              onSaved();
+            })
+            .catch(fail);
+        }}
+      >
+        <h3>New skill</h3>
+        <Field label="Name">
+          <input value={name} onChange={(event) => setName(event.target.value)} />
+        </Field>
+        <Field label="Description">
+          <input value={description} onChange={(event) => setDescription(event.target.value)} />
+        </Field>
+        <Field label="Instructions">
+          <textarea rows={5} value={instructions} onChange={(event) => setInstructions(event.target.value)} />
+        </Field>
+        <Field label="Required groups">
+          <input
+            value={requiredGroups}
+            placeholder="Finance, Payroll"
+            onChange={(event) => setRequiredGroups(event.target.value)}
+          />
+        </Field>
+        <div className="row">
+          <button className="primary" type="submit">
+            Save skill
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => {
+              void window.agent
+                .importSkillFile()
+                .then(() => onSaved())
+                .catch(fail);
+            }}
+          >
+            Upload SKILL.md or zip
+          </button>
+        </div>
+      </form>
     </section>
   );
 }

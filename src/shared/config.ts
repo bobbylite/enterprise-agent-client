@@ -70,6 +70,19 @@ export const enterpriseConfigSchema = z.object({
     }),
   }),
   enterpriseInstructions: instructionSchema,
+  access: z
+    .object({
+      adminGroup: z.string().min(1).default('Administrator'),
+      groupsClaim: z.string().min(1).default('groups'),
+    })
+    .default({ adminGroup: 'Administrator', groupsClaim: 'groups' }),
+  authorize: z
+    .object({
+      decisionEndpointId: z.string().default(''),
+      cacheMs: z.number().int().positive().default(30_000),
+      mcpServerId: z.string().min(1).default('pingone'),
+    })
+    .default({ decisionEndpointId: '', cacheMs: 30_000, mcpServerId: 'pingone' }),
   agents: z.array(
     z.object({
       id: z.string().min(1),

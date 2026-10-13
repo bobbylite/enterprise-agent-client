@@ -11,6 +11,7 @@ const api: AgentBridge = {
   startSystemBrowserLogin: (signals) => ipcRenderer.invoke(Ipc.startSystemBrowserLogin, signals),
   cancelLogin: () => ipcRenderer.invoke(Ipc.cancelLogin),
   setMockScenario: (scenario) => ipcRenderer.invoke(Ipc.setMockScenario, scenario),
+  setMockAdmin: (admin) => ipcRenderer.invoke(Ipc.setMockAdmin, admin),
   logout: () => ipcRenderer.invoke(Ipc.logout),
   listConversations: () => ipcRenderer.invoke(Ipc.listConversations),
   createConversation: () => ipcRenderer.invoke(Ipc.createConversation),
@@ -49,6 +50,17 @@ const api: AgentBridge = {
   listTokens: () => ipcRenderer.invoke(Ipc.listTokens),
   revealToken: (id) => ipcRenderer.invoke(Ipc.revealToken, id),
   reexchangeToken: (id) => ipcRenderer.invoke(Ipc.reexchangeToken, id),
+  listSkills: () => ipcRenderer.invoke(Ipc.listSkills),
+  importSkill: (input) => ipcRenderer.invoke(Ipc.importSkill, input),
+  importSkillFile: () => ipcRenderer.invoke(Ipc.importSkillFile),
+  setSkillEnabled: (id, enabled) => ipcRenderer.invoke(Ipc.setSkillEnabled, id, enabled),
+  deleteSkill: (id) => ipcRenderer.invoke(Ipc.deleteSkill, id),
+  assignSkill: (agentId, skillId, assigned) => ipcRenderer.invoke(Ipc.assignSkill, agentId, skillId, assigned),
+  listPolicies: () => ipcRenderer.invoke(Ipc.listPolicies),
+  refreshPolicies: () => ipcRenderer.invoke(Ipc.refreshPolicies),
+  scaffoldPolicies: (confirm) => ipcRenderer.invoke(Ipc.scaffoldPolicies, confirm),
+  setPolicyEnabled: (id, enabled) => ipcRenderer.invoke(Ipc.setPolicyEnabled, id, enabled),
+  listAudit: () => ipcRenderer.invoke(Ipc.listAudit),
   onChatEvent: (listener) => {
     const wrapped = (_event: IpcRendererEvent, payload: ChatEvent) => listener(payload);
     ipcRenderer.on(Ipc.chatEvent, wrapped);
