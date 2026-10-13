@@ -4,7 +4,7 @@ import { applyChatEvent } from '../chat-events';
 import { Field } from '../components/Markdown';
 import { Transcript } from '../components/Transcript';
 
-export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
+export function RoomsScreen({ showReasoning, readOnly }: { showReasoning: boolean; readOnly: boolean }) {
   const [rooms, setRooms] = useState<Room[]>([]);
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [selected, setSelected] = useState<Room | null>(null);
@@ -133,13 +133,14 @@ export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
           </div>
         </form>
         {snapshot ? <Transcript messages={snapshot.messages} showReasoning={showReasoning} /> : null}
+        {readOnly ? <p className="notice">Authorize policy made this session read-only.</p> : null}
         {error ? <p className="error">{error}</p> : null}
         {selected ? (
           <form
             className="composer"
             onSubmit={(event) => {
               event.preventDefault();
-              if (!selected) return;
+              if (!selected || readOnly) return;
               setBusy(true);
               const text = draft;
               setDraft('');
@@ -151,13 +152,18 @@ export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
                 .finally(() => setBusy(false));
             }}
           >
-            <textarea value={draft} placeholder="Message the room" onChange={(event) => setDraft(event.target.value)} />
+            <textarea
+              value={draft}
+              placeholder={readOnly ? 'Chat is read-only for this session' : 'Message the room'}
+              disabled={readOnly}
+              onChange={(event) => setDraft(event.target.value)}
+            />
             {busy ? (
               <button className="primary" type="button" onClick={() => snapshot && void window.agent.stopGeneration(snapshot.conversation.id)}>
                 Stop
               </button>
             ) : (
-              <button className="primary" type="submit">
+              <button className="primary" type="submit" disabled={readOnly}>
                 Send
               </button>
             )}

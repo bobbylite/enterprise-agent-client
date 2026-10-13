@@ -13,7 +13,22 @@ import {
 import { createPkce, type PkcePair } from '@shared/auth/pkce';
 import { waitForLoopbackCode } from '@shared/auth/loopback';
 import { classifyAccessToken, type TokenSet } from '@shared/auth/tokens';
+import { groupsFromClaims, isAdmin } from '@shared/access/groups';
+import {
+  decisionCacheKey,
+  evaluatePolicies,
+  failClosed,
+  featuresFromAuthorize,
+  mergeScaffold,
+  parseScaffoldMarker,
+  scaffoldPolicies,
+  SCAFFOLD_MARKER,
+  type AuthorizePolicy,
+  type DecisionInput,
+} from '@shared/authorize/policy';
+import { createRemotePolicy, listRemotePolicies, postDecision, setRemotePolicyEnabled } from '@shared/authorize/remote';
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
+import { PINGONE_SKILL_ID, pingoneSkillInstructions, type SkillDraft } from '@shared/skills/markdown';
 import { toolKey } from '@shared/mcp/approvals';
 import { buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
 import { mockRiskPayload } from '@shared/protect/mock';
@@ -33,6 +48,12 @@ import type {
   AgentPage,
   AgentProfile,
   AppState,
+  AuditView,
+  FeatureDecision,
+  PolicyScaffoldResult,
+  PolicyView,
+  SkillInput,
+  SkillView,
   ApprovalChoice,
   ApprovalRequest,
   Attachment,
@@ -58,8 +79,10 @@ import type {
   InspectedToken,
 } from '@shared/types';
 import { compileAgentGraph, runAgentGraph, type AgentGraph, type GraphParticipant } from './agent-graph';
+import type { RuntimeTool } from './runtime-tool';
 import { openCheckpointer, type NodeSqliteSaver } from './checkpoint-sqlite';
-import { Repository, type AgentRow, type McpServerRow } from './db';
+import { Repository, type AgentRow, type McpServerRow, type SkillRow } from './db';
+import { skillFromUpload } from './skill-files';
 import { McpHub } from './mcp';
 
 interface StoredSession {
@@ -70,6 +93,7 @@ interface StoredSession {
   tokenType: string;
   userId: string;
   username: string;
+  groups: string[];
 }
 
 interface PendingLogin {
@@ -114,6 +138,9 @@ export class Runtime {
   private login: LoginView = { phase: 'idle' };
   private stepUpRequired = false;
   private scenario: MockScenario = 'low';
+  private mockAdmin = false;
+  private features: FeatureDecision = failClosed(0);
+  private decisionCache: { key: string; at: number; decision: FeatureDecision } | null = null;
   private pkce: PkcePair | null = null;
   private flow: FlowSnapshot | null = null;
   private mfaSatisfied = false;
@@ -182,6 +209,8 @@ export class Runtime {
     this.seed();
     this.migrateAgentOwnership();
     this.syncBrandedAgents();
+    this.ensureBuiltinSkill();
+    this.mockAdmin = this.options.db.getSetting('mockAdmin') === '1';
     const storedScenario = this.options.db.getSetting('mockScenario');
     if (storedScenario && SCENARIOS.includes(storedScenario as MockScenario)) {
       this.scenario = storedScenario as MockScenario;
@@ -201,6 +230,9 @@ export class Runtime {
       mockScenario: this.scenario,
       login: this.login,
       showReasoning: this.options.config.provider.showReasoning,
+      adminGroup: this.options.config.access.adminGroup,
+      mockAdmin: this.mockAdmin,
+      features: this.currentFeatures(),
     };
   }
 
@@ -326,9 +358,20 @@ export class Runtime {
     return this.state();
   }
 
+  async setMockAdmin(admin: boolean): Promise<AppState> {
+    if (this.options.config.tenant.mode !== 'mock') {
+      throw new Error('The administrator sign-in switch is only available in mock mode.');
+    }
+    this.mockAdmin = admin;
+    this.options.db.setSetting('mockAdmin', admin ? '1' : '0');
+    return this.state();
+  }
+
   async logout(): Promise<AppState> {
     this.session = null;
     this.risk = null;
+    this.features = failClosed(this.now());
+    this.decisionCache = null;
     this.stepUpRequired = false;
     this.pendingLogin = null;
     this.flow = null;
@@ -370,6 +413,7 @@ export class Runtime {
 
   async sendMessage(conversationId: string, text: string, attachmentIds: string[]): Promise<void> {
     const conversation = this.openConversation(conversationId).conversation;
+    this.requireWritableChat();
     const body = text.trim();
     if (!body && attachmentIds.length === 0) throw new Error('Write a message or attach a file.');
     const messageId = randomId();
@@ -461,6 +505,134 @@ export class Runtime {
     return this.agentPage(agent);
   }
 
+  listSkills(): SkillView[] {
+    this.requireSession();
+    return this.options.db.listSkills().filter((skill) => this.skillVisible(skill)).map((skill) => this.skillView(skill, []));
+  }
+
+  importSkill(input: SkillInput): SkillView {
+    this.requireSession();
+    const name = input.name.trim();
+    if (!name) throw new Error('Give the skill a name.');
+    if (!input.instructions.trim()) throw new Error('Write the skill instructions.');
+    const skill: SkillRow = {
+      id: randomId(),
+      name,
+      description: input.description.trim(),
+      instructions: input.instructions.trim(),
+      files: [],
+      requiredGroups: input.requiredGroups.map((group) => group.trim()).filter(Boolean),
+      requiresAdmin: false,
+      builtin: false,
+      enabled: true,
+      createdAt: this.now(),
+    };
+    this.options.db.upsertSkill(skill);
+    return this.skillView(skill, []);
+  }
+
+  async importSkillFile(): Promise<SkillView> {
+    this.requireSession();
+    if (!this.options.pickFiles) throw new Error('File picking is not available.');
+    const files = await this.options.pickFiles();
+    const file = files[0];
+    if (!file) throw new Error('Choose a SKILL.md file or a zip that contains one.');
+    return this.storeSkillDraft(skillFromUpload(file.name, file.bytes));
+  }
+
+  setSkillEnabled(id: string, enabled: boolean): SkillView[] {
+    this.requireSession();
+    const skill = this.options.db.getSkill(id);
+    if (!skill || !this.skillVisible(skill)) throw new Error('That skill was not found.');
+    if (skill.requiresAdmin) this.requireAdmin();
+    this.options.db.upsertSkill({ ...skill, enabled });
+    return this.listSkills();
+  }
+
+  deleteSkill(id: string): SkillView[] {
+    this.requireSession();
+    const skill = this.options.db.getSkill(id);
+    if (!skill || !this.skillVisible(skill)) throw new Error('That skill was not found.');
+    if (skill.builtin) throw new Error('The built-in PingOne skill stays.');
+    this.options.db.deleteSkill(id);
+    for (const agent of this.options.db.listAgents()) {
+      if (!agent.skillIds.includes(id)) continue;
+      this.options.db.upsertAgent({ ...agent, skillIds: agent.skillIds.filter((skillId) => skillId !== id) });
+    }
+    return this.listSkills();
+  }
+
+  assignSkill(agentId: string, skillId: string, assigned: boolean): AgentPage {
+    this.requireSession();
+    const agent = this.options.db.getAgent(agentId);
+    if (!agent) throw new Error('That agent was not found.');
+    const skill = this.options.db.getSkill(skillId);
+    if (!skill || !this.skillVisible(skill)) throw new Error('That skill was not found.');
+    if (skill.requiresAdmin) this.requireAdmin();
+    if (assigned && !this.skillUsable(skill)) {
+      throw new Error(`This sign-in does not meet the groups required by ${skill.name}.`);
+    }
+    const skillIds = assigned
+      ? [...new Set([...agent.skillIds, skillId])]
+      : agent.skillIds.filter((id) => id !== skillId);
+    const saved = { ...agent, skillIds };
+    this.options.db.upsertAgent(saved);
+    return this.agentPage(saved);
+  }
+
+  async listPolicies(): Promise<PolicyView[]> {
+    this.requirePolicy();
+    return this.options.db.listPolicies().map(policyView);
+  }
+
+  async refreshPolicies(): Promise<PolicyView[]> {
+    this.requirePolicy();
+    if (this.options.config.tenant.mode === 'pingone') await this.pullRemotePolicies();
+    await this.refreshFeatures();
+    return this.listPolicies();
+  }
+
+  async scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult> {
+    this.requirePolicy();
+    const incoming = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '');
+    const existing = this.options.db.listPolicies();
+    const merged = mergeScaffold(existing, incoming);
+    const preview = incoming.map(policyView);
+    if (!confirm) return { preview, created: [], policies: existing.map(policyView) };
+    for (const policy of merged.created) this.options.db.upsertPolicy(policy);
+    if (this.options.config.tenant.mode === 'pingone') {
+      const pending = this.options.db.listPolicies().filter((policy) => policy.scaffold && !policy.remoteId);
+      await this.pushScaffold(pending);
+    }
+    if (merged.created.length > 0) {
+      this.audit(null, 'policy:scaffold', merged.created.map((policy) => policy.name).join(', '));
+    }
+    this.decisionCache = null;
+    await this.refreshFeatures();
+    return { preview, created: merged.created.map(policyView), policies: this.options.db.listPolicies().map(policyView) };
+  }
+
+  async setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]> {
+    this.requirePolicy();
+    const policy = this.options.db.listPolicies().find((item) => item.id === id);
+    if (!policy) throw new Error('That policy was not found.');
+    const next = { ...policy, enabled, updatedAt: this.now(), updatedBy: this.session?.username ?? null };
+    if (this.options.config.tenant.mode === 'pingone' && next.remoteId) {
+      const token = await this.workerAccessToken();
+      await setRemotePolicyEnabled(this.options.config, token, next.remoteId, enabled, this.options.fetchImpl ?? fetch);
+    }
+    this.options.db.upsertPolicy(next);
+    this.audit(null, 'policy:enforcement', `${next.name} ${enabled ? 'enabled' : 'disabled'}`);
+    this.decisionCache = null;
+    await this.refreshFeatures();
+    return this.options.db.listPolicies().map(policyView);
+  }
+
+  listAudit(): AuditView[] {
+    this.requireAdmin();
+    return this.options.db.listAudit();
+  }
+
   deleteAgent(id: string): void {
     this.requireSession();
     const agent = this.options.db.getAgent(id);
@@ -519,6 +691,7 @@ export class Runtime {
 
   async sendRoomMessage(roomId: string, text: string): Promise<void> {
     const snapshot = this.openRoom(roomId);
+    this.requireWritableChat();
     const body = text.trim();
     if (!body) throw new Error('Write a message.');
     const room = this.options.db.getRoom(roomId);
@@ -625,10 +798,7 @@ export class Runtime {
     this.requireSession();
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
     if (!server) throw new Error('That server was not found.');
-    let accessToken: string | undefined;
-    if (server.audience) {
-      accessToken = await this.tokenForAudience(server.audience, server.scope);
-    }
+    const accessToken = await this.accessTokenForServer(server);
     await this.hub.connect({
       id: server.id,
       name: server.name,
@@ -934,6 +1104,13 @@ export class Runtime {
           requestApproval: (request) => this.askApproval(request),
           rememberAlways: (serverId, toolName) => this.options.db.setToolPreference(serverId, toolName, 'always'),
           tokenForServer: (serverId) => this.tokenForServer(serverId),
+          visibleTools: (tools, participant) => tools.filter((tool) => this.gateTool(tool, participant) === null),
+          gateTool: (tool, participant) => this.gateTool(tool, participant),
+          recordAdminAction: (agentId, action, detail) => {
+            const prefix = `tool:${this.options.config.authorize.mcpServerId}/`;
+            if (!action.startsWith(prefix)) return;
+            this.audit(agentId, action, detail);
+          },
           callTool: (tool, args, accessToken) => this.hub.call(tool.serverId, tool.name, args, accessToken),
           persistMessage: (message) => {
             this.options.db.insertMessage({
@@ -986,6 +1163,8 @@ export class Runtime {
       user: agent.userInstructions ?? emptyFields(),
       room,
       risk,
+      skillIds: this.usableSkills(agent).map((skill) => skill.id),
+      skills: this.skillPrompt(agent),
     };
   }
 
@@ -1000,8 +1179,267 @@ export class Runtime {
 
   private async tokenForServer(serverId: string): Promise<string> {
     const server = this.options.db.listMcpServers().find((item) => item.id === serverId);
-    if (!server?.audience) return '';
+    if (!server) return '';
+    return (await this.accessTokenForServer(server)) ?? '';
+  }
+
+  private async accessTokenForServer(server: McpServerRow): Promise<string | undefined> {
+    if (server.id === this.options.config.authorize.mcpServerId) {
+      this.requireAdmin();
+      if (!this.currentFeatures().pingoneTools) {
+        throw new Error('Authorize turned PingOne tools off for this session.');
+      }
+      if (this.options.config.tenant.mode === 'mock') {
+        return this.mockToken('worker', 'worker', 'authorize').accessToken;
+      }
+      return this.workerAccessToken();
+    }
+    if (!server.audience) return undefined;
     return this.tokenForAudience(server.audience, server.scope);
+  }
+
+  private gateTool(tool: RuntimeTool, participant: GraphParticipant | undefined): string | null {
+    const features = this.currentFeatures();
+    if (tool.serverId === this.options.config.authorize.mcpServerId) {
+      if (!this.isAdmin()) return `PingOne tools are limited to the ${this.options.config.access.adminGroup} group.`;
+      if (!features.pingoneTools) return 'Authorize turned PingOne tools off for this session.';
+      if (!participant?.skillIds.includes(PINGONE_SKILL_ID)) return 'This agent does not have the PingOne skill.';
+      return null;
+    }
+    if ((!features.mcpWrites || features.chat === 'read_only') && !tool.readOnlyHint) {
+      return 'Authorize policy disabled MCP writes for this session.';
+    }
+    return null;
+  }
+
+  private isAdmin(): boolean {
+    return isAdmin(this.session?.groups ?? [], this.options.config.access.adminGroup);
+  }
+
+  private requireAdmin(): void {
+    this.requireSession();
+    if (!this.isAdmin()) {
+      throw new Error(`That action is limited to the ${this.options.config.access.adminGroup} group.`);
+    }
+  }
+
+  private requirePolicy(): void {
+    this.requireAdmin();
+    if (!this.currentFeatures().policyTab) {
+      throw new Error('Authorize policy hid the Policy tab for this session.');
+    }
+  }
+
+  private mockGroupNames(): string[] {
+    return this.mockAdmin ? [this.options.config.access.adminGroup] : ['Employees'];
+  }
+
+  private groupsForTokens(tokens: { accessToken: string; idToken?: string }): string[] {
+    const claim = this.options.config.access.groupsClaim;
+    const fromAccess = groupsFromClaims(decodeJwtPayload(tokens.accessToken), claim);
+    if (fromAccess.length > 0) return fromAccess;
+    if (tokens.idToken) return groupsFromClaims(decodeJwtPayload(tokens.idToken), claim);
+    return [];
+  }
+
+  private currentFeatures(): FeatureDecision {
+    if (!this.session || this.stepUpRequired) return failClosed(this.now());
+    return this.features;
+  }
+
+  private decisionInput(): DecisionInput {
+    return {
+      groups: this.session?.groups ?? [],
+      riskLevel: this.risk?.level ?? 'UNKNOWN',
+      riskAction: this.risk?.action ?? 'allow',
+    };
+  }
+
+  private policiesForDecision(): AuthorizePolicy[] {
+    const stored = this.options.db.listPolicies();
+    if (stored.length > 0) return stored;
+    return scaffoldPolicies(this.options.config.access.adminGroup, this.now(), 'starter');
+  }
+
+  private requireWritableChat(): void {
+    if (this.currentFeatures().chat === 'read_only') {
+      throw new Error('Authorize policy made this session read-only.');
+    }
+  }
+
+  private ensureBuiltinSkill(): void {
+    const existing = this.options.db.getSkill(PINGONE_SKILL_ID);
+    this.options.db.upsertSkill({
+      id: PINGONE_SKILL_ID,
+      name: 'PingOne',
+      description: 'Administer PingOne Authorize through the PingOne MCP server.',
+      instructions: pingoneSkillInstructions(this.options.config.access.adminGroup),
+      files: existing?.files ?? [],
+      requiredGroups: [],
+      requiresAdmin: true,
+      builtin: true,
+      enabled: existing?.enabled ?? true,
+      createdAt: existing?.createdAt ?? this.now(),
+    });
+  }
+
+  private skillMatchesSession(skill: SkillRow): boolean {
+    if (skill.requiresAdmin) return this.isAdmin();
+    if (skill.requiredGroups.length === 0) return true;
+    const groups = this.session?.groups ?? [];
+    return skill.requiredGroups.some((group) => groups.includes(group));
+  }
+
+  private skillVisible(skill: SkillRow): boolean {
+    return this.skillMatchesSession(skill);
+  }
+
+  private skillUsable(skill: SkillRow): boolean {
+    return skill.enabled && this.skillMatchesSession(skill);
+  }
+
+  private skillView(skill: SkillRow, assignedIds: string[]): SkillView {
+    return {
+      id: skill.id,
+      name: skill.name,
+      description: skill.description,
+      instructions: skill.instructions,
+      requiredGroups: skill.requiredGroups,
+      requiresAdmin: skill.requiresAdmin,
+      builtin: skill.builtin,
+      enabled: skill.enabled,
+      assigned: assignedIds.includes(skill.id),
+    };
+  }
+
+  private storeSkillDraft(draft: SkillDraft): SkillView {
+    const size = draft.instructions.length + draft.files.reduce((sum, file) => sum + file.path.length + file.text.length, 0);
+    if (size > 200_000) throw new Error('That skill is larger than 200 KB.');
+    if (!draft.name.trim()) throw new Error('Give the skill a name.');
+    if (!draft.instructions.trim()) throw new Error('The skill needs instructions.');
+    const skill: SkillRow = {
+      id: randomId(),
+      name: draft.name.trim(),
+      description: draft.description.trim(),
+      instructions: draft.instructions.trim(),
+      files: draft.files,
+      requiredGroups: draft.requiredGroups,
+      requiresAdmin: false,
+      builtin: false,
+      enabled: true,
+      createdAt: this.now(),
+    };
+    this.options.db.upsertSkill(skill);
+    return this.skillView(skill, []);
+  }
+
+  private usableSkills(agent: AgentRow): SkillRow[] {
+    return agent.skillIds.flatMap((id) => {
+      const skill = this.options.db.getSkill(id);
+      return skill && this.skillUsable(skill) ? [skill] : [];
+    });
+  }
+
+  private skillPrompt(agent: AgentRow): string {
+    return this.usableSkills(agent)
+      .map((skill) => {
+        const files = skill.files.map((file) => `\n\nFile ${file.path}:\n${file.text}`).join('');
+        return `Skill: ${skill.name}\n${skill.description}\n${skill.instructions}${files}`;
+      })
+      .join('\n\n');
+  }
+
+  private audit(agentId: string | null, action: string, detail: string): void {
+    this.options.db.insertAudit({
+      id: randomId(),
+      at: this.now(),
+      userId: this.session?.userId ?? '',
+      username: this.session?.username ?? '',
+      agentId,
+      action,
+      detail,
+    });
+  }
+
+  private async pullRemotePolicies(): Promise<void> {
+    const token = await this.workerAccessToken();
+    const remote = await listRemotePolicies(this.options.config, token, this.options.fetchImpl ?? fetch);
+    const local = this.options.db.listPolicies();
+    for (const item of remote) {
+      const marker = parseScaffoldMarker(item.description);
+      const match = local.find((policy) => policy.remoteId === item.id || policy.id === marker?.id || policy.name === item.name);
+      if (match) {
+        this.options.db.upsertPolicy({
+          ...match,
+          enabled: item.enabled,
+          remoteId: item.id,
+          updatedAt: item.updatedAt ?? match.updatedAt,
+          when: Object.keys(match.when).length > 0 ? match.when : (marker?.when ?? match.when),
+          effect: Object.keys(match.effect).length > 0 ? match.effect : (marker?.effect ?? match.effect),
+        });
+        continue;
+      }
+      this.options.db.upsertPolicy({
+        id: marker?.id ?? item.id,
+        name: item.name,
+        description: item.description,
+        enabled: item.enabled,
+        updatedAt: item.updatedAt,
+        updatedBy: null,
+        scaffold: Boolean(marker) || item.description.includes(SCAFFOLD_MARKER),
+        remoteId: item.id,
+        when: marker?.when ?? {},
+        effect: marker?.effect ?? {},
+      });
+    }
+  }
+
+  private async pushScaffold(created: AuthorizePolicy[]): Promise<void> {
+    if (created.length === 0) return;
+    const token = await this.workerAccessToken();
+    const fetchImpl = this.options.fetchImpl ?? fetch;
+    const remote = await listRemotePolicies(this.options.config, token, fetchImpl);
+    for (const policy of created) {
+      const existing = remote.find((item) => item.name === policy.name || item.description.includes(policy.id));
+      const remoteId = existing ? existing.id : await createRemotePolicy(this.options.config, token, policy, fetchImpl);
+      this.options.db.upsertPolicy({ ...policy, remoteId });
+    }
+  }
+
+  private async refreshFeatures(): Promise<void> {
+    if (!this.session) {
+      this.features = failClosed(this.now());
+      this.decisionCache = null;
+      return;
+    }
+    const input = this.decisionInput();
+    const key = decisionCacheKey(input);
+    const cached = this.decisionCache;
+    if (cached && cached.key === key && this.now() - cached.at < this.options.config.authorize.cacheMs) {
+      this.features = cached.decision;
+      return;
+    }
+    const local = evaluatePolicies(this.policiesForDecision(), input, this.now());
+    const endpoint = this.options.config.authorize.decisionEndpointId.trim();
+    if (this.options.config.tenant.mode !== 'pingone' || !endpoint) {
+      this.features = local;
+      this.decisionCache = { key, at: this.now(), decision: local };
+      return;
+    }
+    try {
+      const token = await this.workerAccessToken();
+      const body = await postDecision(
+        this.options.config,
+        token,
+        { ...input, userId: this.session.userId, username: this.session.username },
+        this.options.fetchImpl ?? fetch,
+      );
+      const remote = featuresFromAuthorize(body, this.now());
+      this.features = remote ?? local;
+    } catch {
+      this.features = failClosed(this.now());
+    }
+    this.decisionCache = { key, at: this.now(), decision: this.features };
   }
 
   private askApproval(request: ApprovalRequest): Promise<ApprovalChoice> {
@@ -1246,8 +1684,10 @@ export class Runtime {
       tokenType: tokens.tokenType,
       userId,
       username,
+      groups: this.groupsForTokens(tokens),
     };
     await this.options.secrets.set('session', JSON.stringify(this.session));
+    await this.refreshFeatures();
     this.login = { phase: 'idle' };
     this.stepUpRequired = false;
     this.pendingLogin = null;
@@ -1446,6 +1886,7 @@ export class Runtime {
       jti: randomId(),
       mock: true,
     };
+    if (audience === 'user') claims[this.options.config.access.groupsClaim] = this.mockGroupNames();
     if (includeAct) claims.act = { sub: this.agentClientId() };
     const accessToken = `${encodeJsonSegment({ alg: 'none', typ: 'mock' })}.${encodeJsonSegment(claims)}.mock`;
     return { accessToken, expiresAt, tokenType: 'Bearer', scope: tokenScope };
@@ -1579,7 +2020,7 @@ export class Runtime {
         return;
       }
     }
-    this.session = stored;
+    this.session = { ...stored, groups: stored.groups ?? this.groupsForTokens(stored) };
     const riskRaw = this.options.db.getSetting('risk');
     if (riskRaw) {
       try {
@@ -1588,6 +2029,7 @@ export class Runtime {
         this.risk = null;
       }
     }
+    await this.refreshFeatures();
     await this.exchangeAudiences();
   }
 
@@ -1717,6 +2159,10 @@ export class Runtime {
       enterpriseLocked: true,
       routines: this.listRoutines(agent.id),
       skillIds: agent.skillIds,
+      skills: this.options.db
+        .listSkills()
+        .filter((skill) => this.skillVisible(skill))
+        .map((skill) => this.skillView(skill, agent.skillIds)),
     };
   }
 
@@ -1758,11 +2204,14 @@ export class Runtime {
       userId: this.session.userId,
       username: this.session.username,
       expiresAt: this.session.expiresAt,
+      groups: this.session.groups ?? [],
+      admin: this.isAdmin(),
     };
   }
 
   private serverView(server: McpServerRow): McpServerView {
-    const tools = this.hub.tools(server.id);
+    const pingone = server.id === this.options.config.authorize.mcpServerId;
+    const tools = pingone && (!this.isAdmin() || !this.currentFeatures().pingoneTools) ? [] : this.hub.tools(server.id);
     return {
       ...server,
       status: this.hub.status(server.id),
@@ -1774,6 +2223,18 @@ export class Runtime {
       })),
     };
   }
+}
+
+function policyView(policy: AuthorizePolicy): PolicyView {
+  return {
+    id: policy.id,
+    name: policy.name,
+    description: policy.description,
+    enabled: policy.enabled,
+    updatedAt: policy.updatedAt,
+    updatedBy: policy.updatedBy,
+    scaffold: policy.scaffold,
+  };
 }
 
 function emptyFields(): InstructionFields {

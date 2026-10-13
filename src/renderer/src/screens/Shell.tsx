@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { AppState, Branding } from '@shared/types';
 import { ApprovalModal } from '../components/ApprovalModal';
 import { AgentsScreen } from './AgentsScreen';
 import { ChatScreen } from './ChatScreen';
 import { McpScreen } from './McpScreen';
+import { PolicyScreen } from './PolicyScreen';
 import { RoomsScreen } from './RoomsScreen';
 import { SettingsScreen } from './SettingsScreen';
 
@@ -12,6 +13,7 @@ const NAV = [
   ['rooms', 'Rooms'],
   ['agents', 'Agents'],
   ['tools', 'Tools'],
+  ['policy', 'Policy'],
   ['settings', 'Settings'],
 ] as const;
 
@@ -24,8 +26,15 @@ export function Shell({
   state: AppState;
   onState: (state: AppState) => void;
 }) {
+  const showPolicy = Boolean(state.session?.admin && state.features.policyTab);
+  const nav = NAV.filter(([id]) => id !== 'policy' || showPolicy);
   const [view, setView] = useState<(typeof NAV)[number][0]>('chat');
   const riskClass = state.risk?.action === 'block' ? 'danger' : state.risk?.action === 'allow' ? 'good' : 'warn';
+  const readOnly = state.features.chat === 'read_only';
+
+  useEffect(() => {
+    if (view === 'policy' && !showPolicy) setView('chat');
+  }, [showPolicy, view]);
 
   return (
     <div className="shell">
@@ -44,7 +53,7 @@ export function Shell({
           </div>
         ) : null}
         <nav>
-          {NAV.map(([id, label]) => (
+          {nav.map(([id, label]) => (
             <button key={id} type="button" className={view === id ? 'nav selected' : 'nav'} onClick={() => setView(id)}>
               {label}
             </button>
@@ -62,10 +71,11 @@ export function Shell({
         </div>
       </aside>
       <section className="workspace">
-        {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} /> : null}
-        {view === 'rooms' ? <RoomsScreen showReasoning={state.showReasoning} /> : null}
+        {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} readOnly={readOnly} /> : null}
+        {view === 'rooms' ? <RoomsScreen showReasoning={state.showReasoning} readOnly={readOnly} /> : null}
         {view === 'agents' ? <AgentsScreen branding={branding} /> : null}
         {view === 'tools' ? <McpScreen /> : null}
+        {view === 'policy' && showPolicy ? <PolicyScreen onState={onState} /> : null}
         {view === 'settings' ? <SettingsScreen state={state} /> : null}
       </section>
       <ApprovalModal />

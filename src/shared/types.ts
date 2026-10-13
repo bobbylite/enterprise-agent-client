@@ -79,6 +79,62 @@ export interface SessionView {
   userId: string;
   username: string;
   expiresAt: number;
+  groups: string[];
+  admin: boolean;
+}
+
+export interface FeatureDecision {
+  policyTab: boolean;
+  pingoneTools: boolean;
+  mcpWrites: boolean;
+  chat: 'allow' | 'read_only';
+  source: 'starter' | 'authorize' | 'fail_closed';
+  fetchedAt: number;
+}
+
+export interface SkillView {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  requiredGroups: string[];
+  requiresAdmin: boolean;
+  builtin: boolean;
+  enabled: boolean;
+  assigned: boolean;
+}
+
+export interface SkillInput {
+  name: string;
+  description: string;
+  instructions: string;
+  requiredGroups: string[];
+}
+
+export interface PolicyView {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  updatedAt: number | null;
+  updatedBy: string | null;
+  scaffold: boolean;
+}
+
+export interface PolicyScaffoldResult {
+  preview: PolicyView[];
+  created: PolicyView[];
+  policies: PolicyView[];
+}
+
+export interface AuditView {
+  id: string;
+  at: number;
+  userId: string;
+  username: string;
+  agentId: string | null;
+  action: string;
+  detail: string;
 }
 
 export interface AppState {
@@ -92,6 +148,9 @@ export interface AppState {
   mockScenario: MockScenario;
   login: LoginView;
   showReasoning: boolean;
+  adminGroup: string;
+  mockAdmin: boolean;
+  features: FeatureDecision;
 }
 
 export type ProviderId = 'mock' | 'openai' | 'anthropic' | 'generic';
@@ -162,8 +221,9 @@ export interface AgentPage {
   user: InstructionFields;
   enterpriseLocked: true;
   routines: Routine[];
-  /** Assigned skill ids. Empty until skill assignment is added. */
+  /** Assigned skill ids. */
   skillIds: string[];
+  skills: SkillView[];
 }
 
 export interface AgentInput {
@@ -356,6 +416,7 @@ export interface AgentBridge {
   startSystemBrowserLogin(signals: string): Promise<AppState>;
   cancelLogin(): Promise<AppState>;
   setMockScenario(scenario: MockScenario): Promise<AppState>;
+  setMockAdmin(admin: boolean): Promise<AppState>;
   logout(): Promise<AppState>;
   listConversations(): Promise<Conversation[]>;
   createConversation(): Promise<ChatSnapshot>;
@@ -394,5 +455,16 @@ export interface AgentBridge {
   listTokens(): Promise<InspectedToken[]>;
   revealToken(id: string): Promise<string>;
   reexchangeToken(id: string): Promise<InspectedToken>;
+  listSkills(): Promise<SkillView[]>;
+  importSkill(input: SkillInput): Promise<SkillView>;
+  importSkillFile(): Promise<SkillView>;
+  setSkillEnabled(id: string, enabled: boolean): Promise<SkillView[]>;
+  deleteSkill(id: string): Promise<SkillView[]>;
+  assignSkill(agentId: string, skillId: string, assigned: boolean): Promise<AgentPage>;
+  listPolicies(): Promise<PolicyView[]>;
+  refreshPolicies(): Promise<PolicyView[]>;
+  scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult>;
+  setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]>;
+  listAudit(): Promise<AuditView[]>;
   onChatEvent(listener: (event: ChatEvent) => void): () => void;
 }

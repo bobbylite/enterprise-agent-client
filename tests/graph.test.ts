@@ -28,6 +28,8 @@ function participant(patch?: Partial<GraphParticipant>): GraphParticipant {
     persona: { ...blank, persona: 'Be a careful assistant.' },
     user: { ...blank, communicationStyle: 'Use short sentences.' },
     risk: 'Session risk context (authoritative for this sign-in):\nRisk level: HIGH.\nPolicy action: block.',
+    skillIds: [],
+    skills: '',
     ...patch,
   };
 }
@@ -96,7 +98,7 @@ describe('LangGraph runtime', () => {
       const stream = await graph.stream(
         {
           conversationId: 'c1',
-          participants: [participant({ risk: 'Risk level: LOW.\nPolicy action: allow.' })],
+          participants: [participant({ risk: 'Risk level: LOW.\nPolicy action: allow.', skills: 'Skill: PingOne\nUse the worker token.' })],
           messages: [{ role: 'user', content: 'hello' }],
           availableTools: [],
         },
@@ -117,6 +119,51 @@ describe('LangGraph runtime', () => {
     expect(custom.some((event) => event.type === 'assistant-delta')).toBe(true);
     expect(events.some((event) => event.type === 'assistant-reasoning')).toBe(true);
     expect(system.indexOf('Enterprise policy (locked)')).toBeLessThan(system.indexOf('Agent persona'));
+    expect(system).toContain('Skill: PingOne');
+  });
+
+  it('denies a PingOne tool in the tool node even when it is still listed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'graph-pingone-'));
+    const checkpointer = openCheckpointer(join(directory, 'turns.sqlite'));
+    const graph = compileAgentGraph(checkpointer);
+    const seen: string[] = [];
+    const { deps: bound, calls } = deps({
+      gateTool: () => 'PingOne tools are limited to the Administrator group.',
+      persistTool: (tool) => {
+        seen.push(`${tool.status}:${tool.result ?? ''}`);
+      },
+    });
+    try {
+      await runAgentGraph({
+        graph,
+        checkpointer,
+        threadId: 'pingone-thread',
+        runId: 'pingone-run',
+        deps: bound,
+        initial: {
+          conversationId: 'c-pingone',
+          participants: [participant({ skillIds: [], skills: '' })],
+          messages: [{ role: 'user', content: 'echo hello' }],
+          availableTools: [
+            {
+              key: 'pingone__echo',
+              serverId: 'pingone',
+              serverName: 'PingOne',
+              name: 'createPolicy',
+              description: 'Create a policy',
+              inputSchema: { type: 'object', properties: { message: { type: 'string' } } },
+              readOnlyHint: false,
+            },
+          ],
+          riskAction: 'allow',
+        },
+      });
+      expect(calls.token).toEqual([]);
+      expect(calls.tool).toEqual([]);
+      expect(seen).toContain('denied:PingOne tools are limited to the Administrator group.');
+    } finally {
+      checkpointer.close();
+    }
   });
 
   it('blocks a tool inside the graph without exchanging a token', async () => {

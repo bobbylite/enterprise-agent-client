@@ -1,7 +1,7 @@
 import type { BrowserWindow, IpcMain } from 'electron';
 import { Ipc } from '@shared/channels';
 import { redactSecrets } from '@shared/env';
-import type { AgentInput, ApprovalChoice, Branding, ChatEvent, InstructionFields, MockScenario, RoomInput, RoutineInput, SettingsInput, McpServerInput } from '@shared/types';
+import type { AgentInput, ApprovalChoice, Branding, ChatEvent, InstructionFields, MockScenario, RoomInput, RoutineInput, SettingsInput, SkillInput, McpServerInput } from '@shared/types';
 import type { Runtime } from './runtime';
 
 export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindow, branding: Branding): void {
@@ -30,6 +30,7 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
   handle(Ipc.startSystemBrowserLogin, (signals: string) => runtime.startSystemBrowserLogin(signals));
   handle(Ipc.cancelLogin, () => runtime.cancelLogin());
   handle(Ipc.setMockScenario, (scenario: MockScenario) => runtime.setMockScenario(scenario));
+  handle(Ipc.setMockAdmin, (admin: boolean) => runtime.setMockAdmin(admin));
   handle(Ipc.logout, () => runtime.logout());
   handle(Ipc.listConversations, () => runtime.listConversations());
   handle(Ipc.createConversation, () => runtime.createConversation());
@@ -70,4 +71,15 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
   handle(Ipc.listTokens, () => runtime.listInspectedTokens());
   handle(Ipc.revealToken, (id: string) => runtime.revealInspectedToken(id));
   handle(Ipc.reexchangeToken, (id: string) => runtime.reexchangeToken(id));
+  handle(Ipc.listSkills, () => runtime.listSkills());
+  handle(Ipc.importSkill, (input: SkillInput) => runtime.importSkill(input));
+  handle(Ipc.importSkillFile, () => runtime.importSkillFile());
+  handle(Ipc.setSkillEnabled, (id: string, enabled: boolean) => runtime.setSkillEnabled(id, enabled));
+  handle(Ipc.deleteSkill, (id: string) => runtime.deleteSkill(id));
+  handle(Ipc.assignSkill, (agentId: string, skillId: string, assigned: boolean) => runtime.assignSkill(agentId, skillId, assigned));
+  handle(Ipc.listPolicies, () => runtime.listPolicies());
+  handle(Ipc.refreshPolicies, () => runtime.refreshPolicies());
+  handle(Ipc.scaffoldPolicies, (confirm: boolean) => runtime.scaffoldPolicies(confirm));
+  handle(Ipc.setPolicyEnabled, (id: string, enabled: boolean) => runtime.setPolicyEnabled(id, enabled));
+  handle(Ipc.listAudit, () => runtime.listAudit());
 }

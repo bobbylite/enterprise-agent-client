@@ -21,6 +21,8 @@ export interface GraphParticipant {
   user: InstructionFields;
   room?: string;
   risk?: string;
+  skillIds: string[];
+  skills: string;
 }
 
 export interface GraphDeps {
@@ -40,6 +42,9 @@ export interface GraphDeps {
   rememberAlways: (serverId: string, toolName: string) => void;
   tokenForServer: (serverId: string) => Promise<string>;
   callTool: (tool: RuntimeTool, args: unknown, accessToken: string | undefined) => Promise<string>;
+  visibleTools?: (tools: RuntimeTool[], participant: GraphParticipant) => RuntimeTool[];
+  gateTool?: (tool: RuntimeTool, participant: GraphParticipant | undefined) => string | null;
+  recordAdminAction?: (agentId: string | null, action: string, detail: string) => void;
   persistMessage: (message: {
     id: string;
     content: string;
@@ -173,7 +178,7 @@ async function modelNode(state: AgentStateType, config: RunnableConfig): Promise
     deps,
     config,
   );
-  const system = composeInstructions({
+  const composed = composeInstructions({
     branding: { appName: participant.appName, agentName: participant.agentName },
     enterprise: participant.enterprise,
     persona: participant.persona,
@@ -181,6 +186,8 @@ async function modelNode(state: AgentStateType, config: RunnableConfig): Promise
     room: participant.room,
     risk: participant.risk,
   });
+  const system = participant.skills ? `${composed}\n\n${participant.skills}` : composed;
+  const visible = deps.visibleTools?.(state.availableTools, participant) ?? state.availableTools;
   let content = '';
   let reasoning = '';
   let answered = false;
@@ -192,7 +199,7 @@ async function modelNode(state: AgentStateType, config: RunnableConfig): Promise
       model: deps.model,
       system,
       messages: state.messages,
-      tools: state.availableTools,
+      tools: visible,
       temperature: deps.temperature,
       reasoningEffort: deps.reasoningEffort,
       showReasoning: deps.showReasoning,
@@ -269,6 +276,7 @@ async function modelNode(state: AgentStateType, config: RunnableConfig): Promise
     activeMessageId: messageId,
     finalText: content,
     cancelled,
+    availableTools: visible,
   };
 }
 
@@ -296,6 +304,25 @@ async function toolsNode(state: AgentStateType, config: RunnableConfig): Promise
     publish({ type: 'tool', conversationId: state.conversationId, messageId, tool: denied }, deps, config);
     return {
       messages: [{ role: 'tool', toolCallId: invocationId, content: denied.result ?? '' }],
+      toolIndex: state.toolIndex + 1,
+    };
+  }
+  const participant = state.participants[state.agentIndex];
+  const gated = deps.gateTool?.(tool, participant);
+  if (gated) {
+    const denied = invocation(invocationId, messageId, {
+      serverId: tool.serverId,
+      serverName: tool.serverName,
+      toolName: tool.name,
+      args: parseToolArgs(call.arguments),
+      result: gated,
+      status: 'denied',
+      approval: 'automatic',
+    });
+    deps.persistTool(denied);
+    publish({ type: 'tool', conversationId: state.conversationId, messageId, tool: denied }, deps, config);
+    return {
+      messages: [{ role: 'tool', toolCallId: invocationId, content: gated }],
       toolIndex: state.toolIndex + 1,
     };
   }
@@ -362,6 +389,9 @@ async function toolsNode(state: AgentStateType, config: RunnableConfig): Promise
     if (deps.signal?.aborted) throw new StreamCancelled();
     const accessToken = await deps.tokenForServer(tool.serverId);
     resultText = await deps.callTool(tool, args, accessToken || undefined);
+    if (deps.recordAdminAction && tool.serverId) {
+      deps.recordAdminAction(participant?.id ?? null, `tool:${tool.serverId}/${tool.name}`, JSON.stringify(args));
+    }
   } catch (error) {
     if (isCancellation(error)) {
       const stopped = live('denied', 'Stopped.', outcome.persistence);

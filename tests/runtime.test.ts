@@ -7,6 +7,7 @@ import { Repository } from '../src/main/db';
 import { Runtime } from '../src/main/runtime';
 import { parseBranding } from '../src/shared/branding';
 import { parseEnterpriseConfig } from '../src/shared/config';
+import { decodeJwtPayload, encodeJsonSegment } from '../src/shared/ids';
 import { MemorySecretStore } from '../src/shared/secrets';
 import type { ChatEvent } from '../src/shared/types';
 
@@ -483,6 +484,164 @@ describe('mock runtime', () => {
   });
 });
 
+describe('admin gate', () => {
+  it('hides policy and the PingOne skill from a non-admin and allows them for an administrator', async () => {
+    const { runtime } = await boot();
+    const employee = await runtime.submitCredentials('ada', 'secret', '');
+    expect(employee.session?.groups).toEqual(['Employees']);
+    expect(employee.session?.admin).toBe(false);
+    expect(employee.features.policyTab).toBe(false);
+    expect(employee.features.pingoneTools).toBe(false);
+    expect(employee.features.chat).toBe('allow');
+    await expect(runtime.listPolicies()).rejects.toThrow(/Administrator/);
+    await expect(runtime.scaffoldPolicies(true)).rejects.toThrow(/Administrator/);
+    const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+    const employeePage = runtime.openAgent(branded!.id);
+    expect(employeePage.skills.some((skill) => skill.id === 'pingone')).toBe(false);
+    expect(() => runtime.assignSkill(branded!.id, 'pingone', true)).toThrow(/not found/);
+
+    await runtime.logout();
+    await runtime.setMockAdmin(true);
+    const admin = await runtime.submitCredentials('ada', 'secret', '');
+    expect(admin.session?.admin).toBe(true);
+    expect(admin.session?.groups).toEqual(['Administrator']);
+    expect(admin.features.policyTab).toBe(true);
+    expect(admin.features.pingoneTools).toBe(true);
+    const adminPage = runtime.openAgent(branded!.id);
+    expect(adminPage.skills.some((skill) => skill.id === 'pingone' && skill.builtin && skill.requiresAdmin)).toBe(true);
+    const assigned = runtime.assignSkill(branded!.id, 'pingone', true);
+    expect(assigned.skillIds).toContain('pingone');
+    expect(assigned.skills.find((skill) => skill.id === 'pingone')?.assigned).toBe(true);
+  });
+
+  it('scaffolds once, toggles enforcement, and audits both', async () => {
+    const { runtime } = await boot();
+    await runtime.setMockAdmin(true);
+    await runtime.submitCredentials('ada', 'secret', '');
+    const preview = await runtime.scaffoldPolicies(false);
+    expect(preview.created).toEqual([]);
+    expect(preview.policies).toEqual([]);
+    expect(preview.preview.map((policy) => policy.id)).toEqual([
+      'enterprise-agent:session',
+      'enterprise-agent:admin',
+      'enterprise-agent:read-only',
+      'enterprise-agent:high-risk',
+    ]);
+    const created = await runtime.scaffoldPolicies(true);
+    expect(created.created).toHaveLength(4);
+    const again = await runtime.scaffoldPolicies(true);
+    expect(again.created).toEqual([]);
+    expect(await runtime.listPolicies()).toHaveLength(4);
+
+    await runtime.setPolicyEnabled('enterprise-agent:session', false);
+    const after = runtime.state();
+    expect(after.features.chat).toBe('read_only');
+    expect(after.features.mcpWrites).toBe(false);
+    expect(after.features.policyTab).toBe(true);
+    const audit = runtime.listAudit();
+    expect(audit.some((event) => event.action === 'policy:scaffold' && event.username === 'ada')).toBe(true);
+    expect(audit.some((event) => event.action === 'policy:enforcement' && event.detail.includes('disabled'))).toBe(true);
+  });
+
+  it('locks an administrator session down at high risk', async () => {
+    const { runtime } = await boot(0, (config) => {
+      config.protect.policy.levels.HIGH = 'allow';
+      config.protect.policy.reasonOverrides = config.protect.policy.reasonOverrides.filter((item) => item.code !== 'IMPOSSIBLE_TRAVEL');
+    });
+    await runtime.setMockAdmin(true);
+    await runtime.setMockScenario('impossible_travel');
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(state.session?.admin).toBe(true);
+    expect(state.risk?.level).toBe('HIGH');
+    expect(state.risk?.action).toBe('allow');
+    expect(state.features.policyTab).toBe(false);
+    expect(state.features.pingoneTools).toBe(false);
+    expect(state.features.mcpWrites).toBe(false);
+    expect(state.features.chat).toBe('read_only');
+    await expect(runtime.listPolicies()).rejects.toThrow(/Policy tab/);
+    const snapshot = runtime.createConversation();
+    await expect(runtime.sendMessage(snapshot.conversation.id, 'hello', [])).rejects.toThrow(/read-only/);
+  });
+
+  it('uses a worker token for the PingOne server and denies the tool until the skill is assigned', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pingone-token-'));
+    const tokenFile = join(directory, 'token.txt');
+    const script = join(directory, 'capture.mjs');
+    writeFileSync(script, "import { writeFileSync } from 'node:fs'; writeFileSync(process.argv[2], process.env.MCP_ACCESS_TOKEN ?? '');\n");
+    const { runtime, events } = await boot();
+    try {
+      await runtime.setMockAdmin(false);
+      await runtime.submitCredentials('ada', 'secret', '');
+      await runtime.saveMcpServer({
+        id: 'pingone',
+        name: 'PingOne',
+        transport: 'stdio',
+        command: 'node',
+        args: `${script} ${tokenFile}`,
+        url: '',
+        audience: '',
+        scope: '',
+        enabled: true,
+      });
+      await expect(runtime.connectMcp('pingone')).rejects.toThrow(/Administrator/);
+      expect(existsSync(tokenFile)).toBe(false);
+
+      await runtime.logout();
+      await runtime.setMockAdmin(true);
+      await runtime.submitCredentials('ada', 'secret', '');
+      await expect(runtime.connectMcp('pingone')).rejects.toThrow();
+      const payload = decodeJwtPayload(readFileSync(tokenFile, 'utf8'));
+      expect(payload.aud).toBe('worker');
+      expect(payload.sub).toBe('worker');
+      expect(payload.act).toBeUndefined();
+
+      await runtime.saveMcpServer({
+        id: 'pingone',
+        name: 'PingOne',
+        transport: 'stdio',
+        command: 'node',
+        args: 'examples/echo-mcp-server.mjs',
+        url: '',
+        audience: '',
+        scope: '',
+        enabled: true,
+      });
+      const connected = await runtime.connectMcp('pingone');
+      expect(connected.tools.map((tool) => tool.name)).toContain('echo');
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      const snapshot = runtime.createConversation();
+      await runtime.sendMessage(snapshot.conversation.id, 'echo hello', []);
+      expect(events.some((event) => event.type === 'tool' && event.tool.serverId === 'pingone')).toBe(false);
+
+      runtime.assignSkill(branded!.id, 'pingone', true);
+      const pending = runtime.sendMessage(snapshot.conversation.id, 'echo hello again', []);
+      const approval = await waitFor(events, (event) => event.type === 'approval-required' && event.request.serverId === 'pingone');
+      if (approval.type !== 'approval-required') throw new Error('missing approval');
+      runtime.respondApproval(approval.request.id, 'once');
+      await pending;
+      expect(events.some((event) => event.type === 'tool' && event.tool.serverId === 'pingone' && event.tool.status === 'done')).toBe(true);
+      expect(runtime.listAudit().some((event) => event.action.startsWith('tool:pingone/') && event.agentId === branded!.id)).toBe(true);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('hides a skill whose required groups do not match the session', async () => {
+    const { runtime } = await boot();
+    await runtime.submitCredentials('ada', 'secret', '');
+    const uploaded = runtime.importSkill({
+      name: 'Finance close',
+      description: 'Books',
+      instructions: 'Reconcile the books.',
+      requiredGroups: ['Finance'],
+    });
+    expect(runtime.listSkills().some((skill) => skill.id === uploaded.id)).toBe(false);
+    const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+    expect(runtime.openAgent(branded!.id).skills.some((skill) => skill.id === uploaded.id)).toBe(false);
+    expect(() => runtime.deleteSkill('pingone')).toThrow(/not found/);
+  });
+});
+
 describe('pi.flow runtime', () => {
   function pingone(config: ReturnType<typeof parseEnterpriseConfig>): void {
     config.tenant.mode = 'pingone';
@@ -532,6 +691,114 @@ describe('pi.flow runtime', () => {
       'application/vnd.pingidentity.usernamePassword.check+json',
       'application/x-www-form-urlencoded',
     ]);
+  });
+
+  it('reads the Administrator group from the access token', async () => {
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+      },
+      flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] })),
+    );
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(state.session?.admin).toBe(true);
+    expect(state.session?.groups).toEqual(['Administrator']);
+    expect(state.features.policyTab).toBe(true);
+    expect(state.features.source).toBe('starter');
+  });
+
+  it('fails closed when the Authorize decision endpoint cannot be reached', async () => {
+    let decisionAuth = '';
+    const secrets = new MemorySecretStore();
+    await secrets.set('workerClientSecret', 'worker-secret');
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+        config.authorize.decisionEndpointId = 'decision-1';
+      },
+      async (url, init) => {
+        const target = String(url);
+        const body = String(init?.body ?? '');
+        if (target.includes('/as/token') && body.includes('client_credentials')) {
+          return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        }
+        if (target.includes('/decisionEndpoints/')) {
+          decisionAuth = new Headers(init?.headers).get('authorization') ?? '';
+          const parameters = (JSON.parse(body) as { parameters: Record<string, string> }).parameters;
+          expect(parameters['user.groups']).toBe(JSON.stringify(['Administrator']));
+          expect(parameters['risk.level']).toBe('LOW');
+          expect(parameters['risk.score']).toBe('10');
+          expect(parameters['risk.action']).toBe('allow');
+          throw new Error('Authorize unreachable');
+        }
+        return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+      },
+      secrets,
+      { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+    );
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(decisionAuth).toBe('Bearer worker-token');
+    expect(state.features.source).toBe('fail_closed');
+    expect(state.features.policyTab).toBe(false);
+    expect(state.features.pingoneTools).toBe(false);
+    expect(state.features.mcpWrites).toBe(false);
+    expect(state.features.chat).toBe('read_only');
+  });
+
+  it('applies an Authorize feature statement from the worker decision call', async () => {
+    const secrets = new MemorySecretStore();
+    await secrets.set('workerClientSecret', 'worker-secret');
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+        config.authorize.decisionEndpointId = 'decision-1';
+      },
+      async (url, init) => {
+        const target = String(url);
+        const body = String(init?.body ?? '');
+        if (target.includes('/as/token') && body.includes('client_credentials')) {
+          return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        }
+        if (target.includes('/decisionEndpoints/')) {
+          return json(200, {
+            decision: 'PERMIT',
+            statements: [
+              {
+                code: 'enterprise-agent-features',
+                payload: JSON.stringify({ policyTab: true, pingoneTools: false, mcpWrites: true, chat: 'allow' }),
+              },
+            ],
+          });
+        }
+        return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+      },
+      secrets,
+      { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+    );
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(state.features.source).toBe('authorize');
+    expect(state.features.policyTab).toBe(true);
+    expect(state.features.pingoneTools).toBe(false);
+    expect(state.features.mcpWrites).toBe(true);
+    expect(state.features.chat).toBe('allow');
+    await runtime.saveMcpServer({
+      id: 'pingone',
+      name: 'PingOne',
+      transport: 'stdio',
+      command: 'node',
+      args: 'examples/echo-mcp-server.mjs',
+      url: '',
+      audience: '',
+      scope: '',
+      enabled: true,
+    });
+    await expect(runtime.connectMcp('pingone')).rejects.toThrow(/turned PingOne tools off/);
   });
 
   it('reports an external identity provider instead of posting usernamePassword.check', async () => {
@@ -780,6 +1047,38 @@ async function waitFor(events: ChatEvent[], predicate: (event: ChatEvent) => boo
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('Timed out waiting for an event.');
+}
+
+function unsignedJwt(claims: Record<string, unknown>): string {
+  return `${encodeJsonSegment({ alg: 'none', typ: 'JWT' })}.${encodeJsonSegment(claims)}.sig`;
+}
+
+function flowFetch(accessToken: string): typeof fetch {
+  let state = '';
+  return async (url, init) => {
+    const type = new Headers(init?.headers).get('content-type') ?? '';
+    const target = String(url);
+    if (target.includes('/as/authorize')) {
+      state = new URL(target).searchParams.get('state') ?? '';
+      return json(200, {
+        id: 'flow-1',
+        status: 'USERNAME_PASSWORD_REQUIRED',
+        _links: { 'usernamePassword.check': { href: 'https://auth.example/env-1/flows/flow-1' } },
+      });
+    }
+    if (type.includes('usernamePassword.check')) {
+      return json(200, {
+        id: 'flow-1',
+        status: 'COMPLETED',
+        authorizeResponse: { code: 'auth-code', state },
+        _embedded: { user: { id: 'user-1', username: 'ada' } },
+      });
+    }
+    if (target.includes('/as/token')) {
+      return json(200, { access_token: accessToken, expires_in: 3600, token_type: 'Bearer' });
+    }
+    return json(500, { message: target });
+  };
 }
 
 function json(status: number, body: unknown): Response {
