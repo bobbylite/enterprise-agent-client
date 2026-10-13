@@ -1,6 +1,6 @@
 import { randomId } from '@shared/ids';
 import { choiceFromUser, previewApproval, type ApprovalDecision, type ApprovalPreview } from '@shared/mcp/approvals';
-import type { ChatProvider, ProviderMessage, ProviderRequest } from '@shared/providers/types';
+import { isCancellation, StreamCancelled, type ChatProvider, type ProviderMessage, type ProviderRequest } from '@shared/providers/types';
 import type { ApprovalChoice, ApprovalRequest, ChatEvent, RiskAction, ToolInvocation } from '@shared/types';
 
 export interface RuntimeTool {
@@ -28,11 +28,16 @@ export async function runAgentTurn(input: {
   persistMessage: (message: {
     id: string;
     content: string;
+    reasoning: string;
+    reasoningMs: number | null;
     authorId: string;
     authorName: string;
   }) => void;
   persistTool: (tool: ToolInvocation) => void;
   emit: (event: ChatEvent) => void;
+  showReasoning: boolean;
+  signal?: AbortSignal;
+  now?: () => number;
   maxRounds?: number;
 }): Promise<string> {
   const history = [...input.messages];
@@ -48,31 +53,85 @@ export async function runAgentTurn(input: {
       authorId: input.author.id,
       authorName: input.author.name,
     });
-    const result = await input.provider.stream(
-      {
-        ...input.request,
-        messages: history,
-        tools: input.tools.map((tool) => ({
-          name: tool.key,
-          description: tool.description,
-          inputSchema: tool.inputSchema,
-        })),
-      },
-      (delta) => {
-        input.emit({ type: 'assistant-delta', conversationId: input.conversationId, messageId, delta });
-      },
-    );
+    const started = input.now?.() ?? Date.now();
+    const elapsed = () => (input.now?.() ?? Date.now()) - started;
+    input.emit({
+      type: 'assistant-phase',
+      conversationId: input.conversationId,
+      messageId,
+      phase: 'thinking',
+      elapsedMs: 0,
+    });
+    let content = '';
+    let reasoning = '';
+    let answered = false;
+    let cancelled = false;
+    let result: { content: string; toolCalls: { id: string; name: string; arguments: string }[] } = {
+      content: '',
+      toolCalls: [],
+    };
+    try {
+      if (input.signal?.aborted) throw new StreamCancelled();
+      result = await input.provider.stream(
+        {
+          ...input.request,
+          showReasoning: input.showReasoning,
+          messages: history,
+          tools: input.tools.map((tool) => ({
+            name: tool.key,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+          })),
+        },
+        (chunk) => {
+          if (chunk.type === 'reasoning') {
+            if (!input.showReasoning) return;
+            reasoning += chunk.delta;
+            input.emit({ type: 'assistant-reasoning', conversationId: input.conversationId, messageId, delta: chunk.delta });
+            return;
+          }
+          if (!answered) {
+            answered = true;
+            input.emit({
+              type: 'assistant-phase',
+              conversationId: input.conversationId,
+              messageId,
+              phase: 'answering',
+              elapsedMs: elapsed(),
+            });
+          }
+          content += chunk.delta;
+          input.emit({ type: 'assistant-delta', conversationId: input.conversationId, messageId, delta: chunk.delta });
+        },
+        input.signal,
+      );
+      content = result.content || content;
+    } catch (error) {
+      if (!isCancellation(error)) throw error;
+      cancelled = true;
+    }
+    const reasoningMs = elapsed();
     input.persistMessage({
       id: messageId,
-      content: result.content,
+      content,
+      reasoning: input.showReasoning ? reasoning : '',
+      reasoningMs: input.showReasoning ? reasoningMs : null,
       authorId: input.author.id,
       authorName: input.author.name,
     });
+    input.emit({
+      type: 'assistant-phase',
+      conversationId: input.conversationId,
+      messageId,
+      phase: cancelled ? 'cancelled' : 'done',
+      elapsedMs: reasoningMs,
+    });
     input.emit({ type: 'assistant-done', conversationId: input.conversationId, messageId });
-    finalText = result.content;
+    finalText = content;
+    if (cancelled) return finalText;
     history.push({
       role: 'assistant',
-      content: result.content,
+      content,
       toolCalls: result.toolCalls,
     });
     if (result.toolCalls.length === 0) break;
@@ -110,9 +169,26 @@ export async function runAgentTurn(input: {
         readOnlyHint: tool.readOnlyHint,
         remembered: input.remembered(tool.serverId, tool.name) ?? undefined,
       });
-      const outcome = await resolveApproval(preview, async () => {
+      const live = (status: ToolInvocation['status'], resultText: string | null = null, approval: ToolInvocation['approval'] = null): ToolInvocation => ({
+        id: invocationId,
+        messageId,
+        serverId: tool.serverId,
+        serverName: tool.serverName,
+        toolName: tool.name,
+        args,
+        result: resultText,
+        status,
+        approval,
+      });
+      input.emit({ type: 'tool', conversationId: input.conversationId, messageId, tool: live('calling') });
+      if (preview.type === 'prompt') {
+        input.emit({ type: 'tool', conversationId: input.conversationId, messageId, tool: live('approval') });
+      }
+      let outcome: ApprovalDecision;
+      try {
+        outcome = await resolveApproval(preview, async () => {
         if (preview.type !== 'prompt') return 'deny';
-        const choice = await input.requestApproval({
+        const choice = await withSignal(input.requestApproval({
           id: invocationId,
           conversationId: input.conversationId,
           serverId: tool.serverId,
@@ -122,10 +198,17 @@ export async function runAgentTurn(input: {
           readOnlyHint: tool.readOnlyHint,
           riskAction: input.riskAction,
           allowAlways: preview.allowAlways,
-        });
+        }), input.signal);
         if (choice === 'always' && preview.allowAlways) input.rememberAlways(tool.serverId, tool.name);
         return choice;
       });
+      } catch (error) {
+        if (!isCancellation(error)) throw error;
+        const stopped = live('denied', 'Stopped.', 'deny');
+        input.persistTool(stopped);
+        input.emit({ type: 'tool', conversationId: input.conversationId, messageId, tool: stopped });
+        return finalText;
+      }
 
       if (outcome.type === 'deny') {
         const denied: ToolInvocation = {
@@ -145,11 +228,19 @@ export async function runAgentTurn(input: {
         continue;
       }
 
+      input.emit({ type: 'tool', conversationId: input.conversationId, messageId, tool: live('running') });
       let resultText: string;
       let status: ToolInvocation['status'] = 'done';
       try {
+        if (input.signal?.aborted) throw new StreamCancelled();
         resultText = await input.callTool(tool, args);
       } catch (error) {
+        if (isCancellation(error)) {
+          const stopped = live('denied', 'Stopped.', outcome.persistence);
+          input.persistTool(stopped);
+          input.emit({ type: 'tool', conversationId: input.conversationId, messageId, tool: stopped });
+          return finalText;
+        }
         status = 'error';
         resultText = error instanceof Error ? error.message : String(error);
       }
@@ -171,6 +262,16 @@ export async function runAgentTurn(input: {
   }
 
   return finalText;
+}
+
+function withSignal<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(new StreamCancelled());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new StreamCancelled());
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
 }
 
 async function resolveApproval(

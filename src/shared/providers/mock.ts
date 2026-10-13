@@ -1,20 +1,33 @@
-import type { ChatProvider, ProviderRequest, ProviderResult, ProviderToolCall } from './types';
+import { StreamCancelled, type ChatProvider, type ProviderRequest, type ProviderResult, type ProviderToolCall, type StreamChunk } from './types';
 
 export function createMockProvider(delayMs = 12): ChatProvider {
   return {
     id: 'mock',
-    async stream(request, onDelta, signal) {
+    async stream(request, onChunk, signal) {
       const result = mockResult(request);
-      const parts = result.content.split(/(\s+)/);
-      for (const part of parts) {
-        if (!part) continue;
-        if (signal?.aborted) throw new Error('The response was cancelled.');
-        onDelta(part);
-        if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (request.showReasoning !== false) {
+        await emitParts(onChunk, 'reasoning', 'Checking the request against the session policy. ', delayMs, signal);
       }
+      await emitParts(onChunk, 'text', result.content, delayMs, signal);
+      if (signal?.aborted) throw new StreamCancelled();
       return result;
     },
   };
+}
+
+async function emitParts(
+  onChunk: (chunk: StreamChunk) => void,
+  type: StreamChunk['type'],
+  text: string,
+  delayMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  for (const part of text.split(/(\s+)/)) {
+    if (!part) continue;
+    if (signal?.aborted) throw new StreamCancelled();
+    onChunk({ type, delta: part });
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
 }
 
 export function mockResult(request: ProviderRequest): ProviderResult {

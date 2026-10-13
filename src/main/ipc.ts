@@ -37,6 +37,9 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
   handle(Ipc.sendMessage, (conversationId: string, text: string, attachmentIds: string[]) =>
     runtime.sendMessage(conversationId, text, attachmentIds ?? []),
   );
+  handle(Ipc.stopGeneration, (conversationId: string) => runtime.stopGeneration(conversationId));
+  handle(Ipc.deleteConversation, (id: string) => runtime.deleteConversation(id));
+  handle(Ipc.deleteRoomHistory, (roomId: string) => runtime.deleteRoomHistory(roomId));
   handle(Ipc.pickAttachments, () => runtime.pickAttachments());
   handle(Ipc.listAgents, () => runtime.listAgents());
   handle(Ipc.listRooms, () => runtime.listRooms());

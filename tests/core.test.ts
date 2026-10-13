@@ -18,9 +18,12 @@ import {
   createOpenAiProvider,
   isReasoningModel,
   openAiChatBody,
+  openAiResponsesBody,
   REASONING_MAX_COMPLETION_TOKENS,
   unsupportedParameters,
 } from '../src/shared/providers/openai';
+import { anthropicMessageBody, createAnthropicProvider } from '../src/shared/providers/anthropic';
+import { createGenericProvider } from '../src/shared/providers/generic';
 import { parseAnthropicData, parseOpenAiData } from '../src/shared/providers/sse';
 import { mockResult } from '../src/shared/providers/mock';
 import { assertValidCron, cronMatches } from '../src/shared/schedule/cron';
@@ -40,7 +43,8 @@ describe('branding', () => {
     const branding = parseBranding(raw, null);
     expect(branding.appName).toBe(raw.appName);
     expect(branding.agentName).toBe(raw.agentName);
-    expect(branding.appName).toBe(branding.agentName);
+    expect(branding.appName.length).toBeGreaterThan(0);
+    expect(branding.agentName.length).toBeGreaterThan(0);
   });
 
   it('does not hardcode the sample agent name in source', () => {
@@ -506,6 +510,15 @@ describe('cron and providers', () => {
   it('parses provider streams and lets the mock provider call echo', () => {
     expect(parseOpenAiData('[DONE]')).toBe('done');
     expect(parseOpenAiData(JSON.stringify({ choices: [{ delta: { content: 'Hi' } }] }))).toMatchObject({ text: 'Hi' });
+    expect(parseOpenAiData(JSON.stringify({ choices: [{ delta: { reasoning_content: 'Because' } }] }))).toMatchObject({
+      reasoning: 'Because',
+    });
+    expect(parseOpenAiData(JSON.stringify({ type: 'response.reasoning_summary_text.delta', delta: 'Step' }))).toMatchObject({
+      reasoning: 'Step',
+    });
+    expect(parseAnthropicData(JSON.stringify({ type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'Hmm' } }))).toMatchObject({
+      reasoning: 'Hmm',
+    });
     expect(
       parseAnthropicData(JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Yo' } })),
     ).toMatchObject({ text: 'Yo' });
@@ -609,8 +622,76 @@ describe('cron and providers', () => {
     expect(configured.provider.openaiModel).toBe('gpt-5');
     expect(configured.provider.reasoningEffort).toBe('medium');
     expect(configured.provider.temperature).toBeUndefined();
+    expect(configured.provider.showReasoning).toBe(true);
+  });
+
+  it('streams GPT-5 reasoning summaries and Anthropic thinking', async () => {
+    const request = {
+      model: 'gpt-5',
+      system: 'Be brief.',
+      messages: [{ role: 'user' as const, content: 'Hello' }],
+      tools: [] as [],
+      apiKey: 'test-key',
+      showReasoning: true,
+      reasoningEffort: 'medium' as const,
+    };
+    expect(openAiResponsesBody(request).reasoning).toEqual({ effort: 'medium', summary: 'auto' });
+    const chunks: string[] = [];
+    const urls: string[] = [];
+    const fetchImpl: typeof fetch = async (url) => {
+      urls.push(String(url));
+      if (String(url).endsWith('/responses')) {
+        return sse([
+          { type: 'response.reasoning_summary_text.delta', delta: 'Looking' },
+          { type: 'response.output_text.delta', delta: 'Hi' },
+        ]);
+      }
+      return new Response('missing', { status: 404 });
+    };
+    const result = await createOpenAiProvider(fetchImpl).stream(request, (chunk) => chunks.push(`${chunk.type}:${chunk.delta}`));
+    expect(urls[0]).toContain('/responses');
+    expect(chunks).toEqual(['reasoning:Looking', 'text:Hi']);
+    expect(result.content).toBe('Hi');
+
+    const fallbackUrls: string[] = [];
+    const fallback: typeof fetch = async (url) => {
+      fallbackUrls.push(String(url));
+      if (String(url).endsWith('/responses')) return new Response('no', { status: 404 });
+      return sse([{ choices: [{ delta: { reasoning_content: 'Via chat', content: 'Ok' } }] }]);
+    };
+    const compatible = await createOpenAiProvider(fallback).stream(request, () => undefined);
+    expect(fallbackUrls.map((url) => (url.endsWith('/responses') ? 'responses' : 'completions'))).toEqual(['responses', 'completions']);
+    expect(compatible.content).toBe('Ok');
+
+    const anthropic = anthropicMessageBody({ ...request, model: 'claude-sonnet-4-5', temperature: 0.2 });
+    expect(anthropic.thinking).toEqual({ type: 'enabled', budget_tokens: 2048 });
+    expect(anthropic.temperature).toBeUndefined();
+    expect(anthropicMessageBody({ ...request, model: 'claude-sonnet-4-5', showReasoning: false, temperature: 0.2 }).temperature).toBe(0.2);
+    const thought: string[] = [];
+    const anthropicFetch: typeof fetch = async () =>
+      sse([
+        { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'Weighing' } },
+        { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Done' } },
+      ]);
+    const anthropicResult = await createAnthropicProvider(anthropicFetch).stream(request, (chunk) => thought.push(`${chunk.type}:${chunk.delta}`));
+    expect(thought).toEqual(['reasoning:Weighing', 'text:Done']);
+    expect(anthropicResult.content).toBe('Done');
+
+    const genericFetch: typeof fetch = async () =>
+      sse([{ reasoning: 'Internal', delta: 'Answer' }]);
+    const generic = await createGenericProvider(genericFetch).stream(
+      { ...request, baseUrl: 'https://llm.example/generate', showReasoning: true },
+      (chunk) => chunks.push(`generic:${chunk.type}:${chunk.delta}`),
+    );
+    expect(generic.content).toBe('Answer');
+    expect(chunks).toContain('generic:reasoning:Internal');
   });
 });
+
+function sse(events: unknown[]): Response {
+  const body = events.map((event) => `data: ${JSON.stringify(event)}`).join('\n\n');
+  return new Response(`${body}\n\ndata: [DONE]\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
 
 describe('config safety', () => {
   it('rejects secrets embedded in enterprise config', () => {

@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import type { AgentProfile, ChatSnapshot, Room } from '@shared/types';
+import { applyChatEvent } from '../chat-events';
 import { Field } from '../components/Markdown';
 import { Transcript } from '../components/Transcript';
 
-export function RoomsScreen() {
+export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
   const [rooms, setRooms] = useState<Room[]>([]);
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [selected, setSelected] = useState<Room | null>(null);
@@ -34,49 +35,7 @@ export function RoomsScreen() {
   useEffect(() => {
     void load().catch((caught: unknown) => setError(caught instanceof Error ? caught.message : String(caught)));
     return window.agent.onChatEvent((event) => {
-      if (event.type === 'assistant-delta' || event.type === 'assistant-start' || event.type === 'tool') {
-        setSnapshot((current) => {
-          if (!current || !('conversationId' in event) || event.conversationId !== current.conversation.id) return current;
-          if (event.type === 'assistant-start') {
-            return {
-              ...current,
-              messages: [
-                ...current.messages,
-                {
-                  id: event.messageId,
-                  conversationId: event.conversationId,
-                  role: 'assistant',
-                  authorId: event.authorId,
-                  authorName: event.authorName,
-                  content: '',
-                  createdAt: Date.now(),
-                  tools: [],
-                  attachments: [],
-                },
-              ],
-            };
-          }
-          if (event.type === 'assistant-delta') {
-            return {
-              ...current,
-              messages: current.messages.map((message) =>
-                message.id === event.messageId ? { ...message, content: message.content + event.delta } : message,
-              ),
-            };
-          }
-          if (event.type === 'tool') {
-            return {
-              ...current,
-              messages: current.messages.map((message) =>
-                message.id === event.messageId
-                  ? { ...message, tools: [...message.tools.filter((tool) => tool.id !== event.tool.id), event.tool] }
-                  : message,
-              ),
-            };
-          }
-          return current;
-        });
-      }
+      setSnapshot((current) => applyChatEvent(current, event));
     });
     // load() is called once on mount; later refreshes call it directly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -146,17 +105,34 @@ export function RoomsScreen() {
               Save room
             </button>
             {selected ? (
-              <button
-                type="button"
-                className="ghost"
-                onClick={() => void window.agent.deleteRoom(selected.id).then(() => load())}
-              >
-                Delete
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => {
+                    if (!selected) return;
+                    if (!window.confirm("Delete this room's messages? The room, its agents, instructions, and routines stay.")) return;
+                    void window.agent
+                      .deleteRoomHistory(selected.id)
+                      .then(() => window.agent.openRoom(selected.id))
+                      .then(setSnapshot)
+                      .catch((caught: unknown) => setError(caught instanceof Error ? caught.message : String(caught)));
+                  }}
+                >
+                  Delete history
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => void window.agent.deleteRoom(selected.id).then(() => load())}
+                >
+                  Delete room
+                </button>
+              </>
             ) : null}
           </div>
         </form>
-        {snapshot ? <Transcript messages={snapshot.messages} /> : null}
+        {snapshot ? <Transcript messages={snapshot.messages} showReasoning={showReasoning} /> : null}
         {error ? <p className="error">{error}</p> : null}
         {selected ? (
           <form
@@ -176,9 +152,15 @@ export function RoomsScreen() {
             }}
           >
             <textarea value={draft} placeholder="Message the room" onChange={(event) => setDraft(event.target.value)} />
-            <button className="primary" type="submit" disabled={busy}>
-              {busy ? 'Working' : 'Send'}
-            </button>
+            {busy ? (
+              <button className="primary" type="button" onClick={() => snapshot && void window.agent.stopGeneration(snapshot.conversation.id)}>
+                Stop
+              </button>
+            ) : (
+              <button className="primary" type="submit">
+                Send
+              </button>
+            )}
           </form>
         ) : null}
       </div>

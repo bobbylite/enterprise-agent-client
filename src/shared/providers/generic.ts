@@ -1,16 +1,17 @@
 import { readSse } from './sse';
-import type { ChatProvider, ProviderToolCall } from './types';
+import { isCancellation, StreamCancelled, type ChatProvider, type ProviderToolCall } from './types';
 
 /**
  * Generic HTTP provider.
  * POST {baseUrl} with JSON { model, system, messages, tools, temperature }.
  * Accepts either a JSON body { content, tool_calls } or SSE lines
- * `data: {"delta":"..."}` and `data: {"tool_calls":[...]}`.
+ * `data: {"delta":"..."}`, `data: {"reasoning":"..."}`, and `data: {"tool_calls":[...]}`.
  */
 export function createGenericProvider(fetchImpl: typeof fetch = fetch): ChatProvider {
   return {
     id: 'generic',
-    async stream(request, onDelta, signal) {
+    async stream(request, onChunk, signal) {
+      if (signal?.aborted) throw new StreamCancelled();
       if (!request.baseUrl) throw new Error('Set the generic provider URL in Settings.');
       const response = await fetchImpl(request.baseUrl, {
         method: 'POST',
@@ -34,20 +35,29 @@ export function createGenericProvider(fetchImpl: typeof fetch = fetch): ChatProv
       if (!contentType.includes('text/event-stream')) {
         const body = (await response.json()) as { content?: string; tool_calls?: ProviderToolCall[] };
         const content = body.content ?? '';
-        if (content) onDelta(content);
+        const reasoning = typeof (body as { reasoning?: string }).reasoning === 'string' ? (body as { reasoning?: string }).reasoning : '';
+        if (reasoning && request.showReasoning !== false) onChunk({ type: 'reasoning', delta: reasoning });
+        if (content) onChunk({ type: 'text', delta: content });
         return { content, toolCalls: body.tool_calls ?? [] };
       }
       let content = '';
       const toolCalls: ProviderToolCall[] = [];
-      await readSse(response, (data) => {
-        if (data === '[DONE]') return;
-        const parsed = JSON.parse(data) as { delta?: string; tool_calls?: ProviderToolCall[] };
-        if (parsed.delta) {
-          content += parsed.delta;
-          onDelta(parsed.delta);
-        }
-        if (parsed.tool_calls) toolCalls.push(...parsed.tool_calls);
-      });
+      try {
+        await readSse(response, (data) => {
+          if (data === '[DONE]') return;
+          const parsed = JSON.parse(data) as { delta?: string; reasoning?: string; thinking?: string; tool_calls?: ProviderToolCall[] };
+          const reasoning = parsed.reasoning || parsed.thinking;
+          if (reasoning && request.showReasoning !== false) onChunk({ type: 'reasoning', delta: reasoning });
+          if (parsed.delta) {
+            content += parsed.delta;
+            onChunk({ type: 'text', delta: parsed.delta });
+          }
+          if (parsed.tool_calls) toolCalls.push(...parsed.tool_calls);
+        });
+      } catch (error) {
+        if (isCancellation(error)) throw new StreamCancelled();
+        throw error;
+      }
       return { content, toolCalls };
     },
   };

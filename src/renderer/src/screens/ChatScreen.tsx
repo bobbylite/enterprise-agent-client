@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Attachment, Branding, ChatEvent, ChatSnapshot, Conversation } from '@shared/types';
+import { applyChatEvent } from '../chat-events';
 import { Transcript } from '../components/Transcript';
 
-export function ChatScreen({ branding }: { branding: Branding }) {
+export function ChatScreen({ branding, showReasoning }: { branding: Branding; showReasoning: boolean }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [snapshot, setSnapshot] = useState<ChatSnapshot | null>(null);
   const [draft, setDraft] = useState('');
@@ -29,9 +30,21 @@ export function ChatScreen({ branding }: { branding: Branding }) {
     return window.agent.onChatEvent((event: ChatEvent) => {
       if (event.type === 'error' && event.conversationId === activeId.current) setError(event.message);
       if (!('conversationId' in event) || event.conversationId !== activeId.current) return;
-      setSnapshot((current) => applyEvent(current, event));
+      setSnapshot((current) => applyChatEvent(current, event));
     });
   }, []);
+
+  async function removeChat(id: string): Promise<void> {
+    if (!window.confirm('Delete this chat? Its messages, attachments, and tool results will be removed from this device.')) return;
+    const wasOpen = activeId.current === id;
+    await window.agent.deleteConversation(id);
+    if (wasOpen) {
+      const created = await window.agent.createConversation();
+      await refreshList(created.conversation.id);
+      return;
+    }
+    await refreshList();
+  }
 
   async function send(): Promise<void> {
     if (!snapshot) return;
@@ -63,21 +76,30 @@ export function ChatScreen({ branding }: { branding: Branding }) {
           New chat
         </button>
         {conversations.map((conversation) => (
-          <button
-            key={conversation.id}
-            type="button"
-            className={conversation.id === snapshot?.conversation.id ? 'list-item selected' : 'list-item'}
-            onClick={() => void refreshList(conversation.id)}
-          >
-            {conversation.title}
-          </button>
+          <div key={conversation.id} className="list-row">
+            <button
+              type="button"
+              className={conversation.id === snapshot?.conversation.id ? 'list-item selected' : 'list-item'}
+              onClick={() => void refreshList(conversation.id)}
+            >
+              {conversation.title}
+            </button>
+            <button type="button" className="ghost danger-text" aria-label={`Delete ${conversation.title}`} onClick={() => void removeChat(conversation.id)}>
+              Delete
+            </button>
+          </div>
         ))}
       </div>
       <div className="conversation">
         {snapshot ? (
           <>
             <header className="pane-head">
-              <h2>{snapshot.conversation.title}</h2>
+              <div className="row">
+                <h2>{snapshot.conversation.title}</h2>
+                <button type="button" className="ghost danger-text" onClick={() => void removeChat(snapshot.conversation.id)}>
+                  Delete chat
+                </button>
+              </div>
               <p>Talking with {branding.agentName}</p>
             </header>
             {snapshot.messages.length === 0 ? (
@@ -86,7 +108,7 @@ export function ChatScreen({ branding }: { branding: Branding }) {
                 <p>Messages stream here. Try “echo hello” after connecting the local echo tool.</p>
               </div>
             ) : (
-              <Transcript messages={snapshot.messages} />
+              <Transcript messages={snapshot.messages} showReasoning={showReasoning} />
             )}
             {error ? <p className="error">{error}</p> : null}
             {attachments.length > 0 ? (
@@ -122,9 +144,19 @@ export function ChatScreen({ branding }: { branding: Branding }) {
                 >
                   Attach
                 </button>
-                <button className="primary" type="submit" disabled={busy}>
-                  {busy ? 'Working' : 'Send'}
-                </button>
+                {busy ? (
+                  <button
+                    className="primary"
+                    type="button"
+                    onClick={() => void window.agent.stopGeneration(snapshot.conversation.id)}
+                  >
+                    Stop
+                  </button>
+                ) : (
+                  <button className="primary" type="submit">
+                    Send
+                  </button>
+                )}
               </div>
             </form>
           </>
@@ -137,46 +169,4 @@ export function ChatScreen({ branding }: { branding: Branding }) {
       </div>
     </div>
   );
-}
-
-function applyEvent(current: ChatSnapshot | null, event: ChatEvent): ChatSnapshot | null {
-  if (!current) return current;
-  if (event.type === 'assistant-start') {
-    return {
-      ...current,
-      messages: [
-        ...current.messages,
-        {
-          id: event.messageId,
-          conversationId: event.conversationId,
-          role: 'assistant',
-          authorId: event.authorId,
-          authorName: event.authorName,
-          content: '',
-          createdAt: Date.now(),
-          tools: [],
-          attachments: [],
-        },
-      ],
-    };
-  }
-  if (event.type === 'assistant-delta') {
-    return {
-      ...current,
-      messages: current.messages.map((message) =>
-        message.id === event.messageId ? { ...message, content: message.content + event.delta } : message,
-      ),
-    };
-  }
-  if (event.type === 'tool') {
-    return {
-      ...current,
-      messages: current.messages.map((message) =>
-        message.id === event.messageId
-          ? { ...message, tools: [...message.tools.filter((tool) => tool.id !== event.tool.id), event.tool] }
-          : message,
-      ),
-    };
-  }
-  return current;
 }
