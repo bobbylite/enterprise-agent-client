@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fillTemplate } from '@shared/branding';
 import type { EnterpriseConfig } from '@shared/config';
@@ -26,6 +26,7 @@ import { createProvider, defaultModelFor } from '@shared/providers/index';
 import type { ProviderMessage } from '@shared/providers/types';
 import { assertValidCron, cronMatches, minuteKey } from '@shared/schedule/cron';
 import type { SecretStore } from '@shared/secrets';
+import { isCancellation } from '@shared/providers/types';
 import { AudienceTokenCache, fetchClientCredentials, getOrExchange } from '@shared/tokens/exchange';
 import { redactSecrets } from '@shared/env';
 import { inspectJwt } from '@shared/tokens/inspect';
@@ -126,6 +127,9 @@ export class Runtime {
   private readonly cache: AudienceTokenCache;
   private readonly hub: McpHub;
   private firing = false;
+  private activeTurn: AbortController | null = null;
+  private activeConversationId = '';
+  private cancelledConversations = new Set<string>();
 
   private constructor(private readonly options: RuntimeOptions) {
     this.pi = new PiFlowClient({
@@ -188,6 +192,7 @@ export class Runtime {
       allowSystemBrowserFallback: this.options.config.tenant.login.allowSystemBrowserFallback,
       mockScenario: this.scenario,
       login: this.login,
+      showReasoning: this.options.config.provider.showReasoning,
     };
   }
 
@@ -377,9 +382,11 @@ export class Runtime {
       this.options.db.touchConversation(conversationId, now);
     }
     const agent = this.options.db.getAgent(conversation.agentId ?? '') ?? this.defaultAgent();
+    this.cancelledConversations.delete(conversationId);
     try {
       await this.speak(conversationId, agent, undefined);
     } catch (error) {
+      if (isCancellation(error)) return;
       const message = redactSecrets(error instanceof Error ? error.message : String(error));
       this.emit({ type: 'error', conversationId, message });
       throw new Error(message, { cause: error });
@@ -480,10 +487,39 @@ export class Runtime {
       createdAt: now,
     });
     this.options.db.touchConversation(snapshot.conversation.id, now);
+    this.cancelledConversations.delete(snapshot.conversation.id);
     for (const agentId of room.agentIds) {
+      if (this.cancelledConversations.has(snapshot.conversation.id)) break;
       const agent = this.options.db.getAgent(agentId);
       if (!agent) continue;
       await this.speak(snapshot.conversation.id, agent, room.instructions);
+    }
+  }
+
+  stopGeneration(conversationId: string): void {
+    this.cancelledConversations.add(conversationId);
+    if (this.activeConversationId === conversationId) this.activeTurn?.abort();
+  }
+
+  deleteConversation(id: string): void {
+    this.requireSession();
+    this.stopGeneration(id);
+    for (const path of this.options.db.deleteConversation(id)) this.removeFile(path);
+  }
+
+  deleteRoomHistory(roomId: string): void {
+    this.requireSession();
+    const conversation = this.options.db.findRoomConversation(roomId);
+    if (!conversation) return;
+    this.stopGeneration(conversation.id);
+    for (const path of this.options.db.clearConversationMessages(conversation.id)) this.removeFile(path);
+  }
+
+  private removeFile(path: string): void {
+    try {
+      unlinkSync(path);
+    } catch {
+      // The file was already removed.
     }
   }
 
@@ -826,14 +862,20 @@ export class Runtime {
           : settings.provider === 'generic'
             ? settings.genericBaseUrl
             : undefined;
+    if (this.cancelledConversations.has(conversationId)) return '';
     const history = this.providerHistory(conversationId);
-    return runAgentTurn({
+    const controller = new AbortController();
+    this.activeTurn = controller;
+    this.activeConversationId = conversationId;
+    try {
+    return await runAgentTurn({
       provider,
       request: {
         model: settings.model,
         system: this.systemPrompt(agent, room),
         temperature: settings.temperature ?? undefined,
         reasoningEffort: this.options.config.provider.reasoningEffort,
+        showReasoning: this.options.config.provider.showReasoning,
         apiKey,
         baseUrl,
       },
@@ -854,12 +896,23 @@ export class Runtime {
           authorId: message.authorId,
           authorName: message.authorName,
           content: message.content,
+          reasoning: message.reasoning,
+          reasoningMs: message.reasoningMs,
           createdAt: this.now(),
         });
       },
       persistTool: (tool) => this.options.db.insertToolInvocation(tool),
       emit: (event) => this.emit(event),
+      showReasoning: this.options.config.provider.showReasoning,
+      signal: controller.signal,
+      now: () => this.now(),
     });
+    } finally {
+      if (this.activeTurn === controller) {
+        this.activeTurn = null;
+        this.activeConversationId = '';
+      }
+    }
   }
 
   private askApproval(request: ApprovalRequest): Promise<ApprovalChoice> {

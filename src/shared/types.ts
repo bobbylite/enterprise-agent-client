@@ -91,6 +91,7 @@ export interface AppState {
   allowSystemBrowserFallback: boolean;
   mockScenario: MockScenario;
   login: LoginView;
+  showReasoning: boolean;
 }
 
 export type ProviderId = 'mock' | 'openai' | 'anthropic' | 'generic';
@@ -113,7 +114,7 @@ export interface ToolInvocation {
   toolName: string;
   args: unknown;
   result: string | null;
-  status: 'pending' | 'done' | 'denied' | 'error';
+  status: 'pending' | 'calling' | 'approval' | 'running' | 'done' | 'denied' | 'error';
   approval: 'once' | 'always' | 'deny' | 'automatic' | null;
 }
 
@@ -134,6 +135,9 @@ export interface ChatMessage {
   authorName: string | null;
   content: string;
   createdAt: number;
+  reasoning?: string;
+  reasoningMs?: number | null;
+  phase?: 'thinking' | 'answering' | 'done' | 'cancelled';
   tools: ToolInvocation[];
   attachments: Attachment[];
 }
@@ -287,6 +291,14 @@ export type ApprovalChoice = 'once' | 'always' | 'deny';
 export type ChatEvent =
   | { type: 'assistant-start'; conversationId: string; messageId: string; authorId: string; authorName: string }
   | { type: 'assistant-delta'; conversationId: string; messageId: string; delta: string }
+  | { type: 'assistant-reasoning'; conversationId: string; messageId: string; delta: string }
+  | {
+      type: 'assistant-phase';
+      conversationId: string;
+      messageId: string;
+      phase: 'thinking' | 'answering' | 'done' | 'cancelled';
+      elapsedMs: number;
+    }
   | { type: 'assistant-done'; conversationId: string; messageId: string }
   | { type: 'tool'; conversationId: string; messageId: string; tool: ToolInvocation }
   | { type: 'error'; conversationId: string; message: string }
@@ -326,6 +338,9 @@ export interface AgentBridge {
   createConversation(): Promise<ChatSnapshot>;
   openConversation(id: string): Promise<ChatSnapshot>;
   sendMessage(conversationId: string, text: string, attachmentIds: string[]): Promise<void>;
+  stopGeneration(conversationId: string): Promise<void>;
+  deleteConversation(id: string): Promise<void>;
+  deleteRoomHistory(roomId: string): Promise<void>;
   pickAttachments(): Promise<Attachment[]>;
   listAgents(): Promise<AgentProfile[]>;
   listRooms(): Promise<Room[]>;

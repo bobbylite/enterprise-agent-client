@@ -121,6 +121,7 @@ export const enterpriseConfigSchema = z.object({
     genericModel: z.string(),
     temperature: z.number().min(0).max(2).optional(),
     reasoningEffort: z.enum(['minimal', 'low', 'medium', 'high']).optional(),
+    showReasoning: z.boolean().default(true),
   }),
 });
 

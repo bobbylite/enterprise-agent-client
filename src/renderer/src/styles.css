@@ -102,6 +102,11 @@ button.nav.selected, button.list-item.selected { background: rgba(255, 255, 255,
 .page { overflow: auto; padding: 28px 32px 48px; }
 .page-split { min-height: 0; }
 .list-pane { border-right: 1px solid var(--line); padding: 16px; display: flex; flex-direction: column; gap: 8px; overflow: auto; }
+.list-row { display: flex; align-items: stretch; gap: 4px; }
+.list-row .list-item { flex: 1; }
+.list-row .danger-text { opacity: 0; }
+.list-row:hover .danger-text, .list-row:focus-within .danger-text { opacity: 1; }
+.danger-text { color: var(--danger); }
 .list-item { display: flex; flex-direction: column; gap: 2px; }
 .list-item span { font-size: 12px; color: #6d645b; }
 .conversation { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -119,6 +124,8 @@ button.nav.selected, button.list-item.selected { background: rgba(255, 255, 255,
 .empty { margin: auto; text-align: center; max-width: 360px; display: flex; flex-direction: column; gap: 8px; }
 .chips { display: flex; gap: 8px; list-style: none; padding: 0 28px; margin: 0; }
 .chips li { background: white; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+.thinking { margin: 0 0 8px; border: 1px dashed var(--line); border-radius: 10px; padding: 6px 8px; background: #f7f3ee; }
+.thinking p { white-space: pre-wrap; margin-top: 6px; color: #4d463f; }
 .tool-card { margin-top: 8px; border-left: 3px solid var(--accent); background: #faf7f2; padding: 8px 10px; border-radius: 8px; }
 .tool-card header { display: flex; justify-content: space-between; text-transform: none; letter-spacing: 0; }
 .tool-card.denied { border-left-color: var(--danger); }

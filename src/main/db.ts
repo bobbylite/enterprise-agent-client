@@ -83,6 +83,8 @@ export class Repository {
         author_id TEXT,
         author_name TEXT,
         content TEXT NOT NULL,
+        reasoning TEXT NOT NULL DEFAULT '',
+        reasoning_ms INTEGER,
         created_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS tool_invocations (
@@ -167,6 +169,14 @@ export class Repository {
         fields_json TEXT NOT NULL
       );
     `);
+    this.ensureColumn('messages', 'reasoning', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('messages', 'reasoning_ms', 'INTEGER');
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
+    if (columns.some((row) => text(row.name) === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   getSetting(key: string): string | null {
@@ -245,6 +255,8 @@ export class Repository {
         authorId: row.author_id === null ? null : text(row.author_id),
         authorName: row.author_name === null ? null : text(row.author_name),
         content: text(row.content),
+        reasoning: text(row.reasoning),
+        reasoningMs: row.reasoning_ms === null || row.reasoning_ms === undefined ? null : num(row.reasoning_ms),
         createdAt: num(row.created_at),
         tools: this.listToolInvocations(id),
         attachments: this.listAttachments(id),
@@ -255,7 +267,7 @@ export class Repository {
   insertMessage(message: Omit<ChatMessage, 'tools' | 'attachments'>): void {
     this.db
       .prepare(
-        'INSERT INTO messages(id, conversation_id, role, author_id, author_name, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO messages(id, conversation_id, role, author_id, author_name, content, reasoning, reasoning_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         message.id,
@@ -264,8 +276,43 @@ export class Repository {
         message.authorId,
         message.authorName,
         message.content,
+        message.reasoning ?? '',
+        message.reasoningMs ?? null,
         message.createdAt,
       );
+  }
+
+  deleteConversation(id: string): string[] {
+    const paths = this.attachmentPaths(id);
+    this.clearMessages(id);
+    this.db.prepare('DELETE FROM conversations WHERE id = ?').run(id);
+    return paths;
+  }
+
+  clearConversationMessages(id: string): string[] {
+    const paths = this.attachmentPaths(id);
+    this.clearMessages(id);
+    return paths;
+  }
+
+  private attachmentPaths(conversationId: string): string[] {
+    return this.db
+      .prepare(
+        'SELECT path FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)',
+      )
+      .all(conversationId)
+      .map((row) => text(row.path))
+      .filter(Boolean);
+  }
+
+  private clearMessages(conversationId: string): void {
+    this.db
+      .prepare('DELETE FROM tool_invocations WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)')
+      .run(conversationId);
+    this.db
+      .prepare('DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)')
+      .run(conversationId);
+    this.db.prepare('DELETE FROM messages WHERE conversation_id = ?').run(conversationId);
   }
 
   updateMessageContent(id: string, content: string): void {

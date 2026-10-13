@@ -1,5 +1,13 @@
 import { parseOpenAiData, readSse } from './sse';
-import { schemaOf, type ChatProvider, type ProviderMessage, type ProviderRequest, type ProviderToolCall } from './types';
+import {
+  isCancellation,
+  schemaOf,
+  StreamCancelled,
+  type ChatProvider,
+  type ProviderMessage,
+  type ProviderRequest,
+  type ProviderToolCall,
+} from './types';
 
 export const REASONING_MAX_COMPLETION_TOKENS = 4096;
 
@@ -57,9 +65,17 @@ export function openAiChatBody(request: ProviderRequest, omit: ReadonlySet<strin
 export function createOpenAiProvider(fetchImpl: typeof fetch = fetch): ChatProvider {
   return {
     id: 'openai',
-    async stream(request, onDelta, signal) {
+    async stream(request, onChunk, signal) {
+      if (signal?.aborted) throw new StreamCancelled();
       if (!request.apiKey) throw new Error('Add an OpenAI-compatible API key in Settings.');
       const base = (request.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
+      if (isReasoningModel(request.model) && request.showReasoning !== false) {
+        try {
+          return await streamResponses(base, request, onChunk, signal, fetchImpl);
+        } catch (error) {
+          if (isCancellation(error) || !(error instanceof ResponsesUnsupported)) throw error;
+        }
+      }
       const omit = new Set<string>();
       let response: Response | undefined;
       let failure = '';
@@ -82,24 +98,122 @@ export function createOpenAiProvider(fetchImpl: typeof fetch = fetch): ChatProvi
       if (!response?.ok) throw new Error(failure || 'The model provider rejected the request.');
       let content = '';
       const calls = new Map<number, ProviderToolCall>();
-      await readSse(response, (data) => {
-        const parsed = parseOpenAiData(data);
-        if (!parsed || parsed === 'done') return;
-        if (parsed.text) {
-          content += parsed.text;
-          onDelta(parsed.text);
-        }
-        for (const call of parsed.toolCalls) {
-          const current = calls.get(call.index) ?? { id: '', name: '', arguments: '' };
-          if (call.id) current.id = call.id;
-          if (call.name) current.name = call.name;
-          if (call.arguments) current.arguments += call.arguments;
-          calls.set(call.index, current);
-        }
-      });
+      try {
+        await readSse(response, (data) => {
+          const parsed = parseOpenAiData(data);
+          if (!parsed || parsed === 'done') return;
+          if (parsed.reasoning && request.showReasoning !== false) {
+            onChunk({ type: 'reasoning', delta: parsed.reasoning });
+          }
+          if (parsed.text) {
+            content += parsed.text;
+            onChunk({ type: 'text', delta: parsed.text });
+          }
+          for (const call of parsed.toolCalls) {
+            const current = calls.get(call.index) ?? { id: '', name: '', arguments: '' };
+            if (call.id) current.id = call.id;
+            if (call.name) current.name = call.name;
+            if (call.arguments) current.arguments += call.arguments;
+            calls.set(call.index, current);
+          }
+        });
+      } catch (error) {
+        if (isCancellation(error)) throw new StreamCancelled();
+        throw error;
+      }
       return { content, toolCalls: [...calls.values()].filter((call) => call.name) };
     },
   };
+}
+
+class ResponsesUnsupported extends Error {
+  constructor() {
+    super('This endpoint does not accept the Responses API.');
+    this.name = 'ResponsesUnsupported';
+  }
+}
+
+async function streamResponses(
+  base: string,
+  request: ProviderRequest,
+  onChunk: (chunk: { type: 'text' | 'reasoning'; delta: string }) => void,
+  signal: AbortSignal | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ content: string; toolCalls: ProviderToolCall[] }> {
+  const response = await fetchImpl(`${base}/responses`, {
+    method: 'POST',
+    signal,
+    headers: {
+      Authorization: `Bearer ${request.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(openAiResponsesBody(request)),
+  });
+  if (response.status === 404 || response.status === 405) throw new ResponsesUnsupported();
+  if (!response.ok) throw new Error(await errorText(response, 'The model provider rejected the request'));
+  let content = '';
+  const calls = new Map<number, ProviderToolCall>();
+  try {
+    await readSse(response, (data) => {
+      const parsed = parseOpenAiData(data);
+      if (!parsed || parsed === 'done') return;
+      if (parsed.reasoning) onChunk({ type: 'reasoning', delta: parsed.reasoning });
+      if (parsed.text) {
+        content += parsed.text;
+        onChunk({ type: 'text', delta: parsed.text });
+      }
+      for (const call of parsed.toolCalls) {
+        const current = calls.get(call.index) ?? { id: '', name: '', arguments: '' };
+        if (call.id) current.id = call.id;
+        if (call.name) current.name = call.name;
+        if (call.arguments) current.arguments += call.arguments;
+        calls.set(call.index, current);
+      }
+    });
+  } catch (error) {
+    if (isCancellation(error)) throw new StreamCancelled();
+    throw error;
+  }
+  return { content, toolCalls: [...calls.values()].filter((call) => call.name) };
+}
+
+export function openAiResponsesBody(request: ProviderRequest): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: request.model,
+    stream: true,
+    instructions: request.system,
+    input: toResponsesInput(request.messages),
+    max_output_tokens: REASONING_MAX_COMPLETION_TOKENS,
+    reasoning: { effort: request.reasoningEffort ?? 'medium', summary: 'auto' },
+  };
+  if (request.tools.length > 0) {
+    body.tools = request.tools.map((tool) => ({
+      type: 'function',
+      name: tool.name,
+      description: tool.description ?? '',
+      parameters: schemaOf(tool),
+    }));
+  }
+  return body;
+}
+
+function toResponsesInput(messages: ProviderMessage[]): unknown[] {
+  const input: unknown[] = [];
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      input.push({ type: 'function_call_output', call_id: message.toolCallId, output: message.content });
+      continue;
+    }
+    if (message.role === 'assistant' && message.toolCalls && message.toolCalls.length > 0) {
+      if (message.content) input.push({ role: 'assistant', content: message.content });
+      for (const call of message.toolCalls) {
+        input.push({ type: 'function_call', call_id: call.id, name: call.name, arguments: call.arguments });
+      }
+      continue;
+    }
+    input.push({ role: message.role, content: message.content });
+  }
+  return input;
 }
 
 function toOpenAiMessage(message: ProviderMessage): Record<string, unknown> {

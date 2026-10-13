@@ -1,10 +1,42 @@
 import { parseAnthropicData, readSse } from './sse';
-import { schemaOf, type ChatProvider, type ProviderMessage, type ProviderToolCall } from './types';
+import {
+  isCancellation,
+  schemaOf,
+  StreamCancelled,
+  type ChatProvider,
+  type ProviderMessage,
+  type ProviderRequest,
+  type ProviderToolCall,
+} from './types';
+
+export const ANTHROPIC_THINKING_BUDGET = 2048;
+
+export function anthropicMessageBody(request: ProviderRequest): Record<string, unknown> {
+  const thinking = request.showReasoning !== false;
+  const body: Record<string, unknown> = {
+    model: request.model,
+    max_tokens: thinking ? ANTHROPIC_THINKING_BUDGET + 2048 : 4096,
+    stream: true,
+    system: request.system,
+    messages: toAnthropicMessages(request.messages),
+    tools: request.tools.length
+      ? request.tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description ?? '',
+          input_schema: schemaOf(tool),
+        }))
+      : undefined,
+  };
+  if (thinking) body.thinking = { type: 'enabled', budget_tokens: ANTHROPIC_THINKING_BUDGET };
+  else if (request.temperature !== undefined) body.temperature = request.temperature;
+  return body;
+}
 
 export function createAnthropicProvider(fetchImpl: typeof fetch = fetch): ChatProvider {
   return {
     id: 'anthropic',
-    async stream(request, onDelta, signal) {
+    async stream(request, onChunk, signal) {
+      if (signal?.aborted) throw new StreamCancelled();
       if (!request.apiKey) throw new Error('Add an Anthropic API key in Settings.');
       const base = (request.baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
       const response = await fetchImpl(`${base}/v1/messages`, {
@@ -15,21 +47,7 @@ export function createAnthropicProvider(fetchImpl: typeof fetch = fetch): ChatPr
           'anthropic-version': '2023-06-01',
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          model: request.model,
-          max_tokens: 4096,
-          temperature: request.temperature,
-          stream: true,
-          system: request.system,
-          messages: toAnthropicMessages(request.messages),
-          tools: request.tools.length
-            ? request.tools.map((tool) => ({
-                name: tool.name,
-                description: tool.description ?? '',
-                input_schema: schemaOf(tool),
-              }))
-            : undefined,
-        }),
+        body: JSON.stringify(anthropicMessageBody(request)),
       });
       if (!response.ok) {
         const text = await response.text();
@@ -37,13 +55,15 @@ export function createAnthropicProvider(fetchImpl: typeof fetch = fetch): ChatPr
       }
       let content = '';
       const calls = new Map<number, ProviderToolCall>();
-      await readSse(response, (data) => {
-        const parsed = parseAnthropicData(data);
-        if (!parsed) return;
-        if (parsed.text) {
-          content += parsed.text;
-          onDelta(parsed.text);
-        }
+      try {
+        await readSse(response, (data) => {
+          const parsed = parseAnthropicData(data);
+          if (!parsed) return;
+          if (parsed.reasoning && request.showReasoning !== false) onChunk({ type: 'reasoning', delta: parsed.reasoning });
+          if (parsed.text) {
+            content += parsed.text;
+            onChunk({ type: 'text', delta: parsed.text });
+          }
         if (parsed.tool) {
           const current = calls.get(parsed.tool.index) ?? { id: '', name: '', arguments: '' };
           if (parsed.tool.id) current.id = parsed.tool.id;
@@ -51,7 +71,11 @@ export function createAnthropicProvider(fetchImpl: typeof fetch = fetch): ChatPr
           if (parsed.tool.partialJson) current.arguments += parsed.tool.partialJson;
           calls.set(parsed.tool.index, current);
         }
-      });
+        });
+      } catch (error) {
+        if (isCancellation(error)) throw new StreamCancelled();
+        throw error;
+      }
       return { content, toolCalls: [...calls.values()].filter((call) => call.name) };
     },
   };

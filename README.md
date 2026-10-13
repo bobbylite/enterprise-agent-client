@@ -198,6 +198,8 @@ OPENAI_API_KEY=sk-...
 
 Do not set `temperature` for `gpt-5`. The model only accepts the default value.
 
+`provider.showReasoning` defaults to true. While a model is working, chat shows a Thinking panel: OpenAI reasoning summaries for `gpt-5` and the o-series (Responses API, falling back to chat-completions `reasoning_content`), Anthropic extended thinking, or the status “Thinking…” when the provider sends no reasoning. The panel collapses when the answer starts and keeps the elapsed time. Set `showReasoning` to false to hide the panel and skip those reasoning requests. Stop keeps the partial answer. Delete chat removes that conversation’s messages, attachments, and tool results. Delete history on a room clears only its messages.
+
 ## PingOne admin configuration
 
 Use three applications in the same environment. The public PKCE application cannot be the confidential token-exchange client, and the Protect worker is a different application from the AI Agent that holds the Token Exchange grant.
@@ -328,7 +330,7 @@ The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-
 - RFC 8693 exchange on the AI Agent client, with the user access token as `subject_token` and the agent's cached client-credentials token as `actor_token`. Worker credentials remain the fallback. Audience tokens are injected into MCP connections.
 - Protect evaluation client, reason extraction, policy engine, and risk text in the system prompt.
 - MCP stdio, Streamable HTTP, and SSE fallback. Server management UI. Per-tool allow once / always / deny. Tool cards in the transcript.
-- Streaming chat, markdown, history, attachments, and providers: mock (default), OpenAI-compatible, Anthropic, and a generic HTTP provider.
+- Streaming chat for every provider, with a collapsible Thinking panel, live tool status, and stop that keeps the partial answer. `provider.showReasoning` (default true) hides reasoning for an enterprise policy. Chats can be deleted from the list or the open chat. Deleting a room's history leaves the room, its agents, instructions, and routines in place.
 - Layered instructions. The enterprise layer is read-only in the UI. Persona resets to the branding file. The user layer is editable.
 - Group rooms with a sequential reply from each member, room instructions, routines, and cron while the window is open, with run history.
 - Unit tests, lint, typecheck, and a GitHub Actions workflow.
@@ -338,7 +340,7 @@ The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-
 - OS installers, auto-update, and code signing.
 - pi.flow statuses this UI does not complete: FIDO2 assertion, push confirmation, magic link, account recovery, and external identity-provider redirects. Those stop with a message that names the flow status and points at the system browser. Identifier-first policies are handled.
 - Continuous Protect re-evaluation during a session, and richer feedback than the completion-status update.
-- Anthropic and generic-provider extras: extended thinking, prompt caching, and full vision parity. Basic streaming and image blocks on the Anthropic path are implemented.
+- Prompt caching and full vision parity. Anthropic extended thinking and OpenAI reasoning summaries stream into the Thinking panel when `provider.showReasoning` is true.
 - Group chat fan-out, @mentions, and debate. Replies are sequential.
 - Routines while the app is closed.
 - Conversation search, export, rename, and delete.

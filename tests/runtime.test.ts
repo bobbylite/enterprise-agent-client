@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
@@ -85,6 +85,8 @@ describe('mock runtime', () => {
       await pending;
       const opened = runtime.openConversation(snapshot.conversation.id);
       const tool = opened.messages.flatMap((message) => message.tools).find((item) => item.toolName === 'echo');
+      const statuses = events.flatMap((event) => (event.type === 'tool' && event.tool.toolName === 'echo' ? [event.tool.status] : []));
+      expect(statuses).toEqual(expect.arrayContaining(['calling', 'approval', 'running', 'done']));
       expect(tool?.status).toBe('done');
       expect(tool?.result).toContain('hello from the desk');
       expect(opened.messages.some((message) => message.content.includes('The tool returned'))).toBe(true);
@@ -145,6 +147,82 @@ describe('mock runtime', () => {
     expect(second).not.toBe(first);
     expect(JSON.stringify(refreshed)).not.toContain(second);
     expect(refreshed.aud).toBe('https://mcp.local.echo');
+  });
+
+  it('keeps a partial answer when generation is stopped', async () => {
+    const { runtime, events } = await boot(15);
+    await runtime.submitCredentials('ada', 'secret', '');
+    const snapshot = runtime.createConversation();
+    const pending = runtime.sendMessage(snapshot.conversation.id, 'hello there friend', []);
+    await waitFor(events, (event) => event.type === 'assistant-delta');
+    runtime.stopGeneration(snapshot.conversation.id);
+    await pending;
+    const assistant = runtime.openConversation(snapshot.conversation.id).messages.find((message) => message.role === 'assistant');
+    expect(assistant?.content.length).toBeGreaterThan(0);
+    expect(assistant?.content).not.toContain('Ask me to');
+    expect(assistant?.reasoning).toContain('Checking');
+    expect(events.some((event) => event.type === 'assistant-phase' && event.phase === 'cancelled')).toBe(true);
+  });
+
+  it('hides reasoning when the admin flag is off', async () => {
+    const { runtime, events } = await boot(0, (config) => {
+      config.provider.showReasoning = false;
+    });
+    expect(runtime.state().showReasoning).toBe(false);
+    await runtime.submitCredentials('ada', 'secret', '');
+    const snapshot = runtime.createConversation();
+    await runtime.sendMessage(snapshot.conversation.id, 'hello', []);
+    expect(events.some((event) => event.type === 'assistant-reasoning')).toBe(false);
+    const assistant = runtime.openConversation(snapshot.conversation.id).messages.find((message) => message.role === 'assistant');
+    expect(assistant?.reasoning).toBe('');
+  });
+
+  it('streams each agent in a room and can clear that history', async () => {
+    const { runtime, events } = await boot(0);
+    await runtime.submitCredentials('ada', 'secret', '');
+    const room = runtime.listRooms()[0];
+    const routines = runtime.listRoutines().map((item) => item.id);
+    await runtime.sendRoomMessage(room.id, 'hello room');
+    const authors = events.flatMap((event) => (event.type === 'assistant-start' ? [event.authorName] : []));
+    expect(authors).toEqual(expect.arrayContaining(['Northstar', 'Reviewer']));
+    expect(runtime.openRoom(room.id).messages.length).toBeGreaterThan(1);
+    runtime.deleteRoomHistory(room.id);
+    expect(runtime.openRoom(room.id).messages).toEqual([]);
+    expect(runtime.listRooms()[0]).toMatchObject({ id: room.id, agentIds: room.agentIds, instructions: room.instructions });
+    expect(runtime.listRoutines().map((item) => item.id)).toEqual(routines);
+  });
+
+  it('deletes a chat, its tool results, and its attachment files', async () => {
+    const { runtime, db } = await boot(0);
+    await runtime.submitCredentials('ada', 'secret', '');
+    const snapshot = runtime.createConversation();
+    await runtime.sendMessage(snapshot.conversation.id, 'hello', []);
+    const message = runtime.openConversation(snapshot.conversation.id).messages[0];
+    const file = join(mkdtempSync(join(tmpdir(), 'attach-')), 'note.txt');
+    writeFileSync(file, 'note');
+    db.insertAttachment({
+      id: 'att-1',
+      messageId: message.id,
+      name: 'note.txt',
+      mime: 'text/plain',
+      size: 4,
+      path: file,
+    });
+    db.insertToolInvocation({
+      id: 'tool-1',
+      messageId: message.id,
+      serverId: 'echo',
+      serverName: 'Local echo',
+      toolName: 'echo',
+      args: { message: 'hello' },
+      result: 'hello',
+      status: 'done',
+      approval: 'once',
+    });
+    runtime.deleteConversation(snapshot.conversation.id);
+    expect(runtime.listConversations().some((item) => item.id === snapshot.conversation.id)).toBe(false);
+    expect(existsSync(file)).toBe(false);
+    expect(() => runtime.openConversation(snapshot.conversation.id)).toThrow(/not found/);
   });
 
   it('stores the AI Agent secret from the environment and from settings', async () => {

@@ -64,8 +64,8 @@ export function Shell({
         </div>
       </aside>
       <section className="workspace">
-        {view === 'chat' ? <ChatScreen branding={branding} /> : null}
-        {view === 'rooms' ? <RoomsScreen /> : null}
+        {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} /> : null}
+        {view === 'rooms' ? <RoomsScreen showReasoning={state.showReasoning} /> : null}
         {view === 'routines' ? <RoutinesScreen /> : null}
         {view === 'tools' ? <McpScreen /> : null}
         {view === 'instructions' ? <InstructionsScreen /> : null}

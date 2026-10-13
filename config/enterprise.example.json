@@ -113,6 +113,7 @@
     "anthropicBaseUrl": "https://api.anthropic.com",
     "anthropicModel": "claude-sonnet-4-5",
     "genericBaseUrl": "",
-    "genericModel": "default"
+    "genericModel": "default",
+    "showReasoning": true
   }
 }
