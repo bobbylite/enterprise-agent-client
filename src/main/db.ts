@@ -29,6 +29,8 @@ export interface RoutineRow extends Routine {
 
 export interface AgentRow extends AgentProfile {
   instructions: InstructionFields | null;
+  userInstructions: InstructionFields | null;
+  skillIds: string[];
 }
 
 function text(value: SQLOutputValue | undefined): string {
@@ -131,6 +133,8 @@ export class Repository {
         provider TEXT NOT NULL,
         model TEXT NOT NULL,
         instructions_json TEXT,
+        user_instructions_json TEXT,
+        skill_ids_json TEXT NOT NULL DEFAULT '[]',
         name_from_branding INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS rooms (
@@ -148,6 +152,7 @@ export class Repository {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         prompt TEXT NOT NULL,
+        agent_id TEXT,
         target_type TEXT NOT NULL,
         target_id TEXT NOT NULL,
         cron TEXT NOT NULL,
@@ -171,6 +176,9 @@ export class Repository {
     `);
     this.ensureColumn('messages', 'reasoning', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('messages', 'reasoning_ms', 'INTEGER');
+    this.ensureColumn('agents', 'user_instructions_json', 'TEXT');
+    this.ensureColumn('agents', 'skill_ids_json', "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn('routines', 'agent_id', 'TEXT');
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -460,13 +468,15 @@ export class Repository {
   upsertAgent(agent: AgentRow): void {
     this.db
       .prepare(
-        `INSERT INTO agents(id, name, provider, model, instructions_json, name_from_branding)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO agents(id, name, provider, model, instructions_json, user_instructions_json, skill_ids_json, name_from_branding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name,
            provider = excluded.provider,
            model = excluded.model,
            instructions_json = excluded.instructions_json,
+           user_instructions_json = excluded.user_instructions_json,
+           skill_ids_json = excluded.skill_ids_json,
            name_from_branding = excluded.name_from_branding`,
       )
       .run(
@@ -475,8 +485,17 @@ export class Repository {
         agent.provider,
         agent.model,
         agent.instructions ? JSON.stringify(agent.instructions) : null,
+        agent.userInstructions ? JSON.stringify(agent.userInstructions) : null,
+        JSON.stringify(agent.skillIds ?? []),
         agent.nameFromBranding ? 1 : 0,
       );
+  }
+
+  deleteAgent(id: string): void {
+    this.db.prepare('DELETE FROM room_agents WHERE agent_id = ?').run(id);
+    const routines = this.listRoutines().filter((routine) => routine.agentId === id || (routine.targetType === 'agent' && routine.targetId === id));
+    for (const routine of routines) this.deleteRoutine(routine.id);
+    this.db.prepare('DELETE FROM agents WHERE id = ?').run(id);
   }
 
   listRooms(): { id: string; name: string; instructions: string; createdAt: number; agentIds: string[] }[] {
@@ -540,11 +559,12 @@ export class Repository {
   upsertRoutine(routine: RoutineRow): void {
     this.db
       .prepare(
-        `INSERT INTO routines(id, name, prompt, target_type, target_id, cron, enabled, created_at, last_fired_minute)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO routines(id, name, prompt, agent_id, target_type, target_id, cron, enabled, created_at, last_fired_minute)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name,
            prompt = excluded.prompt,
+           agent_id = excluded.agent_id,
            target_type = excluded.target_type,
            target_id = excluded.target_id,
            cron = excluded.cron,
@@ -554,6 +574,7 @@ export class Repository {
         routine.id,
         routine.name,
         routine.prompt,
+        routine.agentId,
         routine.targetType,
         routine.targetId,
         routine.cron,
@@ -639,7 +660,19 @@ function mapAgent(row: Record<string, SQLOutputValue>): AgentRow {
     model: text(row.model),
     nameFromBranding: bool(row.name_from_branding),
     instructions: row.instructions_json ? (JSON.parse(text(row.instructions_json)) as InstructionFields) : null,
+    userInstructions: row.user_instructions_json ? (JSON.parse(text(row.user_instructions_json)) as InstructionFields) : null,
+    skillIds: parseSkillIds(row.skill_ids_json),
   };
+}
+
+function parseSkillIds(value: SQLOutputValue | undefined): string[] {
+  if (value === null || value === undefined || value === '') return [];
+  try {
+    const parsed = JSON.parse(text(value)) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
 }
 
 function mapRoutine(row: Record<string, SQLOutputValue>): RoutineRow {
@@ -647,6 +680,7 @@ function mapRoutine(row: Record<string, SQLOutputValue>): RoutineRow {
     id: text(row.id),
     name: text(row.name),
     prompt: text(row.prompt),
+    agentId: text(row.agent_id),
     targetType: text(row.target_type) as Routine['targetType'],
     targetId: text(row.target_id),
     cron: text(row.cron),

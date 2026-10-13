@@ -1,6 +1,5 @@
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { fillTemplate } from '@shared/branding';
 import type { EnterpriseConfig } from '@shared/config';
 import { riskEvaluationsUrl, tokenEndpoint, tokenInspectorEnabled } from '@shared/config';
 import {
@@ -30,6 +29,8 @@ import { AudienceTokenCache, fetchClientCredentials, getOrExchange } from '@shar
 import { redactSecrets } from '@shared/env';
 import { inspectJwt } from '@shared/tokens/inspect';
 import type {
+  AgentInput,
+  AgentPage,
   AgentProfile,
   AppState,
   ApprovalChoice,
@@ -179,6 +180,7 @@ export class Runtime {
   async init(): Promise<void> {
     await this.hydrateSecrets();
     this.seed();
+    this.migrateAgentOwnership();
     this.syncBrandedAgents();
     const storedScenario = this.options.db.getSetting('mockScenario');
     if (storedScenario && SCENARIOS.includes(storedScenario as MockScenario)) {
@@ -426,7 +428,46 @@ export class Runtime {
   }
 
   listAgents(): AgentProfile[] {
-    return this.options.db.listAgents().map(({ instructions: _instructions, ...agent }) => agent);
+    return this.options.db.listAgents().map((agent) => this.profile(agent));
+  }
+
+  openAgent(id: string): AgentPage {
+    const agent = this.options.db.getAgent(id);
+    if (!agent) throw new Error('That agent was not found.');
+    return this.agentPage(agent);
+  }
+
+  saveAgent(input: AgentInput): AgentPage {
+    this.requireSession();
+    const existing = input.id ? this.options.db.getAgent(input.id) : null;
+    if (input.id && !existing) throw new Error('That agent was not found.');
+    const provider = input.provider;
+    if (!['mock', 'openai', 'anthropic', 'generic'].includes(provider)) throw new Error('Choose a provider.');
+    if (!input.model.trim()) throw new Error('Choose a model.');
+    const name = existing?.nameFromBranding ? this.options.branding.agentName : input.name.trim();
+    if (!name) throw new Error('Give the agent a name.');
+    const agent: AgentRow = {
+      id: existing?.id ?? randomId(),
+      name,
+      provider,
+      model: input.model.trim(),
+      nameFromBranding: existing?.nameFromBranding ?? false,
+      instructions: input.persona,
+      userInstructions: input.user,
+      skillIds: existing?.skillIds ?? [],
+    };
+    this.options.db.upsertAgent(agent);
+    if (agent.nameFromBranding) this.options.db.setSetting('personaCustomized', '1');
+    return this.agentPage(agent);
+  }
+
+  deleteAgent(id: string): void {
+    this.requireSession();
+    const agent = this.options.db.getAgent(id);
+    if (!agent) throw new Error('That agent was not found.');
+    if (agent.nameFromBranding) throw new Error('The branding agent stays. Edit it instead of deleting it.');
+    if (this.options.db.listAgents().length <= 1) throw new Error('Keep at least one agent.');
+    this.options.db.deleteAgent(id);
   }
 
   listRooms(): Room[] {
@@ -529,30 +570,25 @@ export class Runtime {
   }
 
   getInstructions(): InstructionEditorState {
-    const persona = this.options.db.getInstructions('persona') ?? this.options.branding.persona;
-    const user = this.options.db.getInstructions('user') ?? emptyFields();
-    return {
-      enterprise: this.options.config.enterpriseInstructions,
-      persona,
-      user,
-      enterpriseLocked: true,
-      personaCustomized: this.options.db.getSetting('personaCustomized') === '1',
-    };
+    return this.instructionState(this.defaultAgent());
   }
 
   savePersona(fields: InstructionFields): InstructionEditorState {
-    this.options.db.setInstructions('persona', fields);
+    const agent = this.defaultAgent();
+    this.options.db.upsertAgent({ ...agent, instructions: fields });
     this.options.db.setSetting('personaCustomized', '1');
     return this.getInstructions();
   }
 
   saveUserLayer(fields: InstructionFields): InstructionEditorState {
-    this.options.db.setInstructions('user', fields);
+    const agent = this.defaultAgent();
+    this.options.db.upsertAgent({ ...agent, userInstructions: fields });
     return this.getInstructions();
   }
 
   resetPersona(): InstructionEditorState {
-    this.options.db.setInstructions('persona', this.options.branding.persona);
+    const agent = this.defaultAgent();
+    this.options.db.upsertAgent({ ...agent, instructions: this.options.branding.persona });
     this.options.db.setSetting('personaCustomized', '0');
     return this.getInstructions();
   }
@@ -620,20 +656,28 @@ export class Runtime {
     resolve(choice);
   }
 
-  listRoutines(): Routine[] {
-    return this.options.db.listRoutines().map(({ lastFiredMinute: _last, ...routine }) => routine);
+  listRoutines(agentId?: string): Routine[] {
+    return this.options.db
+      .listRoutines()
+      .filter((routine) => !agentId || routine.agentId === agentId)
+      .map(({ lastFiredMinute: _last, ...routine }) => routine);
   }
 
   saveRoutine(input: RoutineInput): Routine {
     assertValidCron(input.cron);
     if (!input.name.trim() || !input.prompt.trim()) throw new Error('A routine needs a name and a prompt.');
     const existing = input.id ? this.options.db.getRoutine(input.id) : null;
+    const agentId = input.agentId || existing?.agentId || (input.targetType === 'agent' ? input.targetId : this.defaultAgent().id);
+    if (!this.options.db.getAgent(agentId)) throw new Error('That agent was not found.');
+    const targetId = input.targetType === 'agent' ? agentId : input.targetId;
+    if (input.targetType === 'room' && !this.options.db.getRoom(targetId)) throw new Error('That room was not found.');
     const routine = {
       id: input.id || randomId(),
       name: input.name.trim(),
       prompt: input.prompt,
+      agentId,
       targetType: input.targetType,
-      targetId: input.targetId,
+      targetId,
       cron: input.cron.trim(),
       enabled: input.enabled,
       createdAt: existing?.createdAt ?? this.now(),
@@ -929,7 +973,6 @@ export class Runtime {
   }
 
   private participant(agent: AgentRow, room?: string): GraphParticipant {
-    const instructions = this.getInstructions();
     const risk = this.risk
       ? renderRiskContext(this.risk, agent.nameFromBranding ? this.options.branding.agentName : agent.name)
       : undefined;
@@ -939,8 +982,8 @@ export class Runtime {
       appName: this.options.branding.appName,
       agentName: agent.name,
       enterprise: this.options.config.enterpriseInstructions,
-      persona: agent.instructions ?? instructions.persona,
-      user: instructions.user,
+      persona: agent.instructions ?? (agent.nameFromBranding ? this.options.branding.persona : emptyFields()),
+      user: agent.userInstructions ?? emptyFields(),
       room,
       risk,
     };
@@ -1592,8 +1635,11 @@ export class Runtime {
         provider: agent.provider,
         model: agent.model,
         nameFromBranding: Boolean(agent.nameFromBranding),
-        instructions: agent.instructions ?? null,
+        instructions: agent.instructions ?? (agent.nameFromBranding ? this.options.branding.persona : null),
+        userInstructions: null,
+        skillIds: [],
       });
+      if (agent.nameFromBranding && agent.instructions) this.options.db.setSetting('personaCustomized', '1');
     }
     for (const room of config.rooms) {
       this.options.db.upsertRoom({ ...room, createdAt: this.now() });
@@ -1611,8 +1657,10 @@ export class Runtime {
         enabled: true,
       });
     }
+    const brandedId = config.agents.find((agent) => agent.nameFromBranding)?.id ?? config.agents[0]?.id ?? 'default';
     for (const routine of config.routines) {
-      this.options.db.upsertRoutine({ ...routine, createdAt: this.now(), lastFiredMinute: null });
+      const agentId = routine.targetType === 'agent' ? routine.targetId : brandedId;
+      this.options.db.upsertRoutine({ ...routine, agentId, createdAt: this.now(), lastFiredMinute: null });
     }
     this.options.db.setSetting('provider', config.provider.default);
     this.options.db.setSetting('model', defaultModelFor(config.provider.default, config.provider));
@@ -1623,16 +1671,73 @@ export class Runtime {
     this.options.db.setSetting('seeded', '1');
   }
 
-  private syncBrandedAgents(): void {
-    for (const agent of this.options.db.listAgents()) {
-      if (agent.nameFromBranding && agent.name !== this.options.branding.agentName) {
-        this.options.db.upsertAgent({ ...agent, name: this.options.branding.agentName });
+  private migrateAgentOwnership(): void {
+    if (this.options.db.getSetting('agentOwnership') === '1') return;
+    const agents = this.options.db.listAgents();
+    const branded = agents.find((agent) => agent.nameFromBranding) ?? agents[0];
+    if (branded) {
+      const persona = this.options.db.getInstructions('persona');
+      const user = this.options.db.getInstructions('user');
+      const instructions = branded.instructions ?? persona ?? (branded.nameFromBranding ? this.options.branding.persona : null);
+      const userInstructions = branded.userInstructions ?? user;
+      if (persona && JSON.stringify(persona) !== JSON.stringify(this.options.branding.persona)) {
+        this.options.db.setSetting('personaCustomized', '1');
+      }
+      if (!branded.instructions || !branded.userInstructions) {
+        this.options.db.upsertAgent({ ...branded, instructions, userInstructions });
+      }
+      for (const routine of this.options.db.listRoutines()) {
+        if (routine.agentId) continue;
+        const ownsTarget = routine.targetType === 'agent' && agents.some((agent) => agent.id === routine.targetId);
+        this.options.db.upsertRoutine({ ...routine, agentId: ownsTarget ? routine.targetId : branded.id });
       }
     }
-    const persona = fillTemplate(this.options.branding.persona.persona, this.options.branding);
-    if (this.options.db.getSetting('personaCustomized') !== '1' && persona) {
-      this.options.db.setInstructions('persona', this.options.branding.persona);
+    this.options.db.setSetting('agentOwnership', '1');
+  }
+
+  private syncBrandedAgents(): void {
+    for (const agent of this.options.db.listAgents()) {
+      if (!agent.nameFromBranding) continue;
+      const name = this.options.branding.agentName;
+      const customized = this.options.db.getSetting('personaCustomized') === '1';
+      const instructions = customized ? (agent.instructions ?? this.options.branding.persona) : this.options.branding.persona;
+      if (agent.name !== name || JSON.stringify(agent.instructions) !== JSON.stringify(instructions)) {
+        this.options.db.upsertAgent({ ...agent, name, instructions });
+      }
     }
+  }
+
+  private agentPage(agent: AgentRow): AgentPage {
+    const editor = this.instructionState(agent);
+    return {
+      profile: this.profile(agent),
+      enterprise: editor.enterprise,
+      persona: editor.persona,
+      user: editor.user,
+      enterpriseLocked: true,
+      routines: this.listRoutines(agent.id),
+      skillIds: agent.skillIds,
+    };
+  }
+
+  private instructionState(agent: AgentRow): InstructionEditorState {
+    return {
+      enterprise: this.options.config.enterpriseInstructions,
+      persona: agent.instructions ?? (agent.nameFromBranding ? this.options.branding.persona : emptyFields()),
+      user: agent.userInstructions ?? emptyFields(),
+      enterpriseLocked: true,
+      personaCustomized: this.options.db.getSetting('personaCustomized') === '1',
+    };
+  }
+
+  private profile(agent: AgentRow): AgentProfile {
+    return {
+      id: agent.id,
+      name: agent.name,
+      provider: agent.provider,
+      model: agent.model,
+      nameFromBranding: agent.nameFromBranding,
+    };
   }
 
   private defaultAgent(): AgentRow {

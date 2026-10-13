@@ -100,6 +100,123 @@ describe('mock runtime', () => {
     }
   });
 
+  it('keeps the branding agent, moves routines onto it, and lets rooms pick from the agent list', async () => {
+    const { runtime } = await boot();
+    await runtime.submitCredentials('ada', 'secret', '');
+    const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+    expect(branded?.name).toBe('Northstar');
+    const page = runtime.openAgent(branded!.id);
+    expect(page.enterpriseLocked).toBe(true);
+    expect(page.enterprise.persona.length).toBeGreaterThan(0);
+    expect(page.persona.persona).toContain('{{agentName}}');
+    expect(page.skillIds).toEqual([]);
+    expect(page.routines.map((routine) => routine.targetId)).toContain(branded!.id);
+    expect(runtime.openAgent('reviewer').routines).toEqual([]);
+    expect(runtime.openAgent('reviewer').persona.persona).toContain('reviewer');
+
+    const created = runtime.saveAgent({
+      name: 'Scribe',
+      provider: 'mock',
+      model: 'mock-1',
+      persona: { ...page.persona, persona: 'You are the scribe.' },
+      user: { ...page.user, communicationStyle: 'Be brief.' },
+    });
+    expect(created.profile.nameFromBranding).toBe(false);
+    expect(created.skillIds).toEqual([]);
+    const routine = runtime.saveRoutine({
+      name: 'Scribe note',
+      prompt: 'Write a note',
+      agentId: created.profile.id,
+      targetType: 'agent',
+      targetId: created.profile.id,
+      cron: '0 9 * * 1-5',
+      enabled: false,
+    });
+    expect(runtime.openAgent(created.profile.id).routines.map((item) => item.id)).toContain(routine.id);
+    const room = runtime.listRooms()[0];
+    const savedRoom = runtime.saveRoom({
+      id: room.id,
+      name: room.name,
+      instructions: room.instructions,
+      agentIds: [...room.agentIds, created.profile.id],
+    });
+    expect(savedRoom.agentIds).toContain(created.profile.id);
+    runtime.deleteAgent(created.profile.id);
+    expect(runtime.listAgents().some((agent) => agent.id === created.profile.id)).toBe(false);
+    expect(runtime.listRoutines().some((item) => item.id === routine.id)).toBe(false);
+    expect(runtime.listRooms()[0].agentIds).not.toContain(created.profile.id);
+    expect(() => runtime.deleteAgent(branded!.id)).toThrow(/branding agent/);
+  });
+
+  it('migrates global instructions and routines onto the branding agent', async () => {
+    const rawBranding = JSON.parse(readFileSync('branding/default.json', 'utf8')) as Record<string, unknown>;
+    const branding = parseBranding({ ...rawBranding, appName: 'Northstar', agentName: 'Northstar' }, null);
+    const config = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')));
+    const db = Repository.open(':memory:');
+    const fields = {
+      persona: 'Migrated persona',
+      communicationStyle: '',
+      autonomy: '',
+      safety: '',
+      untrustedContent: '',
+    };
+    db.upsertAgent({
+      id: 'default',
+      name: 'Old name',
+      provider: 'mock',
+      model: 'mock-1',
+      nameFromBranding: true,
+      instructions: null,
+      userInstructions: null,
+      skillIds: [],
+    });
+    db.upsertAgent({
+      id: 'reviewer',
+      name: 'Reviewer',
+      provider: 'mock',
+      model: 'mock-1',
+      nameFromBranding: false,
+      instructions: { ...fields, persona: 'Stay the reviewer.' },
+      userInstructions: null,
+      skillIds: ['kept-skill'],
+    });
+    db.setInstructions('persona', fields);
+    db.setInstructions('user', { ...fields, communicationStyle: 'Migrated style' });
+    db.setSetting('personaCustomized', '1');
+    db.setSetting('seeded', '1');
+    db.upsertRoutine({
+      id: 'legacy',
+      name: 'Legacy',
+      prompt: 'Do the legacy task',
+      agentId: '',
+      targetType: 'agent',
+      targetId: 'default',
+      cron: '0 9 * * 1-5',
+      enabled: false,
+      createdAt: 1,
+      lastFiredMinute: null,
+    });
+    const runtime = await Runtime.create({
+      config,
+      branding,
+      db,
+      secrets: new MemorySecretStore(),
+      appRoot: process.cwd(),
+      attachmentsDir: mkdtempSync(join(tmpdir(), 'agent-')),
+      encryptionAvailable: true,
+      mockDelayMs: 0,
+    });
+    const page = runtime.openAgent('default');
+    expect(page.profile.name).toBe('Northstar');
+    expect(page.persona.persona).toBe('Migrated persona');
+    expect(page.user.communicationStyle).toBe('Migrated style');
+    expect(page.routines.map((routine) => routine.id)).toContain('legacy');
+    expect(runtime.openAgent('reviewer').persona.persona).toBe('Stay the reviewer.');
+    expect(runtime.openAgent('reviewer').skillIds).toEqual(['kept-skill']);
+    expect(page.skillIds).toEqual([]);
+    await runtime.dispose();
+  });
+
   it('keeps enterprise instructions locked and composes the branded persona', async () => {
     const { runtime } = await boot();
     await runtime.submitCredentials('ada', 'secret', '');
@@ -118,6 +235,93 @@ describe('mock runtime', () => {
     const authors = transcript.messages.filter((message) => message.role === 'assistant').map((message) => message.authorName);
     expect(authors).toContain('Northstar');
     expect(authors).toContain('Reviewer');
+  });
+
+  it('runs each agent’s instructions, routines, and cron through the graph', async () => {
+    const systems: string[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      systems.push(JSON.parse(String(init?.body)).system as string);
+      return new Response(JSON.stringify({ content: 'Noted.' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        config.provider.default = 'generic';
+        config.provider.genericBaseUrl = 'https://llm.example/generate';
+      },
+      fetchImpl,
+    );
+    try {
+      await runtime.submitCredentials('ada', 'secret', '');
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      expect(branded?.name).toBe('Northstar');
+      const brandedPage = runtime.openAgent(branded!.id);
+      runtime.saveAgent({
+        id: branded!.id,
+        name: branded!.name,
+        provider: 'mock',
+        model: 'mock-1',
+        persona: brandedPage.persona,
+        user: { ...brandedPage.user, communicationStyle: 'Branded user layer.' },
+      });
+      const reviewer = runtime.openAgent('reviewer');
+      runtime.saveAgent({
+        id: reviewer.profile.id,
+        name: reviewer.profile.name,
+        provider: 'mock',
+        model: 'mock-1',
+        persona: { ...reviewer.persona, persona: 'Reviewer persona only.' },
+        user: { ...reviewer.user, communicationStyle: 'Reviewer user layer.' },
+      });
+
+      await runtime.sendRoomMessage(runtime.listRooms()[0].id, 'What should we watch for?');
+      expect(systems).toHaveLength(2);
+      const brandedTurn = systems.find((system) => system.includes('Branded user layer.'));
+      const reviewerTurn = systems.find((system) => system.includes('Reviewer persona only.'));
+      expect(brandedTurn).toBeTruthy();
+      expect(brandedTurn).not.toContain('Reviewer user layer.');
+      expect(brandedTurn).not.toContain('Reviewer persona only.');
+      expect(reviewerTurn).toContain('Reviewer user layer.');
+      expect(reviewerTurn).not.toContain('Branded user layer.');
+
+      systems.length = 0;
+      const routine = runtime.saveRoutine({
+        name: 'Branded check',
+        prompt: 'Check the branded agent only.',
+        agentId: branded!.id,
+        targetType: 'agent',
+        targetId: branded!.id,
+        cron: '0 9 * * 1-5',
+        enabled: false,
+      });
+      const manual = await runtime.runRoutine(routine.id);
+      expect(manual.status).toBe('success');
+      expect(systems).toHaveLength(1);
+      expect(systems[0]).toContain('Branded user layer.');
+      expect(systems[0]).not.toContain('Reviewer user layer.');
+
+      systems.length = 0;
+      const cron = runtime.saveRoutine({
+        name: 'Branded cron',
+        prompt: 'Cron the branded agent.',
+        agentId: branded!.id,
+        targetType: 'agent',
+        targetId: branded!.id,
+        cron: '* * * * *',
+        enabled: true,
+      });
+      const fired = await runtime.fireDueRoutines(new Date('2026-10-13T12:00:00Z'));
+      expect(fired.map((item) => item.routineId)).toEqual([cron.id]);
+      expect(fired[0]?.status).toBe('success');
+      expect(systems).toHaveLength(1);
+      expect(systems[0]).toContain('Branded user layer.');
+      expect(systems[0]).not.toContain('Reviewer persona only.');
+    } finally {
+      await runtime.dispose();
+    }
   });
 
   it('lists session and audience tokens and can re-exchange without returning the raw jwt', async () => {
