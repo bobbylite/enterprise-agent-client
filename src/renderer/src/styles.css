@@ -161,7 +161,7 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { border-top: 1px solid var(--line); text-align: left; padding: 8px; vertical-align: top; }
 .stack.compact { padding: 0 28px; }
 .agent-page { overflow: auto; }
-.agent-page .segment { padding: 0 28px; }
+.agent-page .segment { position: sticky; top: 0; z-index: 2; background: var(--paper); padding-bottom: 8px; }
 
 @media (max-width: 900px) {
   .login, .split { grid-template-columns: 1fr; }

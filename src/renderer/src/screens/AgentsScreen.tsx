@@ -197,27 +197,6 @@ function AgentEditor({
             : 'Instructions and routines on this page belong to this agent.'}
         </p>
       </header>
-      <section className="stack card">
-        <h3>Profile</h3>
-        {profile.nameFromBranding ? (
-          <Field label="Name">
-            <input value={profile.name} readOnly />
-          </Field>
-        ) : (
-          <Field label="Name">
-            <input value={profile.name} onChange={(event) => onChange({ ...page, profile: { ...profile, name: event.target.value } })} />
-          </Field>
-        )}
-        <ProviderFields
-          provider={profile.provider}
-          model={profile.model}
-          onProvider={(provider) => onChange({ ...page, profile: { ...profile, provider } })}
-          onModel={(model) => onChange({ ...page, profile: { ...profile, model } })}
-        />
-        <button className="primary" type="button" onClick={() => save()}>
-          Save profile
-        </button>
-      </section>
       <div className="segment" role="tablist">
         {AGENT_TABS.map(([id, label]) => (
           <button key={id} type="button" role="tab" aria-selected={tab === id} className={tab === id ? 'selected' : ''} onClick={() => setTab(id)}>
@@ -227,6 +206,27 @@ function AgentEditor({
       </div>
       {tab === 'instructions' ? (
         <>
+          <section className="stack card">
+            <h3>Profile</h3>
+            {profile.nameFromBranding ? (
+              <Field label="Name">
+                <input value={profile.name} readOnly />
+              </Field>
+            ) : (
+              <Field label="Name">
+                <input value={profile.name} onChange={(event) => onChange({ ...page, profile: { ...profile, name: event.target.value } })} />
+              </Field>
+            )}
+            <ProviderFields
+              provider={profile.provider}
+              model={profile.model}
+              onProvider={(provider) => onChange({ ...page, profile: { ...profile, provider } })}
+              onModel={(model) => onChange({ ...page, profile: { ...profile, model } })}
+            />
+            <button className="primary" type="button" onClick={() => save()}>
+              Save profile
+            </button>
+          </section>
           <section className="stack card locked">
             <h3>Enterprise policy</h3>
             <p className="muted">Locked by admin config. It overrides this agent's instructions.</p>
