@@ -2,7 +2,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/client/stdio';
 import { SSEClientTransport, StreamableHTTPClientTransport, type AuthProvider } from '@modelcontextprotocol/client';
 import { toolKey } from '@shared/mcp/approvals';
-import type { RuntimeTool } from './turn';
+import type { RuntimeTool } from './runtime-tool';
 
 export interface McpConnectTarget {
   id: string;
@@ -20,6 +20,9 @@ interface LiveConnection {
   client: Client;
   close: () => Promise<void>;
   tools: RuntimeTool[];
+  target: McpConnectTarget;
+  accessToken?: string;
+  tokenSlot: { current?: string };
 }
 
 export class McpHub {
@@ -51,6 +54,7 @@ export class McpHub {
     this.errors.delete(target.id);
     try {
       const client = new Client(this.clientInfo);
+      const tokenSlot = { current: target.accessToken };
       if (target.transport === 'stdio') {
         const env = {
           ...getDefaultEnvironment(),
@@ -71,13 +75,16 @@ export class McpHub {
         this.connections.set(target.id, {
           client,
           tools: [],
+          target,
+          accessToken: target.accessToken,
+          tokenSlot,
           close: async () => {
             await client.close();
           },
         });
       } else {
         const authProvider: AuthProvider | undefined = target.accessToken
-          ? { token: async () => target.accessToken }
+          ? { token: async () => tokenSlot.current }
           : undefined;
         const url = new URL(target.url);
         if (target.transport === 'sse') {
@@ -93,6 +100,9 @@ export class McpHub {
               this.connections.set(target.id, {
                 client: fallback,
                 tools: [],
+                target,
+                accessToken: target.accessToken,
+                tokenSlot,
                 close: async () => {
                   await fallback.close();
                 },
@@ -108,6 +118,9 @@ export class McpHub {
         this.connections.set(target.id, {
           client,
           tools: [],
+          target,
+          accessToken: target.accessToken,
+          tokenSlot,
           close: async () => {
             await client.close();
           },
@@ -131,12 +144,23 @@ export class McpHub {
     for (const id of [...this.connections.keys()]) await this.disconnect(id);
   }
 
-  async call(serverId: string, toolName: string, args: unknown): Promise<string> {
-    const live = this.connections.get(serverId);
+  async call(serverId: string, toolName: string, args: unknown, accessToken?: string): Promise<string> {
+    let live = this.connections.get(serverId);
     if (!live) throw new Error('That MCP server is not connected.');
+    if (accessToken && accessToken !== live.accessToken) {
+      live.tokenSlot.current = accessToken;
+      if (live.target.transport === 'stdio') {
+        await this.connect({ ...live.target, accessToken });
+        live = this.connections.get(serverId);
+        if (!live) throw new Error('That MCP server is not connected.');
+      } else {
+        live.accessToken = accessToken;
+      }
+    }
     const result = await live.client.callTool({
       name: toolName,
       arguments: (args ?? {}) as Record<string, unknown>,
+      ...(accessToken ? { _meta: { authorization: `Bearer ${accessToken}` } } : {}),
     });
     const parts = (result.content ?? []).map((block) => {
       if (block.type === 'text') return block.text;
