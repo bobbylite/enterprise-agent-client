@@ -1,7 +1,7 @@
 import type { BrowserWindow, IpcMain } from 'electron';
 import { Ipc } from '@shared/channels';
 import { redactSecrets } from '@shared/env';
-import type { ApprovalChoice, Branding, ChatEvent, InstructionFields, MockScenario, RoomInput, RoutineInput, SettingsInput, McpServerInput } from '@shared/types';
+import type { AgentInput, ApprovalChoice, Branding, ChatEvent, InstructionFields, MockScenario, RoomInput, RoutineInput, SettingsInput, McpServerInput } from '@shared/types';
 import type { Runtime } from './runtime';
 
 export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindow, branding: Branding): void {
@@ -42,6 +42,9 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
   handle(Ipc.deleteRoomHistory, (roomId: string) => runtime.deleteRoomHistory(roomId));
   handle(Ipc.pickAttachments, () => runtime.pickAttachments());
   handle(Ipc.listAgents, () => runtime.listAgents());
+  handle(Ipc.openAgent, (id: string) => runtime.openAgent(id));
+  handle(Ipc.saveAgent, (input: AgentInput) => runtime.saveAgent(input));
+  handle(Ipc.deleteAgent, (id: string) => runtime.deleteAgent(id));
   handle(Ipc.listRooms, () => runtime.listRooms());
   handle(Ipc.saveRoom, (input: RoomInput) => runtime.saveRoom(input));
   handle(Ipc.deleteRoom, (id: string) => runtime.deleteRoom(id));

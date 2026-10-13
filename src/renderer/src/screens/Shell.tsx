@@ -1,19 +1,17 @@
 import { useState } from 'react';
 import type { AppState, Branding } from '@shared/types';
 import { ApprovalModal } from '../components/ApprovalModal';
+import { AgentsScreen } from './AgentsScreen';
 import { ChatScreen } from './ChatScreen';
-import { InstructionsScreen } from './InstructionsScreen';
 import { McpScreen } from './McpScreen';
 import { RoomsScreen } from './RoomsScreen';
-import { RoutinesScreen } from './RoutinesScreen';
 import { SettingsScreen } from './SettingsScreen';
 
 const NAV = [
   ['chat', 'Chat'],
   ['rooms', 'Rooms'],
-  ['routines', 'Routines'],
+  ['agents', 'Agents'],
   ['tools', 'Tools'],
-  ['instructions', 'Instructions'],
   ['settings', 'Settings'],
 ] as const;
 
@@ -66,9 +64,8 @@ export function Shell({
       <section className="workspace">
         {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} /> : null}
         {view === 'rooms' ? <RoomsScreen showReasoning={state.showReasoning} /> : null}
-        {view === 'routines' ? <RoutinesScreen /> : null}
+        {view === 'agents' ? <AgentsScreen branding={branding} /> : null}
         {view === 'tools' ? <McpScreen /> : null}
-        {view === 'instructions' ? <InstructionsScreen /> : null}
         {view === 'settings' ? <SettingsScreen state={state} /> : null}
       </section>
       <ApprovalModal />

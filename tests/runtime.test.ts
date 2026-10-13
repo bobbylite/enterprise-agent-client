@@ -100,6 +100,123 @@ describe('mock runtime', () => {
     }
   });
 
+  it('keeps the branding agent, moves routines onto it, and lets rooms pick from the agent list', async () => {
+    const { runtime } = await boot();
+    await runtime.submitCredentials('ada', 'secret', '');
+    const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+    expect(branded?.name).toBe('Northstar');
+    const page = runtime.openAgent(branded!.id);
+    expect(page.enterpriseLocked).toBe(true);
+    expect(page.enterprise.persona.length).toBeGreaterThan(0);
+    expect(page.persona.persona).toContain('{{agentName}}');
+    expect(page.skillIds).toEqual([]);
+    expect(page.routines.map((routine) => routine.targetId)).toContain(branded!.id);
+    expect(runtime.openAgent('reviewer').routines).toEqual([]);
+    expect(runtime.openAgent('reviewer').persona.persona).toContain('reviewer');
+
+    const created = runtime.saveAgent({
+      name: 'Scribe',
+      provider: 'mock',
+      model: 'mock-1',
+      persona: { ...page.persona, persona: 'You are the scribe.' },
+      user: { ...page.user, communicationStyle: 'Be brief.' },
+    });
+    expect(created.profile.nameFromBranding).toBe(false);
+    expect(created.skillIds).toEqual([]);
+    const routine = runtime.saveRoutine({
+      name: 'Scribe note',
+      prompt: 'Write a note',
+      agentId: created.profile.id,
+      targetType: 'agent',
+      targetId: created.profile.id,
+      cron: '0 9 * * 1-5',
+      enabled: false,
+    });
+    expect(runtime.openAgent(created.profile.id).routines.map((item) => item.id)).toContain(routine.id);
+    const room = runtime.listRooms()[0];
+    const savedRoom = runtime.saveRoom({
+      id: room.id,
+      name: room.name,
+      instructions: room.instructions,
+      agentIds: [...room.agentIds, created.profile.id],
+    });
+    expect(savedRoom.agentIds).toContain(created.profile.id);
+    runtime.deleteAgent(created.profile.id);
+    expect(runtime.listAgents().some((agent) => agent.id === created.profile.id)).toBe(false);
+    expect(runtime.listRoutines().some((item) => item.id === routine.id)).toBe(false);
+    expect(runtime.listRooms()[0].agentIds).not.toContain(created.profile.id);
+    expect(() => runtime.deleteAgent(branded!.id)).toThrow(/branding agent/);
+  });
+
+  it('migrates global instructions and routines onto the branding agent', async () => {
+    const rawBranding = JSON.parse(readFileSync('branding/default.json', 'utf8')) as Record<string, unknown>;
+    const branding = parseBranding({ ...rawBranding, appName: 'Northstar', agentName: 'Northstar' }, null);
+    const config = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')));
+    const db = Repository.open(':memory:');
+    const fields = {
+      persona: 'Migrated persona',
+      communicationStyle: '',
+      autonomy: '',
+      safety: '',
+      untrustedContent: '',
+    };
+    db.upsertAgent({
+      id: 'default',
+      name: 'Old name',
+      provider: 'mock',
+      model: 'mock-1',
+      nameFromBranding: true,
+      instructions: null,
+      userInstructions: null,
+      skillIds: [],
+    });
+    db.upsertAgent({
+      id: 'reviewer',
+      name: 'Reviewer',
+      provider: 'mock',
+      model: 'mock-1',
+      nameFromBranding: false,
+      instructions: { ...fields, persona: 'Stay the reviewer.' },
+      userInstructions: null,
+      skillIds: ['kept-skill'],
+    });
+    db.setInstructions('persona', fields);
+    db.setInstructions('user', { ...fields, communicationStyle: 'Migrated style' });
+    db.setSetting('personaCustomized', '1');
+    db.setSetting('seeded', '1');
+    db.upsertRoutine({
+      id: 'legacy',
+      name: 'Legacy',
+      prompt: 'Do the legacy task',
+      agentId: '',
+      targetType: 'agent',
+      targetId: 'default',
+      cron: '0 9 * * 1-5',
+      enabled: false,
+      createdAt: 1,
+      lastFiredMinute: null,
+    });
+    const runtime = await Runtime.create({
+      config,
+      branding,
+      db,
+      secrets: new MemorySecretStore(),
+      appRoot: process.cwd(),
+      attachmentsDir: mkdtempSync(join(tmpdir(), 'agent-')),
+      encryptionAvailable: true,
+      mockDelayMs: 0,
+    });
+    const page = runtime.openAgent('default');
+    expect(page.profile.name).toBe('Northstar');
+    expect(page.persona.persona).toBe('Migrated persona');
+    expect(page.user.communicationStyle).toBe('Migrated style');
+    expect(page.routines.map((routine) => routine.id)).toContain('legacy');
+    expect(runtime.openAgent('reviewer').persona.persona).toBe('Stay the reviewer.');
+    expect(runtime.openAgent('reviewer').skillIds).toEqual(['kept-skill']);
+    expect(page.skillIds).toEqual([]);
+    await runtime.dispose();
+  });
+
   it('keeps enterprise instructions locked and composes the branded persona', async () => {
     const { runtime } = await boot();
     await runtime.submitCredentials('ada', 'secret', '');
