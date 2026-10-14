@@ -284,19 +284,58 @@ export interface RoutineRun {
   error: string | null;
 }
 
+export type McpExtensionType = 'stdio' | 'streamable_http' | 'sse' | 'builtin';
+
+export type McpAuthStepKind =
+  | 'unauthorized'
+  | 'protected-resource'
+  | 'authorization-server'
+  | 'registration'
+  | 'authorize'
+  | 'token'
+  | 'refresh'
+  | 'step-up';
+
+export interface McpAuthStep {
+  kind: McpAuthStepKind;
+  title: string;
+  detail: string;
+  ok: boolean;
+}
+
+export interface McpHeader {
+  name: string;
+  value: string;
+}
+
+export interface McpEnvInput {
+  name: string;
+  value: string;
+}
+
 export interface McpServerView {
   id: string;
   name: string;
-  transport: 'stdio' | 'http' | 'sse';
+  transport: 'stdio' | 'http' | 'sse' | 'builtin';
+  type: McpExtensionType;
+  description: string;
   command: string;
   args: string[];
   url: string;
+  headers: McpHeader[];
+  envKeys: string[];
+  timeout: number;
   audience: string;
   scope: string;
   enabled: boolean;
   status: 'disconnected' | 'connected' | 'error';
   error?: string;
   tools: McpToolView[];
+  authKind: 'open' | 'oauth' | 'exchange' | 'worker';
+  needsSignIn: boolean;
+  signedIn: boolean;
+  needsClient: boolean;
+  oauthSteps: McpAuthStep[];
 }
 
 export interface McpToolView {
@@ -308,13 +347,24 @@ export interface McpToolView {
 export interface McpServerInput {
   id?: string;
   name: string;
-  transport: 'stdio' | 'http' | 'sse';
+  transport?: 'stdio' | 'http' | 'sse' | 'builtin';
+  type?: McpExtensionType;
+  description?: string;
   command: string;
   args: string;
   url: string;
-  audience: string;
-  scope: string;
+  headers?: McpHeader[];
+  env?: McpEnvInput[];
+  timeout?: number;
+  /** Omit to keep a config-seeded audience. An empty string clears it. */
+  audience?: string;
+  scope?: string;
   enabled: boolean;
+}
+
+export interface McpSignInInput {
+  clientId?: string;
+  clientSecret?: string;
 }
 
 export interface InstructionEditorState {
@@ -442,8 +492,11 @@ export interface AgentBridge {
   listMcpServers(): Promise<McpServerView[]>;
   saveMcpServer(input: McpServerInput): Promise<McpServerView>;
   deleteMcpServer(id: string): Promise<void>;
+  setMcpEnabled(id: string, enabled: boolean): Promise<McpServerView>;
   connectMcp(id: string): Promise<McpServerView>;
   disconnectMcp(id: string): Promise<McpServerView>;
+  signInMcp(id: string, input?: McpSignInInput): Promise<McpServerView>;
+  signOutMcp(id: string): Promise<McpServerView>;
   respondApproval(id: string, choice: ApprovalChoice): Promise<void>;
   listRoutines(): Promise<Routine[]>;
   saveRoutine(input: RoutineInput): Promise<Routine>;

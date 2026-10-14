@@ -11,7 +11,7 @@ import {
   type FlowSnapshot,
 } from '@shared/auth/pi-flow';
 import { createPkce, type PkcePair } from '@shared/auth/pkce';
-import { waitForLoopbackCode } from '@shared/auth/loopback';
+import { beginLoopback, waitForLoopbackCode } from '@shared/auth/loopback';
 import { classifyAccessToken, type TokenSet } from '@shared/auth/tokens';
 import { groupsFromClaims, isAdmin } from '@shared/access/groups';
 import {
@@ -31,6 +31,14 @@ import { AuthorizeClient, listRemotePolicies, postDecision, setRemotePolicyEnabl
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
 import { PINGONE_SKILL_ID, pingoneSkillInstructions, type SkillDraft } from '@shared/skills/markdown';
 import { toolKey } from '@shared/mcp/approvals';
+import { splitCommandLine } from '@shared/mcp/command';
+import {
+  mcpEnvAccount,
+  mcpOauthTokenAccount,
+  refreshStoredMcpToken,
+  runMcpAuthorization,
+  McpOauthError,
+} from '@shared/mcp/oauth';
 import {
   isSkillReferenceTool,
   loadSkillBundle,
@@ -76,8 +84,10 @@ import type {
   InstructionEditorState,
   InstructionFields,
   LoginView,
+  McpAuthStep,
   McpServerInput,
   McpServerView,
+  McpSignInInput,
   MockScenario,
   ProviderId,
   RiskView,
@@ -164,6 +174,10 @@ export class Runtime {
   private workerToken: TokenSet | null = null;
   private agentActorToken: TokenSet | null = null;
   private readonly exchangeErrors = new Map<string, string>();
+  private readonly oauthSteps = new Map<string, McpAuthStep[]>();
+  private readonly oauthSignedIn = new Set<string>();
+  private readonly needsClient = new Set<string>();
+  private readonly pendingScopes = new Map<string, string>();
   private readonly approvals = new Map<string, (choice: ApprovalChoice) => void>();
   private readonly pi: PiFlowClient;
   private readonly cache: AudienceTokenCache;
@@ -186,7 +200,28 @@ export class Runtime {
       now: options.now,
     });
     this.cache = new AudienceTokenCache(options.secrets, 60_000, options.now);
-    this.hub = new McpHub({ name: options.branding.appName, version: options.version ?? '0.1.0' });
+    this.hub = new McpHub(
+      { name: options.branding.appName, version: options.version ?? '0.1.0' },
+      {
+        platform: process.platform,
+        home: options.env?.HOME ?? process.env.HOME,
+        onInsufficientScope: (serverId, scope) => {
+          if (scope) this.pendingScopes.set(serverId, scope);
+          const steps = this.oauthSteps.get(serverId) ?? [];
+          this.oauthSteps.set(serverId, [
+            ...steps,
+            {
+              kind: 'step-up',
+              title: 'Insufficient scope',
+              detail: scope
+                ? `The server returned 403 insufficient_scope for ${scope}. Sign in again to request it.`
+                : 'The server returned 403 insufficient_scope. Sign in again to request a broader scope.',
+              ok: false,
+            },
+          ]);
+        },
+      },
+    );
     this.checkpointer = openCheckpointer(options.checkpointPath ?? join(options.attachmentsDir, 'langgraph.sqlite'));
     this.agentGraph = compileAgentGraph(this.checkpointer);
     this.authorize = new AuthorizeClient({ fetchImpl: options.fetchImpl, now: options.now });
@@ -789,38 +824,79 @@ export class Runtime {
     return this.getInstructions();
   }
 
-  listMcpServers(): McpServerView[] {
-    return this.options.db.listMcpServers().map((server) => this.serverView(server));
+  async listMcpServers(): Promise<McpServerView[]> {
+    const rows = this.options.db.listMcpServers();
+    await Promise.all(rows.map((server) => this.rememberOauth(server)));
+    return rows.map((server) => this.serverView(server));
   }
 
   async saveMcpServer(input: McpServerInput): Promise<McpServerView> {
-    if (!input.name.trim()) throw new Error('Give the server a name.');
+    if (!input.name.trim()) throw new Error('Give the extension a name.');
+    const existing = input.id ? this.options.db.listMcpServers().find((item) => item.id === input.id) : undefined;
+    const kind = extensionKind(input);
+    const commandLine = input.args.trim() ? null : splitCommandLine(input.command);
     const row: McpServerRow = {
       id: input.id || randomId(),
       name: input.name.trim(),
-      transport: input.transport,
-      command: input.command.trim(),
-      args: parseArgs(input.args),
+      transport: kind,
+      description: input.description?.trim() ?? existing?.description ?? '',
+      command: commandLine ? commandLine.command : input.command.trim(),
+      args: commandLine ? commandLine.args : parseArgs(input.args),
       url: input.url.trim(),
-      audience: input.audience.trim(),
-      scope: input.scope.trim(),
+      headers: input.headers ? headerRecord(input.headers) : (existing?.headers ?? {}),
+      envKeys: existing?.envKeys ?? [],
+      timeout: input.timeout ?? existing?.timeout ?? 300,
+      audience: input.audience !== undefined ? input.audience.trim() : (existing?.audience ?? ''),
+      scope: input.scope !== undefined ? input.scope.trim() : (existing?.scope ?? ''),
       enabled: input.enabled,
     };
-    if (row.transport === 'stdio' && !row.command) throw new Error('A stdio server needs a command.');
-    if (row.transport !== 'stdio' && !row.url) throw new Error('An HTTP server needs a URL.');
+    if (input.env) row.envKeys = await this.storeExtensionEnv(row.id, input.env, existing?.envKeys ?? []);
+    if (row.transport === 'stdio' && !row.command) throw new Error('A stdio extension needs a command.');
+    if (row.transport !== 'stdio' && row.transport !== 'builtin' && !row.url) throw new Error('An HTTP extension needs a URL.');
+    if (!Number.isInteger(row.timeout) || row.timeout < 1) throw new Error('Timeout must be a positive number of seconds.');
     this.options.db.upsertMcpServer(row);
+    await this.rememberOauth(row);
     return this.serverView(row);
   }
 
   async deleteMcpServer(id: string): Promise<void> {
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
     await this.hub.disconnect(id);
+    if (server) {
+      for (const key of server.envKeys) await this.options.secrets.delete(mcpEnvAccount(id, key));
+    }
+    await this.options.secrets.delete(mcpOauthTokenAccount(id));
+    this.oauthSignedIn.delete(id);
+    this.oauthSteps.delete(id);
+    this.needsClient.delete(id);
+    this.pendingScopes.delete(id);
     this.options.db.deleteMcpServer(id);
+  }
+
+  async setMcpEnabled(id: string, enabled: boolean): Promise<McpServerView> {
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
+    if (!server) throw new Error('That extension was not found.');
+    const next = { ...server, enabled };
+    this.options.db.upsertMcpServer(next);
+    if (!enabled) {
+      await this.hub.disconnect(id);
+      await this.rememberOauth(next);
+      return this.serverView(next);
+    }
+    const token = this.usesOauth(next) ? await this.currentOauthAccessToken(next.id) : undefined;
+    if (this.session && !this.stepUpRequired && next.transport !== 'builtin' && !(this.usesOauth(next) && !token)) {
+      return this.connectMcp(id);
+    }
+    await this.rememberOauth(next);
+    return this.serverView(next);
   }
 
   async connectMcp(id: string): Promise<McpServerView> {
     this.requireSession();
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
-    if (!server) throw new Error('That server was not found.');
+    if (!server) throw new Error('That extension was not found.');
+    if (!server.enabled) throw new Error('This extension is disabled.');
+    if (server.transport === 'builtin') throw new Error('Built-in extensions are not launched by this client.');
     const accessToken = await this.accessTokenForServer(server);
     await this.hub.connect({
       id: server.id,
@@ -830,15 +906,73 @@ export class Runtime {
       args: server.args,
       url: server.url,
       cwd: this.options.appRoot,
+      env: await this.extensionEnv(server),
+      headers: server.headers,
+      timeoutMs: server.timeout * 1000,
       accessToken,
+      fetchImpl: this.options.fetchImpl,
+      allowUnauthorized: this.usesOauth(server) && !accessToken,
+      refreshAccessToken: this.usesOauth(server) ? async () => this.currentOauthAccessToken(server.id) : undefined,
     });
+    await this.rememberOauth(server);
+    if (this.usesOauth(server) && !accessToken && this.hub.status(server.id) !== 'connected') {
+      throw new Error('This extension needs sign-in.');
+    }
     return this.serverView(server);
   }
 
   async disconnectMcp(id: string): Promise<McpServerView> {
     await this.hub.disconnect(id);
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
-    if (!server) throw new Error('That server was not found.');
+    if (!server) throw new Error('That extension was not found.');
+    await this.rememberOauth(server);
+    return this.serverView(server);
+  }
+
+  async signInMcp(id: string, manual?: McpSignInInput): Promise<McpServerView> {
+    this.requireSession();
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
+    if (!server) throw new Error('That extension was not found.');
+    if (!this.usesOauth(server)) throw new Error('This extension does not use MCP authorization.');
+    if (!this.options.openExternal) throw new Error('System browser sign-in is not available.');
+    const openExternal = this.options.openExternal;
+    try {
+      const outcome = await runMcpAuthorization({
+        extensionId: server.id,
+        serverUrl: server.url,
+        secrets: this.options.secrets,
+        fetchImpl: this.options.fetchImpl,
+        now: () => this.now(),
+        manualClient: manual?.clientId ? { clientId: manual.clientId, clientSecret: manual.clientSecret } : undefined,
+        stepUpScope: this.pendingScopes.get(server.id),
+        openBrowser: (url) => openExternal(url),
+        beginLoopback: (state, port, signal) => beginLoopback({ expectedState: state, port, signal }),
+      });
+      this.oauthSteps.set(server.id, outcome.steps);
+      this.needsClient.delete(server.id);
+      this.pendingScopes.delete(server.id);
+      this.oauthSignedIn.add(server.id);
+      if (server.enabled) return this.connectMcp(server.id);
+      return this.serverView(server);
+    } catch (error) {
+      if (error instanceof McpOauthError) {
+        this.oauthSteps.set(server.id, error.steps);
+        if (error.needsClient) this.needsClient.add(server.id);
+      }
+      await this.rememberOauth(server);
+      throw error;
+    }
+  }
+
+  async signOutMcp(id: string): Promise<McpServerView> {
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
+    if (!server) throw new Error('That extension was not found.');
+    await this.hub.disconnect(id);
+    await this.options.secrets.delete(mcpOauthTokenAccount(id));
+    this.oauthSignedIn.delete(id);
+    this.oauthSteps.delete(id);
+    this.needsClient.delete(id);
+    this.pendingScopes.delete(id);
     return this.serverView(server);
   }
 
@@ -1220,8 +1354,9 @@ export class Runtime {
       }
       return this.workerAccessToken();
     }
-    if (!server.audience) return undefined;
-    return this.tokenForAudience(server.audience, server.scope);
+    if (server.audience.trim()) return this.tokenForAudience(server.audience, server.scope);
+    if (server.transport === 'http' || server.transport === 'sse') return this.currentOauthAccessToken(server.id);
+    return undefined;
   }
 
   private gateTool(tool: RuntimeTool, participant: GraphParticipant | undefined): string | null {
@@ -2168,12 +2303,16 @@ export class Runtime {
         id: server.id,
         name: server.name,
         transport: server.transport,
-        command: server.command ?? '',
-        args: server.args ?? [],
-        url: server.url ?? '',
-        audience: server.audience ?? '',
-        scope: server.scope ?? '',
-        enabled: true,
+        description: server.description,
+        command: server.command,
+        args: server.args,
+        url: server.url,
+        headers: server.headers,
+        envKeys: server.envKeys,
+        timeout: server.timeout,
+        audience: server.audience,
+        scope: server.scope,
+        enabled: server.enabled,
       });
     }
     const brandedId = config.agents.find((agent) => agent.nameFromBranding)?.id ?? config.agents[0]?.id ?? 'default';
@@ -2289,17 +2428,118 @@ export class Runtime {
   private serverView(server: McpServerRow): McpServerView {
     const pingone = server.id === this.options.config.authorize.mcpServerId;
     const tools = pingone && (!this.isAdmin() || !this.currentFeatures().pingoneTools) ? [] : this.hub.tools(server.id);
+    const authKind = pingone ? 'worker' : server.audience.trim() ? 'exchange' : this.usesOauth(server) ? 'oauth' : 'open';
+    const signedIn = this.oauthSignedIn.has(server.id);
     return {
-      ...server,
+      id: server.id,
+      name: server.name,
+      transport: server.transport,
+      type: server.transport === 'http' ? 'streamable_http' : server.transport,
+      description: server.description,
+      command: server.command,
+      args: server.args,
+      url: server.url,
+      headers: Object.entries(server.headers).map(([name, value]) => ({ name, value })),
+      envKeys: server.envKeys,
+      timeout: server.timeout,
+      audience: server.audience,
+      scope: server.scope,
+      enabled: server.enabled,
       status: this.hub.status(server.id),
-      error: this.hub.error(server.id) ?? this.exchangeErrors.get(server.audience),
+      error: this.hub.error(server.id) ?? (server.audience ? this.exchangeErrors.get(server.audience) : undefined),
       tools: tools.map((tool) => ({
         name: tool.name,
         description: tool.description,
         readOnlyHint: tool.readOnlyHint,
       })),
+      authKind,
+      needsSignIn: authKind === 'oauth' && server.enabled && !signedIn,
+      signedIn,
+      needsClient: this.needsClient.has(server.id),
+      oauthSteps: this.oauthSteps.get(server.id) ?? [],
     };
   }
+
+  private usesOauth(server: McpServerRow): boolean {
+    if (server.id === this.options.config.authorize.mcpServerId) return false;
+    if (server.audience.trim()) return false;
+    return server.transport === 'http' || server.transport === 'sse';
+  }
+
+  private async rememberOauth(server: McpServerRow): Promise<void> {
+    if (!this.usesOauth(server)) {
+      this.oauthSignedIn.delete(server.id);
+      return;
+    }
+    const raw = await this.options.secrets.get(mcpOauthTokenAccount(server.id));
+    if (raw) this.oauthSignedIn.add(server.id);
+    else this.oauthSignedIn.delete(server.id);
+  }
+
+  private async currentOauthAccessToken(extensionId: string): Promise<string | undefined> {
+    try {
+      const tokens = await refreshStoredMcpToken({
+        extensionId,
+        secrets: this.options.secrets,
+        fetchImpl: this.options.fetchImpl,
+        now: () => this.now(),
+      });
+      if (tokens) {
+        this.oauthSignedIn.add(extensionId);
+        return tokens.accessToken;
+      }
+      this.oauthSignedIn.delete(extensionId);
+      return undefined;
+    } catch {
+      this.oauthSignedIn.delete(extensionId);
+      return undefined;
+    }
+  }
+
+  private async extensionEnv(server: McpServerRow): Promise<Record<string, string>> {
+    const env: Record<string, string> = {};
+    for (const key of server.envKeys) {
+      const value = await this.options.secrets.get(mcpEnvAccount(server.id, key));
+      if (value !== null) env[key] = value;
+    }
+    return env;
+  }
+
+  private async storeExtensionEnv(
+    id: string,
+    entries: Array<{ name: string; value: string }>,
+    previous: string[],
+  ): Promise<string[]> {
+    const names: string[] = [];
+    for (const entry of entries) {
+      const name = entry.name.trim();
+      if (!name || names.includes(name)) continue;
+      names.push(name);
+      if (entry.value) await this.options.secrets.set(mcpEnvAccount(id, name), entry.value);
+    }
+    for (const old of previous) {
+      if (!names.includes(old)) await this.options.secrets.delete(mcpEnvAccount(id, old));
+    }
+    return names;
+  }
+}
+
+function extensionKind(input: McpServerInput): McpServerRow['transport'] {
+  const type = input.type ?? (input.transport === 'http' ? 'streamable_http' : input.transport) ?? 'stdio';
+  if (type === 'streamable_http') return 'http';
+  if (type === 'sse' || type === 'stdio' || type === 'builtin') return type;
+  if (input.transport === 'http' || input.transport === 'sse' || input.transport === 'builtin') return input.transport;
+  return 'stdio';
+}
+
+function headerRecord(headers: Array<{ name: string; value: string }>): Record<string, string> {
+  const record: Record<string, string> = {};
+  for (const header of headers) {
+    const name = header.name.trim();
+    if (!name) continue;
+    record[name] = header.value;
+  }
+  return record;
 }
 
 function policyView(policy: AuthorizePolicy): PolicyView {

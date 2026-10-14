@@ -1,7 +1,7 @@
 import type { BrowserWindow, IpcMain } from 'electron';
 import { Ipc } from '@shared/channels';
 import { redactSecrets } from '@shared/env';
-import type { AgentInput, ApprovalChoice, Branding, ChatEvent, InstructionFields, MockScenario, RoomInput, RoutineInput, SettingsInput, SkillInput, McpServerInput } from '@shared/types';
+import type { AgentInput, ApprovalChoice, Branding, ChatEvent, InstructionFields, MockScenario, RoomInput, RoutineInput, SettingsInput, SkillInput, McpServerInput, McpSignInInput } from '@shared/types';
 import type { Runtime } from './runtime';
 
 export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindow, branding: Branding): void {
@@ -58,8 +58,11 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
   handle(Ipc.listMcpServers, () => runtime.listMcpServers());
   handle(Ipc.saveMcpServer, (input: McpServerInput) => runtime.saveMcpServer(input));
   handle(Ipc.deleteMcpServer, (id: string) => runtime.deleteMcpServer(id));
+  handle(Ipc.setMcpEnabled, (id: string, enabled: boolean) => runtime.setMcpEnabled(id, enabled));
   handle(Ipc.connectMcp, (id: string) => runtime.connectMcp(id));
   handle(Ipc.disconnectMcp, (id: string) => runtime.disconnectMcp(id));
+  handle(Ipc.signInMcp, (id: string, input?: McpSignInInput) => runtime.signInMcp(id, input));
+  handle(Ipc.signOutMcp, (id: string) => runtime.signOutMcp(id));
   handle(Ipc.respondApproval, (id: string, choice: ApprovalChoice) => runtime.respondApproval(id, choice));
   handle(Ipc.listRoutines, () => runtime.listRoutines());
   handle(Ipc.saveRoutine, (input: RoutineInput) => runtime.saveRoutine(input));

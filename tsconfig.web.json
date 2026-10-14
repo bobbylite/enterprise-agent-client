@@ -17,5 +17,5 @@
     },
     "noEmit": true
   },
-  "include": ["src/renderer/**/*", "src/shared/types.ts", "src/shared/channels.ts"]
+  "include": ["src/renderer/**/*", "src/shared/types.ts", "src/shared/channels.ts", "src/shared/mcp/command.ts"]
 }
