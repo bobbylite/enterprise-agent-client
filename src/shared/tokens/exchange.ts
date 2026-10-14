@@ -67,10 +67,7 @@ export async function fetchClientCredentials(input: {
 }): Promise<TokenSet> {
   const fetchImpl = input.fetchImpl ?? fetch;
   const now = input.now ?? Date.now;
-  const body = new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: input.clientId,
-  });
+  const body = new URLSearchParams({ grant_type: 'client_credentials' });
   if (input.scope) body.set('scope', input.scope);
   const basic = btoa(`${input.clientId}:${input.clientSecret}`);
   const response = await fetchImpl(input.tokenEndpoint, {

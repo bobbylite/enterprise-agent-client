@@ -8,6 +8,7 @@ import { openCheckpointer } from '../src/main/checkpoint-sqlite';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { anthropicTurnFields, openAiTurnFields, readModelChunk } from '../src/main/chat-model';
 import type { RuntimeTool } from '../src/main/runtime-tool';
+import { skillReferenceDenied } from '../src/main/skill-bundle';
 import type { ApprovalRequest, ChatEvent, InstructionFields } from '../src/shared/types';
 
 const blank: InstructionFields = {
@@ -153,6 +154,85 @@ describe('LangGraph runtime', () => {
               description: 'Create a policy',
               inputSchema: { type: 'object', properties: { message: { type: 'string' } } },
               readOnlyHint: false,
+            },
+          ],
+          riskAction: 'allow',
+        },
+      });
+      expect(calls.token).toEqual([]);
+      expect(calls.tool).toEqual([]);
+      expect(seen).toContain('denied:PingOne tools are limited to the Administrator group.');
+    } finally {
+      checkpointer.close();
+    }
+  });
+
+  it('denies read_skill_reference in the tool node for a non-admin even when it is listed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'graph-skill-ref-'));
+    const checkpointer = openCheckpointer(join(directory, 'turns.sqlite'));
+    const graph = compileAgentGraph(checkpointer);
+    const seen: string[] = [];
+    const { deps: bound, calls } = deps({
+      provider: 'generic',
+      model: 'generic-1',
+      baseUrl: 'https://llm.example/generate',
+      gateTool: (tool, participant) =>
+        skillReferenceDenied({
+          serverId: tool.serverId,
+          name: tool.name,
+          mcpServerId: 'pingone',
+          admin: false,
+          adminGroup: 'Administrator',
+          pingoneTools: true,
+          skillIds: participant?.skillIds ?? ['pingone'],
+        }),
+      persistTool: (tool) => {
+        seen.push(`${tool.status}:${tool.result ?? ''}`);
+      },
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { messages?: { role: string }[] };
+        const sawTool = body.messages?.some((message) => message.role === 'tool') ?? false;
+        if (!sawTool) {
+          return new Response(
+            JSON.stringify({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'call-ref',
+                  name: 'skill__read_skill_reference',
+                  arguments: JSON.stringify({ name: 'references/ea-api-operational-quirks.md' }),
+                },
+              ],
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response(JSON.stringify({ content: 'Stopped.' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    try {
+      await runAgentGraph({
+        graph,
+        checkpointer,
+        threadId: 'skill-ref-thread',
+        runId: 'skill-ref-run',
+        deps: bound,
+        initial: {
+          conversationId: 'c-skill-ref',
+          participants: [participant({ skillIds: ['pingone'], skills: '' })],
+          messages: [{ role: 'user', content: 'read the authorize reference' }],
+          availableTools: [
+            {
+              key: 'skill__read_skill_reference',
+              serverId: 'skill',
+              serverName: 'PingOne skill',
+              name: 'read_skill_reference',
+              description: 'Read a skill reference',
+              inputSchema: { type: 'object', properties: { name: { type: 'string' } } },
+              readOnlyHint: true,
             },
           ],
           riskAction: 'allow',

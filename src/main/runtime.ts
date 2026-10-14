@@ -30,6 +30,17 @@ import { AuthorizeClient, listRemotePolicies, postDecision, setRemotePolicyEnabl
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
 import { PINGONE_SKILL_ID, pingoneSkillInstructions, type SkillDraft } from '@shared/skills/markdown';
 import { toolKey } from '@shared/mcp/approvals';
+import {
+  isSkillReferenceTool,
+  loadSkillBundle,
+  pingoneAuthorizeSkillLayer,
+  readSkillReferenceFile,
+  resolveSkillBundle,
+  skillReferenceDenied,
+  SKILL_REFERENCE_SERVER_ID,
+  SKILL_REFERENCE_TOOL,
+  type SkillBundle,
+} from './skill-bundle';
 import { buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
 import { mockRiskPayload } from '@shared/protect/mock';
 import { decideRisk, summarizeRisk, unscoredRisk } from '@shared/protect/policy';
@@ -158,6 +169,7 @@ export class Runtime {
   private readonly checkpointer: NodeSqliteSaver;
   private readonly agentGraph: AgentGraph;
   private readonly authorize: AuthorizeClient;
+  private readonly pingoneBundle: SkillBundle | null;
   private firing = false;
   private activeTurn: AbortController | null = null;
   private activeConversationId = '';
@@ -176,6 +188,8 @@ export class Runtime {
     this.checkpointer = openCheckpointer(options.checkpointPath ?? join(options.attachmentsDir, 'langgraph.sqlite'));
     this.agentGraph = compileAgentGraph(this.checkpointer);
     this.authorize = new AuthorizeClient({ fetchImpl: options.fetchImpl, now: options.now });
+    const bundleRoot = resolveSkillBundle(options.appRoot);
+    this.pingoneBundle = bundleRoot ? loadSkillBundle(bundleRoot) : null;
   }
 
   static async create(options: RuntimeOptions): Promise<Runtime> {
@@ -1103,7 +1117,10 @@ export class Runtime {
             if (!action.startsWith(prefix)) return;
             this.audit(agentId, action, detail);
           },
-          callTool: (tool, args, accessToken) => this.hub.call(tool.serverId, tool.name, args, accessToken),
+          callTool: (tool, args, accessToken) => {
+            if (isSkillReferenceTool(tool)) return Promise.resolve(this.readSkillReference(args));
+            return this.hub.call(tool.serverId, tool.name, args, accessToken);
+          },
           persistMessage: (message) => {
             this.options.db.insertMessage({
               id: message.id,
@@ -1122,7 +1139,7 @@ export class Runtime {
         initial: {
           messages: this.providerHistory(conversationId),
           participants: participants.map((item) => this.participant(item.agent, item.room)),
-          availableTools: this.hub.allTools(),
+          availableTools: this.graphTools(),
           riskAction: this.risk?.action ?? 'allow',
           remembered: this.rememberedMap(),
           agentIndex: 0,
@@ -1162,7 +1179,7 @@ export class Runtime {
 
   private rememberedMap(): Record<string, 'always' | 'deny'> {
     const remembered: Record<string, 'always' | 'deny'> = {};
-    for (const tool of this.hub.allTools()) {
+    for (const tool of this.graphTools()) {
       const preference = this.options.db.getToolPreference(tool.serverId, tool.name);
       if (preference) remembered[`${tool.serverId}\0${tool.name}`] = preference;
     }
@@ -1192,16 +1209,53 @@ export class Runtime {
 
   private gateTool(tool: RuntimeTool, participant: GraphParticipant | undefined): string | null {
     const features = this.currentFeatures();
-    if (tool.serverId === this.options.config.authorize.mcpServerId) {
-      if (!this.isAdmin()) return `PingOne tools are limited to the ${this.options.config.access.adminGroup} group.`;
-      if (!features.pingoneTools) return 'Authorize turned PingOne tools off for this session.';
-      if (!participant?.skillIds.includes(PINGONE_SKILL_ID)) return 'This agent does not have the PingOne skill.';
-      return null;
+    if (isSkillReferenceTool(tool) || tool.serverId === this.options.config.authorize.mcpServerId) {
+      return skillReferenceDenied({
+        serverId: tool.serverId,
+        name: tool.name,
+        mcpServerId: this.options.config.authorize.mcpServerId,
+        admin: this.isAdmin(),
+        adminGroup: this.options.config.access.adminGroup,
+        pingoneTools: features.pingoneTools,
+        skillIds: participant?.skillIds ?? [],
+      });
     }
     if ((!features.mcpWrites || features.chat === 'read_only') && !tool.readOnlyHint) {
       return 'Authorize policy disabled MCP writes for this session.';
     }
     return null;
+  }
+
+  private graphTools(): RuntimeTool[] {
+    return [this.skillReferenceTool(), ...this.hub.allTools()];
+  }
+
+  private skillReferenceTool(): RuntimeTool {
+    return {
+      key: toolKey(SKILL_REFERENCE_SERVER_ID, SKILL_REFERENCE_TOOL),
+      serverId: SKILL_REFERENCE_SERVER_ID,
+      serverName: 'PingOne skill',
+      name: SKILL_REFERENCE_TOOL,
+      description:
+        'Read one file from the built-in PingOne Authorize skill. Call this before any PingOne MCP tool that lists or changes Authorize policies, attributes, statements, or decision endpoints. Returns the file as text and does not run scripts.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description: 'Relative path such as references/ea-api-operational-quirks.md or scripts/walk_policy_tree.py',
+          },
+        },
+        required: ['name'],
+      },
+      readOnlyHint: true,
+    };
+  }
+
+  private readSkillReference(args: unknown): string {
+    if (!this.pingoneBundle) throw new Error('The PingOne Authorize skill bundle is not installed.');
+    const name = args && typeof args === 'object' && 'name' in args && typeof args.name === 'string' ? args.name : '';
+    return readSkillReferenceFile(this.pingoneBundle.root, name);
   }
 
   private isAdmin(): boolean {
@@ -1335,8 +1389,12 @@ export class Runtime {
   private skillPrompt(agent: AgentRow): string {
     return this.usableSkills(agent)
       .map((skill) => {
+        const head = `Skill: ${skill.name}\n${skill.description}\n${skill.instructions}`;
+        if (skill.id === PINGONE_SKILL_ID) {
+          return this.pingoneBundle ? `${head}\n\n${pingoneAuthorizeSkillLayer(this.pingoneBundle)}` : head;
+        }
         const files = skill.files.map((file) => `\n\nFile ${file.path}:\n${file.text}`).join('');
-        return `Skill: ${skill.name}\n${skill.description}\n${skill.instructions}${files}`;
+        return `${head}${files}`;
       })
       .join('\n\n');
   }
