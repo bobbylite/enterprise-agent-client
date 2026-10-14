@@ -9,6 +9,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [enforcement, setEnforcement] = useState<{ policy: PolicyView; enabled: boolean } | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
   const busyRef = useRef(false);
 
   async function load(): Promise<void> {
@@ -29,13 +30,16 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
   }, []);
 
   useEffect(() => {
-    if (!enforcement) return;
+    if (!enforcement && !resetOpen) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setEnforcement(null);
+      if (event.key === 'Escape') {
+        setEnforcement(null);
+        setResetOpen(false);
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [enforcement]);
+  }, [enforcement, resetOpen]);
 
   async function run(action: () => Promise<void>): Promise<void> {
     if (busyRef.current) return;
@@ -69,8 +73,13 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
             void run(async () => {
               setPolicies(await window.agent.refreshPolicies());
               setAudit(await window.agent.listAudit());
-              onState(await window.agent.getState());
-              setNotice('Refreshed from PingOne.');
+              const state = await window.agent.getState();
+              onState(state);
+              setNotice(
+                state.mode === 'pingone'
+                  ? 'Refreshed from PingOne. Starter policies that were missing there were created again.'
+                  : 'Refreshed.',
+              );
             })
           }
         >
@@ -90,12 +99,15 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
         >
           Scaffold policy
         </button>
+        <button type="button" className="ghost" disabled={busy} onClick={() => setResetOpen(true)}>
+          Reset local policy cache
+        </button>
       </div>
       {preview ? (
         <section className="card stack">
           <h3>Starter policies</h3>
           <p className="muted">
-            Confirming creates only the policies that are not already stored. A second confirm does not duplicate them.
+            Confirming creates starter policies that PingOne does not currently have. Ones deleted there are created again. A second confirm does not duplicate the ones still there.
           </p>
           <ul className="tools">
             {preview.map((policy) => (
@@ -116,10 +128,12 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
                   setPolicies(result.policies);
                   setPreview(null);
                   setAudit(await window.agent.listAudit());
-                  onState(await window.agent.getState());
+                  const state = await window.agent.getState();
+                  onState(state);
+                  const already = state.mode === 'pingone' ? 'Those starter policies are already in PingOne.' : 'Those starter policies were already stored.';
                   setNotice(
                     result.created.length === 0
-                      ? 'Those starter policies were already present.'
+                      ? already
                       : `Created ${result.created.length} starter ${result.created.length === 1 ? 'policy' : 'policies'}.`,
                   );
                 })
@@ -173,6 +187,40 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
           ))}
         </ul>
       </section>
+      {resetOpen ? (
+        <div className="modal-backdrop" role="presentation">
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="policy-reset-title">
+            <p className="eyebrow">Policy</p>
+            <h2 id="policy-reset-title">Reset local policy cache</h2>
+            <p>
+              This clears the policies stored on this computer. It does not delete anything in PingOne. Refresh or Scaffold reads PingOne again and creates any missing starter policies.
+            </p>
+            <div className="row">
+              <button type="button" className="ghost" disabled={busy} onClick={() => setResetOpen(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger"
+                disabled={busy}
+                autoFocus
+                onClick={() => {
+                  setResetOpen(false);
+                  void run(async () => {
+                    setPolicies(await window.agent.resetPolicyCache());
+                    setPreview(null);
+                    setAudit(await window.agent.listAudit());
+                    onState(await window.agent.getState());
+                    setNotice('Local policy cache cleared.');
+                  });
+                }}
+              >
+                Reset local policy cache
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {enforcement ? (
         <div className="modal-backdrop" role="presentation">
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="policy-confirm-title">

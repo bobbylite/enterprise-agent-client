@@ -55,6 +55,7 @@ export const Ipc = {
   listPolicies: 'policies:list',
   refreshPolicies: 'policies:refresh',
   scaffoldPolicies: 'policies:scaffold',
+  resetPolicyCache: 'policies:reset-cache',
   setPolicyEnabled: 'policies:enabled',
   listAudit: 'audit:list',
   chatEvent: 'chat:event',

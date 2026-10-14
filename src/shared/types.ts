@@ -464,6 +464,7 @@ export interface AgentBridge {
   listPolicies(): Promise<PolicyView[]>;
   refreshPolicies(): Promise<PolicyView[]>;
   scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult>;
+  resetPolicyCache(): Promise<PolicyView[]>;
   setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]>;
   listAudit(): Promise<AuditView[]>;
   onChatEvent(listener: (event: ChatEvent) => void): () => void;

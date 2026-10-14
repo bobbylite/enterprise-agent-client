@@ -495,6 +495,7 @@ describe('admin gate', () => {
     expect(employee.features.chat).toBe('allow');
     await expect(runtime.listPolicies()).rejects.toThrow(/Administrator/);
     await expect(runtime.scaffoldPolicies(true)).rejects.toThrow(/Administrator/);
+    await expect(runtime.resetPolicyCache()).rejects.toThrow(/Administrator/);
     const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
     const employeePage = runtime.openAgent(branded!.id);
     expect(employeePage.skills.some((skill) => skill.id === 'pingone')).toBe(false);
@@ -541,6 +542,12 @@ describe('admin gate', () => {
     const audit = runtime.listAudit();
     expect(audit.some((event) => event.action === 'policy:scaffold' && event.username === 'ada')).toBe(true);
     expect(audit.some((event) => event.action === 'policy:enforcement' && event.detail.includes('disabled'))).toBe(true);
+
+    expect(await runtime.resetPolicyCache()).toEqual([]);
+    expect(await runtime.listPolicies()).toEqual([]);
+    expect(runtime.listAudit().some((event) => event.action === 'policy:reset-cache')).toBe(true);
+    const restored = await runtime.scaffoldPolicies(true);
+    expect(restored.created).toHaveLength(4);
   });
 
   it('locks an administrator session down at high risk', async () => {
@@ -634,11 +641,26 @@ describe('admin gate', () => {
       if (!String(url).includes('llm.example')) return json(500, { message: String(url) });
       const body = JSON.parse(String(init?.body)) as {
         system?: string;
-        tools?: { name: string }[];
+        tools?: {
+          name: string;
+          description?: string;
+          inputSchema?: {
+            required?: string[];
+            additionalProperties?: boolean;
+            properties?: { name?: { enum?: string[] } };
+          };
+        }[];
         messages?: { role: string; content?: string }[];
       };
       systems.push(body.system ?? '');
       toolLists.push((body.tools ?? []).map((tool) => tool.name));
+      const skillTool = (body.tools ?? []).find((tool) => tool.name === 'skill__read_skill_reference');
+      if (skillTool) {
+        expect(skillTool.description).toContain('references/ea-api-operational-quirks.md');
+        expect(skillTool.inputSchema?.required).toContain('name');
+        expect(skillTool.inputSchema?.additionalProperties).toBe(false);
+        expect(skillTool.inputSchema?.properties?.name?.enum).toContain('references/ea-api-operational-quirks.md');
+      }
       const sawTool = (body.messages ?? []).some((message) => message.role === 'tool');
       const user = [...(body.messages ?? [])].reverse().find((message) => message.role === 'user');
       if (!sawTool && user?.content?.includes('read the authorize reference')) {
@@ -707,6 +729,56 @@ describe('admin gate', () => {
       );
       expect(done?.type === 'tool' ? done.tool.result : '').toContain('#!/usr/bin/env python3');
       expect(done?.type === 'tool' ? done.tool.result : '').not.toContain('Rate limiting is silent');
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('returns the valid reference names when the skill tool is called with {}', async () => {
+    const { runtime, events } = await boot(0, undefined, async (url, init) => {
+      if (!String(url).includes('llm.example')) return json(500, { message: String(url) });
+      const body = JSON.parse(String(init?.body)) as { messages?: { role: string; content?: string }[] };
+      const sawTool = (body.messages ?? []).some((message) => message.role === 'tool');
+      const user = [...(body.messages ?? [])].reverse().find((message) => message.role === 'user');
+      if (!sawTool && user?.content?.includes('read the authorize reference')) {
+        return json(200, {
+          content: '',
+          tool_calls: [{ id: 'call-empty', name: 'skill__read_skill_reference', arguments: '{}' }],
+        });
+      }
+      return json(200, { content: 'Noted.' });
+    });
+    try {
+      const settings = runtime.getSettings();
+      await runtime.saveSettings({
+        provider: 'generic',
+        model: 'generic-1',
+        temperature: settings.temperature,
+        openaiBaseUrl: settings.openaiBaseUrl,
+        anthropicBaseUrl: settings.anthropicBaseUrl,
+        genericBaseUrl: 'https://llm.example/generate',
+      });
+      await runtime.setMockAdmin(true);
+      await runtime.submitCredentials('ada', 'secret', '');
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      runtime.assignSkill(branded!.id, 'pingone', true);
+      const snapshot = runtime.createConversation();
+      const pending = runtime.sendMessage(snapshot.conversation.id, 'read the authorize reference', []);
+      const approval = await waitFor(
+        events,
+        (event) => event.type === 'approval-required' && event.request.toolName === 'read_skill_reference',
+      );
+      if (approval.type !== 'approval-required') throw new Error('missing approval');
+      runtime.respondApproval(approval.request.id, 'once');
+      await pending;
+      const failed = events.find(
+        (event) => event.type === 'tool' && event.tool.toolName === 'read_skill_reference' && event.tool.status === 'error',
+      );
+      const result = failed?.type === 'tool' ? failed.tool.result ?? '' : '';
+      expect(result).toMatch(/not found/);
+      expect(result).toContain('Valid names:');
+      expect(result).toContain('references/ea-api-operational-quirks.md');
+      expect(result).toContain('scripts/walk_policy_tree.py');
     } finally {
       await runtime.dispose();
     }
@@ -936,6 +1008,29 @@ describe('pi.flow runtime', () => {
     const again = await runtime.scaffoldPolicies(true);
     expect(again.created).toEqual([]);
     expect(posts).toHaveLength(4);
+
+    remote.splice(0, remote.length);
+    const recreated = await runtime.scaffoldPolicies(true);
+    expect(recreated.created.map((policy) => policy.name).sort()).toEqual([
+      'Administrator tools',
+      'High risk lockdown',
+      'Read-only risk',
+      'Session can use chat',
+    ]);
+    expect(posts).toHaveLength(8);
+    const listed = await runtime.listPolicies();
+    expect(listed.map((policy) => policy.id).sort()).toEqual([
+      'enterprise-agent:admin',
+      'enterprise-agent:high-risk',
+      'enterprise-agent:read-only',
+      'enterprise-agent:session',
+    ]);
+
+    remote.splice(0, remote.length);
+    const refreshed = await runtime.refreshPolicies();
+    expect(posts).toHaveLength(12);
+    expect(refreshed).toHaveLength(4);
+    expect(remote).toHaveLength(4);
   });
 
   it('reports an external identity provider instead of posting usernamePassword.check', async () => {

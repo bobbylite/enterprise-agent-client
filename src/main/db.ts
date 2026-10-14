@@ -723,6 +723,10 @@ export class Repository {
     return this.db.prepare('SELECT * FROM authorize_policies ORDER BY name COLLATE NOCASE').all().map(mapPolicy);
   }
 
+  deletePolicy(id: string): void {
+    this.db.prepare('DELETE FROM authorize_policies WHERE id = ?').run(id);
+  }
+
   upsertPolicy(policy: AuthorizePolicy): void {
     this.db
       .prepare(

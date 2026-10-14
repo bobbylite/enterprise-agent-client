@@ -1,5 +1,5 @@
 import { ChatAnthropic } from '@langchain/anthropic';
-import { AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from '@langchain/core/messages';
+import { AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage, collapseToolCallChunks, type BaseMessage } from '@langchain/core/messages';
 import { BaseChatModel, type BaseChatModelCallOptions, type BindToolsInput } from '@langchain/core/language_models/chat_models';
 import { ChatGenerationChunk, type ChatResult } from '@langchain/core/outputs';
 import { ChatOpenAI } from '@langchain/openai';
@@ -126,7 +126,7 @@ async function streamOpenAi(input: ModelTurnInput): Promise<{ content: string; t
         },
       });
       return await consumeModel(
-        input.tools.length > 0 ? openAi.bindTools(toolBindings(input.tools)) : openAi,
+        input.tools.length > 0 ? openAi.bindTools(toolBindings(input.tools, 'openai')) : openAi,
         toLangChainMessages(input.system, input.messages),
         input,
       );
@@ -202,12 +202,26 @@ function providerRequest(input: ModelTurnInput) {
   };
 }
 
-function toolBindings(tools: RuntimeTool[]): BindToolsInput[] {
-  return tools.map((tool) => ({
-    name: tool.key,
-    description: tool.description,
-    schema: tool.inputSchema,
-  }));
+function toolBindings(tools: RuntimeTool[], format: 'langchain' | 'openai' = 'langchain'): BindToolsInput[] {
+  return tools.map((tool) => {
+    if (format === 'openai' && tool.strict) {
+      return {
+        type: 'function',
+        function: {
+          name: tool.key,
+          description: tool.description,
+          parameters: tool.inputSchema,
+          strict: true,
+        },
+        strict: true,
+      };
+    }
+    return {
+      name: tool.key,
+      description: tool.description,
+      schema: tool.inputSchema,
+    };
+  });
 }
 
 async function consumeModel(
@@ -216,24 +230,61 @@ async function consumeModel(
   input: ModelTurnInput,
 ): Promise<{ content: string; toolCalls: ProviderToolCall[] }> {
   let content = '';
-  const calls = new Map<string, ProviderToolCall>();
+  const chunks: AIMessageChunk[] = [];
   const stream = await model.stream(messages, { signal: input.signal });
   for await (const chunk of stream) {
     if (input.signal?.aborted) throw new StreamCancelled();
+    chunks.push(chunk);
     const parts = readChunk(chunk);
     if (parts.reasoning && input.showReasoning) input.onChunk({ type: 'reasoning', delta: parts.reasoning });
     if (parts.text) {
       content += parts.text;
       input.onChunk({ type: 'text', delta: parts.text });
     }
-    for (const call of chunk.tool_calls ?? []) {
-      if (!call.name) continue;
-      const id = call.id || call.name;
-      calls.set(id, { id, name: call.name, arguments: JSON.stringify(call.args ?? {}) });
-    }
   }
   if (input.signal?.aborted) throw new StreamCancelled();
-  return { content, toolCalls: [...calls.values()] };
+  return { content, toolCalls: collectStreamedToolCalls(chunks) };
+}
+
+export function collectStreamedToolCalls(chunks: AIMessageChunk[]): ProviderToolCall[] {
+  logRawToolCalls(chunks);
+  const pieces = chunks.flatMap((chunk) => chunk.tool_call_chunks ?? []);
+  if (pieces.length > 0) {
+    const collapsed = collapseToolCallChunks(pieces);
+    const parsed = collapsed.tool_calls.flatMap((call) => toProviderCall(call.name, call.id, call.args));
+    if (parsed.length > 0) return parsed;
+    return collapsed.invalid_tool_calls.flatMap((call) => toProviderCall(call.name, call.id, call.args));
+  }
+  const calls = new Map<string, ProviderToolCall>();
+  for (const chunk of chunks) {
+    for (const call of chunk.tool_calls ?? []) {
+      const provider = toProviderCall(call.name, call.id, call.args)[0];
+      if (provider) calls.set(provider.id, provider);
+    }
+  }
+  return [...calls.values()];
+}
+
+function toProviderCall(name: string | undefined, id: string | undefined, args: unknown): ProviderToolCall[] {
+  if (!name) return [];
+  const argumentsText = typeof args === 'string' ? args || '{}' : JSON.stringify(args ?? {});
+  return [{ id: id || name, name, arguments: argumentsText }];
+}
+
+function logRawToolCalls(chunks: AIMessageChunk[]): void {
+  if (process.env.AGENT_DEBUG !== '1') return;
+  const raw = chunks.flatMap((chunk) => [
+    ...(chunk.tool_call_chunks ?? []).map((call) => ({
+      kind: 'chunk',
+      id: call.id,
+      name: call.name,
+      index: call.index,
+      args: call.args,
+    })),
+    ...(chunk.tool_calls ?? []).map((call) => ({ kind: 'call', id: call.id, name: call.name, args: call.args })),
+  ]);
+  if (raw.length === 0) return;
+  console.error(`[agent] raw tool-call args ${JSON.stringify(raw)}`);
 }
 
 export function readModelChunk(chunk: AIMessageChunk): { text: string; reasoning: string } {

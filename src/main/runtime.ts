@@ -21,6 +21,7 @@ import {
   featuresFromAuthorize,
   mergeScaffold,
   parseScaffoldMarker,
+  reconcilePolicyCache,
   scaffoldPolicies,
   SCAFFOLD_MARKER,
   type AuthorizePolicy,
@@ -37,6 +38,7 @@ import {
   readSkillReferenceFile,
   resolveSkillBundle,
   skillReferenceDenied,
+  skillReferenceToolFields,
   SKILL_REFERENCE_SERVER_ID,
   SKILL_REFERENCE_TOOL,
   type SkillBundle,
@@ -603,9 +605,24 @@ export class Runtime {
 
   async refreshPolicies(): Promise<PolicyView[]> {
     this.requirePolicy();
-    if (this.options.config.tenant.mode === 'pingone') await this.pullRemotePolicies();
-    await this.refreshFeatures();
+    if (this.options.config.tenant.mode === 'pingone') {
+      await this.authorize.run(() =>
+        this.confirmScaffold(scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '')),
+      );
+    } else {
+      await this.refreshFeatures();
+    }
     return this.listPolicies();
+  }
+
+  async resetPolicyCache(): Promise<PolicyView[]> {
+    this.requirePolicy();
+    const removed = this.options.db.listPolicies();
+    for (const policy of removed) this.options.db.deletePolicy(policy.id);
+    this.audit(null, 'policy:reset-cache', removed.map((policy) => policy.name).join(', ') || 'empty');
+    this.decisionCache = null;
+    await this.refreshFeatures();
+    return [];
   }
 
   async scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult> {
@@ -1231,28 +1248,21 @@ export class Runtime {
   }
 
   private skillReferenceTool(): RuntimeTool {
+    const fields = skillReferenceToolFields(this.pingoneBundle?.files ?? []);
     return {
       key: toolKey(SKILL_REFERENCE_SERVER_ID, SKILL_REFERENCE_TOOL),
       serverId: SKILL_REFERENCE_SERVER_ID,
       serverName: 'PingOne skill',
       name: SKILL_REFERENCE_TOOL,
-      description:
-        'Read one file from the built-in PingOne Authorize skill. Call this before any PingOne MCP tool that lists or changes Authorize policies, attributes, statements, or decision endpoints. Returns the file as text and does not run scripts.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          name: {
-            type: 'string',
-            description: 'Relative path such as references/ea-api-operational-quirks.md or scripts/walk_policy_tree.py',
-          },
-        },
-        required: ['name'],
-      },
+      description: fields.description,
+      inputSchema: fields.inputSchema,
       readOnlyHint: true,
+      ...(fields.strict ? { strict: true } : {}),
     };
   }
 
   private readSkillReference(args: unknown): string {
+    if (process.env.AGENT_DEBUG === '1') console.error(`[agent] read_skill_reference args ${JSON.stringify(args)}`);
     if (!this.pingoneBundle) throw new Error('The PingOne Authorize skill bundle is not installed.');
     const name = args && typeof args === 'object' && 'name' in args && typeof args.name === 'string' ? args.name : '';
     return readSkillReferenceFile(this.pingoneBundle.root, name);
@@ -1414,6 +1424,9 @@ export class Runtime {
   private async pullRemotePolicies(): Promise<void> {
     const token = await this.workerAccessToken();
     const remote = await listRemotePolicies(this.options.config, token, this.authorize);
+    const starters = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '');
+    const { dropIds } = reconcilePolicyCache(this.options.db.listPolicies(), remote, starters);
+    for (const id of dropIds) this.options.db.deletePolicy(id);
     const local = this.options.db.listPolicies();
     for (const item of remote) {
       const marker = parseScaffoldMarker(item.description);
@@ -1445,6 +1458,7 @@ export class Runtime {
   }
 
   private async confirmScaffold(incoming: AuthorizePolicy[]): Promise<PolicyScaffoldResult> {
+    if (this.options.config.tenant.mode === 'pingone') await this.pullRemotePolicies();
     const existing = this.options.db.listPolicies();
     const merged = mergeScaffold(existing, incoming);
     const preview = incoming.map(policyView);
