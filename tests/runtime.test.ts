@@ -626,6 +626,92 @@ describe('admin gate', () => {
     }
   });
 
+  it('injects the Authorize skill only for an admin who assigned it, and gates the reference tool', async () => {
+    const systems: string[] = [];
+    const toolLists: string[][] = [];
+    let toolCall = 0;
+    const { runtime, events } = await boot(0, undefined, async (url, init) => {
+      if (!String(url).includes('llm.example')) return json(500, { message: String(url) });
+      const body = JSON.parse(String(init?.body)) as {
+        system?: string;
+        tools?: { name: string }[];
+        messages?: { role: string; content?: string }[];
+      };
+      systems.push(body.system ?? '');
+      toolLists.push((body.tools ?? []).map((tool) => tool.name));
+      const sawTool = (body.messages ?? []).some((message) => message.role === 'tool');
+      const user = [...(body.messages ?? [])].reverse().find((message) => message.role === 'user');
+      if (!sawTool && user?.content?.includes('read the authorize reference')) {
+        return json(200, {
+          content: '',
+          tool_calls: [
+            {
+              id: `call-ref-${(toolCall += 1)}`,
+              name: 'skill__read_skill_reference',
+              arguments: JSON.stringify({ name: 'scripts/walk_policy_tree.py' }),
+            },
+          ],
+        });
+      }
+      return json(200, { content: 'Noted.' });
+    });
+    try {
+      const settings = runtime.getSettings();
+      await runtime.saveSettings({
+        provider: 'generic',
+        model: 'generic-1',
+        temperature: settings.temperature,
+        openaiBaseUrl: settings.openaiBaseUrl,
+        anthropicBaseUrl: settings.anthropicBaseUrl,
+        genericBaseUrl: 'https://llm.example/generate',
+      });
+      await runtime.submitCredentials('ada', 'secret', '');
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      const employeeChat = runtime.createConversation();
+      await runtime.sendMessage(employeeChat.conversation.id, 'read the authorize reference', []);
+      expect(systems.at(-1) ?? '').not.toContain('EA Admin API Build');
+      expect(systems.at(-1) ?? '').not.toContain('Rate limiting is silent');
+      expect(toolLists.at(-1) ?? []).not.toContain('skill__read_skill_reference');
+      expect(
+        events.some(
+          (event) =>
+            event.type === 'tool' && event.tool.status === 'denied' && event.tool.result === 'That tool is not connected.',
+        ),
+      ).toBe(true);
+
+      await runtime.logout();
+      await runtime.setMockAdmin(true);
+      await runtime.submitCredentials('ada', 'secret', '');
+      const adminChat = runtime.createConversation();
+      await runtime.sendMessage(adminChat.conversation.id, 'hello', []);
+      expect(systems.at(-1) ?? '').not.toContain('EA Admin API Build');
+      expect(toolLists.at(-1) ?? []).not.toContain('skill__read_skill_reference');
+
+      runtime.assignSkill(branded!.id, 'pingone', true);
+      const pending = runtime.sendMessage(adminChat.conversation.id, 'read the authorize reference', []);
+      const approval = await waitFor(
+        events,
+        (event) => event.type === 'approval-required' && event.request.toolName === 'read_skill_reference',
+      );
+      if (approval.type !== 'approval-required') throw new Error('missing approval');
+      expect(approval.request.readOnlyHint).toBe(true);
+      runtime.respondApproval(approval.request.id, 'once');
+      await pending;
+      const injected = systems.filter((system) => system.includes('EA Admin API Build'));
+      expect(injected.length).toBeGreaterThan(0);
+      expect(injected.every((system) => system.includes('Before any PingOne MCP tool call'))).toBe(true);
+      expect(injected.every((system) => !system.includes('Rate limiting is silent'))).toBe(true);
+      expect(toolLists.some((names) => names.includes('skill__read_skill_reference'))).toBe(true);
+      const done = events.find(
+        (event) => event.type === 'tool' && event.tool.toolName === 'read_skill_reference' && event.tool.status === 'done',
+      );
+      expect(done?.type === 'tool' ? done.tool.result : '').toContain('#!/usr/bin/env python3');
+      expect(done?.type === 'tool' ? done.tool.result : '').not.toContain('Rate limiting is silent');
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
   it('hides a skill whose required groups do not match the session', async () => {
     const { runtime } = await boot();
     await runtime.submitCredentials('ada', 'secret', '');

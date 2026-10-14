@@ -3,6 +3,9 @@ import { FEATURE_STATEMENT, SCAFFOLD_MARKER, type AuthorizePolicy, decisionParam
 
 const MAX_ATTEMPTS = 4;
 
+/** Gap between management POSTs so a burst does not trip REQUEST_LIMITED. */
+export const MANAGEMENT_POST_GAP_MS = 300;
+
 export interface AuthorizeClientOptions {
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
@@ -84,6 +87,11 @@ export class AuthorizeClient {
     }
     throw new Error(`PingOne is rate limiting, try again in ${Math.max(1, Math.ceil(retryAfter))}s`);
   }
+
+  /** Waits between successful management creates. Tests inject sleep so this stays instant. */
+  paceAfterManagementPost(): Promise<void> {
+    return this.sleep(MANAGEMENT_POST_GAP_MS);
+  }
 }
 
 export function retryAfterSeconds(response: Response, now: number): number | null {
@@ -110,6 +118,8 @@ export function decisionUrl(config: EnterpriseConfig): string {
 }
 
 export function remotePolicyBody(policy: AuthorizePolicy): Record<string, unknown> {
+  // Free-standing library policy. Omit parent: POST-with-parent can return 201 and still
+  // place the policy under the shared Policies root instead of an AAM Custom node.
   return {
     type: 'POLICY',
     name: policy.name,
@@ -217,7 +227,9 @@ export async function syncRemoteScaffold(
       if (posted) created.push(policy);
       onProgress?.(policy);
     };
-    for (const policy of policies) {
+    for (let index = 0; index < policies.length; index += 1) {
+      const policy = policies[index];
+      if (!policy) continue;
       const existing = matchRemote(policy, remote);
       if (existing) {
         keep({ ...policy, remoteId: existing.id, enabled: existing.enabled }, false);
@@ -237,6 +249,8 @@ export async function syncRemoteScaffold(
             updatedAt: policy.updatedAt,
           },
         ];
+        const laterNeedsPost = policies.slice(index + 1).some((item) => !matchRemote(item, remote));
+        if (laterNeedsPost) await client.paceAfterManagementPost();
       } catch (error) {
         if (!(error instanceof PolicyConflictError)) throw error;
         remote = await listRemotePolicies(config, accessToken, client);

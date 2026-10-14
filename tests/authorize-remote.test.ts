@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { AuthorizeClient, syncRemoteScaffold } from '../src/shared/authorize/remote';
+import { AuthorizeClient, MANAGEMENT_POST_GAP_MS, remotePolicyBody, syncRemoteScaffold } from '../src/shared/authorize/remote';
 import { scaffoldPolicies } from '../src/shared/authorize/policy';
 import { parseEnterpriseConfig } from '../src/shared/config';
 
@@ -137,5 +137,40 @@ describe('Authorize HTTP', () => {
     expect(again.created).toEqual([]);
     expect(posts).toHaveLength(4);
     expect(again.policies[0]?.remoteId).toBe('policy-1');
+  });
+
+  it('omits parent on scaffold POST and pauses between creates', async () => {
+    const sleeps: number[] = [];
+    const bodies: Record<string, unknown>[] = [];
+    const client = new AuthorizeClient({
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      fetchImpl: async (_url, init) => {
+        const method = init?.method ?? 'GET';
+        if (method === 'GET') {
+          return new Response(JSON.stringify({ _embedded: { authorizationPolicies: [] } }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        bodies.push(body);
+        return new Response(JSON.stringify({ id: `policy-${bodies.length}` }), {
+          status: 201,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    const starter = scaffoldPolicies('Administrator', 10, 'ada');
+    const synced = await syncRemoteScaffold(config(), 'worker-token', starter, client);
+    expect(synced.created).toHaveLength(starter.length);
+    expect(bodies).toHaveLength(starter.length);
+    for (const body of bodies) {
+      expect(body).not.toHaveProperty('parent');
+      expect(JSON.stringify(body)).not.toContain('"parent"');
+    }
+    expect(remotePolicyBody(starter[0]!)).not.toHaveProperty('parent');
+    expect(sleeps).toEqual(Array.from({ length: starter.length - 1 }, () => MANAGEMENT_POST_GAP_MS));
   });
 });

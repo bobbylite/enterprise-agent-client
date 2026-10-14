@@ -27,7 +27,7 @@ import { createGenericProvider } from '../src/shared/providers/generic';
 import { parseAnthropicData, parseOpenAiData } from '../src/shared/providers/sse';
 import { mockResult } from '../src/shared/providers/mock';
 import { assertValidCron, cronMatches } from '../src/shared/schedule/cron';
-import { AudienceTokenCache, exchangeSubjectToken } from '../src/shared/tokens/exchange';
+import { AudienceTokenCache, exchangeSubjectToken, fetchClientCredentials } from '../src/shared/tokens/exchange';
 import { MemorySecretStore } from '../src/shared/secrets';
 import { parseEnv, redactSecrets } from '../src/shared/env';
 import { encodeJsonSegment } from '../src/shared/ids';
@@ -375,6 +375,29 @@ describe('token exchange', () => {
     expect(plain.get('actor_token_type')).toBeNull();
     expect(delegated.get('actor_token')).toBe('agent-actor-token');
     expect(delegated.get('actor_token_type')).toBe('urn:ietf:params:oauth:token-type:access_token');
+  });
+
+  it('authenticates client credentials with HTTP Basic and omits body credentials', async () => {
+    let body = '';
+    let authorization = '';
+    const token = await fetchClientCredentials({
+      tokenEndpoint: 'https://auth.example/env/as/token',
+      clientId: 'worker-id',
+      clientSecret: 'worker-secret',
+      scope: 'p1:read:user',
+      fetchImpl: async (_url, init) => {
+        body = String(init?.body);
+        authorization = new Headers(init?.headers).get('authorization') ?? '';
+        return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+      },
+    });
+    const params = new URLSearchParams(body);
+    expect(params.get('grant_type')).toBe('client_credentials');
+    expect(params.get('scope')).toBe('p1:read:user');
+    expect(params.get('client_id')).toBeNull();
+    expect(params.get('client_secret')).toBeNull();
+    expect(Buffer.from(authorization.replace(/^Basic /, ''), 'base64').toString('utf8')).toBe('worker-id:worker-secret');
+    expect(token.accessToken).toBe('worker-token');
   });
 });
 
