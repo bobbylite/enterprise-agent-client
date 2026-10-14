@@ -29,10 +29,14 @@ export interface SkillRow {
 export interface McpServerRow {
   id: string;
   name: string;
-  transport: 'stdio' | 'http' | 'sse';
+  transport: 'stdio' | 'http' | 'sse' | 'builtin';
+  description: string;
   command: string;
   args: string[];
   url: string;
+  headers: Record<string, string>;
+  envKeys: string[];
+  timeout: number;
   audience: string;
   scope: string;
   enabled: boolean;
@@ -58,6 +62,18 @@ function num(value: SQLOutputValue | undefined): number {
 
 function bool(value: SQLOutputValue | undefined): boolean {
   return value === 1 || value === '1';
+}
+
+function stringRecord(value: string): Record<string, string> {
+  try {
+    const parsed = JSON.parse(value || '{}') as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+    );
+  } catch {
+    return {};
+  }
 }
 
 export class Repository {
@@ -227,6 +243,10 @@ export class Repository {
     this.ensureColumn('agents', 'user_instructions_json', 'TEXT');
     this.ensureColumn('agents', 'skill_ids_json', "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn('routines', 'agent_id', 'TEXT');
+    this.ensureColumn('mcp_servers', 'description', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('mcp_servers', 'headers_json', "TEXT NOT NULL DEFAULT '{}'");
+    this.ensureColumn('mcp_servers', 'env_keys_json', "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn('mcp_servers', 'timeout_seconds', 'INTEGER NOT NULL DEFAULT 300');
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -444,9 +464,13 @@ export class Repository {
         id: text(row.id),
         name: text(row.name),
         transport: text(row.transport) as McpServerRow['transport'],
+        description: text(row.description),
         command: text(row.command),
         args: JSON.parse(text(row.args_json) || '[]') as string[],
         url: text(row.url),
+        headers: stringRecord(text(row.headers_json)),
+        envKeys: JSON.parse(text(row.env_keys_json) || '[]') as string[],
+        timeout: num(row.timeout_seconds) || 300,
         audience: text(row.audience),
         scope: text(row.scope),
         enabled: bool(row.enabled),
@@ -456,8 +480,11 @@ export class Repository {
   upsertMcpServer(server: McpServerRow): void {
     this.db
       .prepare(
-        `INSERT INTO mcp_servers(id, name, transport, command, args_json, url, audience, scope, enabled)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO mcp_servers(
+           id, name, transport, command, args_json, url, audience, scope, enabled,
+           description, headers_json, env_keys_json, timeout_seconds
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name,
            transport = excluded.transport,
@@ -466,7 +493,11 @@ export class Repository {
            url = excluded.url,
            audience = excluded.audience,
            scope = excluded.scope,
-           enabled = excluded.enabled`,
+           enabled = excluded.enabled,
+           description = excluded.description,
+           headers_json = excluded.headers_json,
+           env_keys_json = excluded.env_keys_json,
+           timeout_seconds = excluded.timeout_seconds`,
       )
       .run(
         server.id,
@@ -478,6 +509,10 @@ export class Repository {
         server.audience,
         server.scope,
         server.enabled ? 1 : 0,
+        server.description,
+        JSON.stringify(server.headers),
+        JSON.stringify(server.envKeys),
+        server.timeout,
       );
   }
 

@@ -13,7 +13,7 @@ This is the foundation: a runnable Electron app with PingOne sign-in (including 
 | Piece | Choice |
 | --- | --- |
 | Shell | Electron 44, React 19, TypeScript, Vite via electron-vite |
-| MCP | `@modelcontextprotocol/client` 2.x (stdio, Streamable HTTP, SSE fallback) |
+| MCP | `@modelcontextprotocol/client` 2.x (stdio, Streamable HTTP, SSE fallback, MCP OAuth) |
 | Agent runtime | LangGraph.js in the Electron main process. No Python runtime. |
 | Models | LangChain chat models for OpenAI (including GPT-5 reasoning), Anthropic (extended thinking), the generic HTTP provider, and mock mode |
 | Local data | `node:sqlite` (`DatabaseSync`) in the user-data directory, including the LangGraph thread checkpointer |
@@ -81,7 +81,7 @@ flowchart TB
   Cron --> Runtime
 ```
 
-A turn is one LangGraph. The model node calls a LangChain chat model and streams tokens, reasoning, and phase changes. The tool node is the only place a tool can run: it applies the Protect action (block, read-only, restrict, or the remembered choice), pauses with `interrupt` for allow once / always / deny, and only then obtains a token and passes it into the MCP call. Other MCP servers still use token exchange (user subject plus agent actor). The PingOne MCP server, whose id matches `authorize.mcpServerId`, uses the worker client-credentials token instead, and the tool node denies it unless the signed-in user is in the admin group, Authorize allows PingOne tools, and that agent has the PingOne skill. Enterprise, persona, user, room, risk, and assigned skill instructions are fields on the graph state. The model node composes them, with the locked enterprise layer first. Group rooms are the same graph with a turn-taking step across each member, and each member keeps its own instructions. Routines and cron start that graph. Threads are checkpointed in SQLite (`langgraph.sqlite` next to attachments) so an approval can resume on a new graph instance. The checkpointer uses `node:sqlite` rather than `better-sqlite3`, which does not load in Electron.
+A turn is one LangGraph. The model node calls a LangChain chat model and streams tokens, reasoning, and phase changes. The tool node is the only place a tool can run: it applies the Protect action (block, read-only, restrict, or the remembered choice), pauses with `interrupt` for allow once / always / deny, and only then obtains a token and passes it into the MCP call. An HTTP extension with an audience in `enterprise.json` still uses token exchange (user subject plus agent actor). The PingOne MCP server, whose id matches `authorize.mcpServerId`, uses the worker client-credentials token instead, and the tool node denies it unless the signed-in user is in the admin group, Authorize allows PingOne tools, and that agent has the PingOne skill. HTTP extensions with no audience use MCP authorization (protected resource metadata, authorization-server metadata, dynamic client registration or a client ID metadata document, then authorization code with PKCE). Enterprise, persona, user, room, risk, and assigned skill instructions are fields on the graph state. The model node composes them, with the locked enterprise layer first. Group rooms are the same graph with a turn-taking step across each member, and each member keeps its own instructions. Routines and cron start that graph. Threads are checkpointed in SQLite (`langgraph.sqlite` next to attachments) so an approval can resume on a new graph instance. The checkpointer uses `node:sqlite` rather than `better-sqlite3`, which does not load in Electron.
 
 Sign-in, in order:
 
@@ -90,7 +90,7 @@ Sign-in, in order:
 3. Protect runs a risk evaluation before the session is stored. Policy maps the level and reason codes to one action: allow, step-up MFA, restrict tools, read-only, or block. The most restrictive matching action wins.
 4. A blocked result never stores a session. Step-up restarts the flow with `acr_values` when that value is configured. Mock mode accepts any 6-digit one-time code for the new-device scenario.
 5. The user token is stored in the keychain. If a refresh token exists, expiry refreshes it. Otherwise the user signs in again.
-6. The AI Agent application mints its own access token with client credentials. That token is cached until it expires. Each configured audience is then exchanged (RFC 8693) on the same AI Agent client: the user's access token is the `subject_token`, and the agent token is the `actor_token`. MCP connections receive the exchanged token: HTTP and SSE via the client auth provider, stdio via `MCP_ACCESS_TOKEN`.
+6. The AI Agent application mints its own access token with client credentials. That token is cached until it expires. Each configured audience is then exchanged (RFC 8693) on the same AI Agent client: the user's access token is the `subject_token`, and the agent token is the `actor_token`. Exchange runs only for an MCP server that has an audience. HTTP and SSE receive that token through the client auth provider, and stdio receives it as `MCP_ACCESS_TOKEN`. An HTTP extension with no audience does not exchange a token; its card stays on Needs sign-in until MCP authorization completes.
 
 The agent is risk-aware. The composed system prompt is enterprise policy, then persona, then the user layer, then optional room instructions, then the current risk context (level, reasons, and the behaviour the policy requires).
 
@@ -179,7 +179,7 @@ A missing `appName` throws. The app does not substitute a built-in name.
 
 ## Enterprise config
 
-`config/enterprise.example.json` holds the tenant, token-exchange audiences, Protect policy, access and Authorize settings, locked enterprise instructions, the starting agents, rooms, MCP servers, routines, and provider defaults. After the first run, agents, their instructions, their routines, and their skills are edited in the Agents view. The branding agent (the sample theme's `agentName`) is created on first launch. Existing global instruction layers and routines are moved onto that agent. Each agent page has Instructions, Routines, Cron, and Skills tabs. Skills can be written in the form or uploaded as `SKILL.md` or a zip that contains one. The built-in PingOne skill is admin-only. Enterprise policy stays read-only on every agent. Group rooms choose from the same agent list.
+`config/enterprise.example.json` holds the tenant, token-exchange audiences, Protect policy, access and Authorize settings, locked enterprise instructions, the starting agents, rooms, MCP servers, routines, and provider defaults. `mcpServers` accepts the existing `transport` / `command` / `url` / `audience` shape and a Goose-style shape (`type` of `stdio`, `streamable_http`, or legacy `sse`, plus `cmd`, `uri`, `headers`, `env_keys`, `timeout`, `enabled`, and `description`). An `envs` object of values is refused. Environment values from the add dialog are stored with `safeStorage` under `mcp-env:<id>:<NAME>` and are not written to `enterprise.json`. Audience and scope stay on the row when the dialog omits them, so a server that already exchanges a token keeps doing that. The Extensions screen does not ask for an audience. After the first run, agents, their instructions, their routines, and their skills are edited in the Agents view. The branding agent (the sample theme's `agentName`) is created on first launch. Existing global instruction layers and routines are moved onto that agent. Each agent page has Instructions, Routines, Cron, and Skills tabs. Skills can be written in the form or uploaded as `SKILL.md` or a zip that contains one. The built-in PingOne skill is admin-only. Enterprise policy stays read-only on every agent. Group rooms choose from the same agent list.
 
 `access.adminGroup` defaults to `Administrator`. `access.groupsClaim` defaults to `groups`. `authorize.decisionEndpointId` is empty until a PingOne decision endpoint is ready. `authorize.cacheMs` defaults to 30000. `authorize.mcpServerId` defaults to `pingone`.
 
@@ -257,7 +257,7 @@ pi.flow actions are `POST`ed to the `_links` href for that action. When the stat
 
 Store the client id in `PINGONE_WORKER_CLIENT_ID` and the secret in `PINGONE_WORKER_CLIENT_SECRET` (or paste the secret in Settings). Client credentials mint the worker token used as the bearer on Protect, on PingOne Authorize policy and decision calls, and on the PingOne MCP server. Those calls do not use token exchange. The token request authenticates with HTTP Basic (`client_secret_basic`): `Authorization: Basic` plus a body of `grant_type=client_credentials` only. Putting `client_id` or `client_secret` in that body returns `Unsupported authentication method` on a worker app that requires Basic. This application does not need the Token Exchange grant. Sending its credentials to the token endpoint returns `Unsupported grant type`.
 
-Other MCP servers still exchange a token on the AI Agent application. Add the PingOne MCP server in Tools with the id in `authorize.mcpServerId` (default `pingone`). Leave its audience empty so the app attaches the worker token. Do not put the worker secret in `enterprise.json`.
+Other MCP servers exchange a token on the AI Agent application only when an audience is configured. Add the PingOne MCP server in Extensions with the id in `authorize.mcpServerId` (default `pingone`). Leave its audience empty so the app attaches the worker token. Do not put the worker secret in `enterprise.json`. HTTP extensions with no audience use MCP OAuth instead, and that flow has no fields on the add dialog.
 
 ### 3. AI Agent application (token exchange)
 
@@ -288,7 +288,7 @@ PINGONE_AGENT_CLIENT_SECRET=<AI Agent application secret>
 
 ### 4. Custom resources (audiences)
 
-For each MCP server or downstream API that should receive an exchanged token:
+For each MCP server or downstream API that should receive an exchanged token. Extensions added in the dialog do not need an audience; leave this section for servers that must keep token exchange:
 
 - Create a custom resource. The audience URL must not contain `pingone` or `pingidentity`.
 - Grant the **AI Agent** application that resource and the scopes the server expects. The Protect worker does not need these grants.
@@ -399,7 +399,7 @@ Each agent has a Skills tab. A skill is a name, description, instructions, optio
 - RFC 8693 exchange on the AI Agent client, with the user access token as `subject_token` and the agent's cached client-credentials token as `actor_token`. Worker credentials remain the fallback for exchange. The LangGraph tool node exchanges the audience token and injects it into the MCP call. The PingOne MCP server and Authorize use the worker client-credentials token instead of an exchanged token.
 - Protect evaluation client, reason extraction, policy engine, and risk text in the system prompt.
 - Group claim `groups` (configurable), admin gate defaulting to `Administrator`, skills upload, the built-in PingOne skill (including the bundled PingOne Authorize guide and on-demand references), and the Policy tab. Authorize decisions can turn the Policy tab, PingOne tools, MCP writes, and chat on or off, and fail closed when the decision endpoint cannot be reached.
-- MCP stdio, Streamable HTTP, and SSE fallback. Server management UI. Per-tool allow once / always / deny. Tool cards in the transcript.
+- MCP stdio, Streamable HTTP, and SSE fallback. Extensions use a Goose-style add dialog (name, type, description, endpoint or command, timeout, headers, and keychain environment variables) and cards with an enable switch, edit, and delete. Per-tool allow once / always / deny. Tool cards in the transcript. HTTP extensions without an audience sign in with MCP authorization (RFC 9728 protected resource metadata, RFC 8414 or OpenID discovery, dynamic client registration or a client ID metadata document, authorization code and PKCE S256 on a loopback redirect, refresh, and insufficient_scope step-up). Tokens and client secrets stay in the keychain. The card shows Needs sign-in, then connected, plus a sign-out control and a debug trace with secrets redacted. stdio launched from the macOS GUI gets the usual Homebrew and user bin directories on `PATH`.
 - LangGraph.js turns for chat, group rooms, and routines. Streaming still feeds the Thinking panel, live tool status, and stop that keeps the partial answer. `provider.showReasoning` (default true) hides reasoning for an enterprise policy. Chats can be deleted from the list or the open chat. Deleting a room's history leaves the room, its agents, instructions, and routines in place.
 - Layered instructions. The enterprise layer is read-only in the UI. Persona resets to the branding file. The user layer is editable.
 - Group rooms as one turn-taking LangGraph over each member, room instructions, routines, and cron while the window is open, with run history. A SQLite checkpointer stores the thread so an approval interrupt can resume.
@@ -414,7 +414,7 @@ Each agent has a Skills tab. A skill is a name, description, instructions, optio
 - Group chat fan-out, @mentions, and debate. Replies are sequential.
 - Routines while the app is closed.
 - Conversation search, export, rename, and delete.
-- MCP resources, prompts, sampling, and elicitation. Remote MCP OAuth is not implemented; HTTP servers get the exchanged PingOne token only.
+- MCP resources, prompts, sampling, and elicitation. HTTP extensions without an audience use MCP authorization; an audience in config still selects PingOne token exchange, and the PingOne server still uses the worker token.
 - Tool-result streaming.
 - Encryption of conversation rows at rest. Tokens are encrypted; message text is not.
 - A Protect risk-policy editor. That policy is still JSON. Authorize enforcement is the Policy tab.
@@ -435,7 +435,7 @@ Each agent has a Skills tab. A skill is a name, description, instructions, optio
 7. Run group turns in parallel, with @mentions.
 8. Run due routines after the app launches, and document a signed-in background helper for when it is closed.
 9. Encrypt conversation content at rest with the same keychain key.
-10. MCP resources, prompts, and sampling, plus remote MCP OAuth distinct from PingOne token exchange.
+10. MCP resources, prompts, and sampling. Remote MCP authorization is implemented for HTTP extensions that have no audience.
 11. Conversation search, rename, delete, and export.
 12. Replace the fixed loopback port with a registered deep link.
 13. Add a UI test pass for login scenarios, approval, and rooms.

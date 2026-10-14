@@ -164,8 +164,39 @@ button.nav.selected, button.list-item.selected { background: rgba(255, 255, 255,
 .tool-card header { display: flex; justify-content: space-between; text-transform: none; letter-spacing: 0; }
 .tool-card.denied { border-left-color: var(--danger); }
 .tool-card pre, .args { white-space: pre-wrap; background: var(--code); color: var(--paper); padding: 10px; border-radius: 8px; }
-.modal-backdrop { position: fixed; inset: 0; background: rgba(28, 25, 21, 0.45); display: grid; place-items: center; }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(28, 25, 21, 0.45); display: grid; place-items: center; z-index: 20; }
 .modal { width: min(520px, calc(100% - 32px)); background: white; border-radius: 18px; padding: 22px; display: flex; flex-direction: column; gap: 10px; }
+.extension-dialog { width: min(720px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; gap: 14px; }
+.extension-page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
+.extension-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.extension-row { display: grid; grid-template-columns: 1.4fr 0.8fr; gap: 12px; }
+.extension-dialog hr { border: 0; border-top: 1px solid var(--line); margin: 2px 0; width: 100%; }
+.extension-add { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; }
+.extension-footer { display: flex; justify-content: flex-end; gap: 8px; }
+.extension-card header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.icon-button { width: 36px; height: 36px; padding: 0; border-radius: 999px; }
+.kv-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.kv-list li { display: flex; justify-content: space-between; gap: 8px; align-items: center; background: var(--paper); border-radius: 10px; padding: 6px 10px; }
+.oauth-debug { border-top: 1px solid var(--line); padding-top: 8px; }
+.oauth-debug summary { cursor: pointer; }
+.oauth-debug ol { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 8px; }
+.oauth-step { font-size: 12px; }
+.oauth-step p { margin-top: 2px; }
+.oauth-step.bad { color: var(--danger); }
+.switch { position: relative; width: 42px; height: 24px; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+.switch span {
+  position: absolute; inset: 0; border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 18%, var(--paper));
+}
+.switch span::after {
+  content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
+  background: white; border-radius: 50%; transition: transform 0.15s ease;
+}
+.switch input:checked + span { background: var(--accent); }
+.switch input:checked + span::after { transform: translateX(18px); }
+.switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+.status.needs-sign-in { background: #fff4e8; color: var(--accent); }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin: 16px 0; }
 .card { background: white; border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
 .card.locked textarea { background: #f3eee6; }
