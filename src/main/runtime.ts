@@ -26,7 +26,7 @@ import {
   type AuthorizePolicy,
   type DecisionInput,
 } from '@shared/authorize/policy';
-import { createRemotePolicy, listRemotePolicies, postDecision, setRemotePolicyEnabled } from '@shared/authorize/remote';
+import { AuthorizeClient, listRemotePolicies, postDecision, setRemotePolicyEnabled, syncRemoteScaffold } from '@shared/authorize/remote';
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
 import { PINGONE_SKILL_ID, pingoneSkillInstructions, type SkillDraft } from '@shared/skills/markdown';
 import { toolKey } from '@shared/mcp/approvals';
@@ -157,6 +157,7 @@ export class Runtime {
   private readonly hub: McpHub;
   private readonly checkpointer: NodeSqliteSaver;
   private readonly agentGraph: AgentGraph;
+  private readonly authorize: AuthorizeClient;
   private firing = false;
   private activeTurn: AbortController | null = null;
   private activeConversationId = '';
@@ -174,6 +175,7 @@ export class Runtime {
     this.hub = new McpHub({ name: options.branding.appName, version: options.version ?? '0.1.0' });
     this.checkpointer = openCheckpointer(options.checkpointPath ?? join(options.attachmentsDir, 'langgraph.sqlite'));
     this.agentGraph = compileAgentGraph(this.checkpointer);
+    this.authorize = new AuthorizeClient({ fetchImpl: options.fetchImpl, now: options.now });
   }
 
   static async create(options: RuntimeOptions): Promise<Runtime> {
@@ -595,21 +597,11 @@ export class Runtime {
   async scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult> {
     this.requirePolicy();
     const incoming = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '');
-    const existing = this.options.db.listPolicies();
-    const merged = mergeScaffold(existing, incoming);
-    const preview = incoming.map(policyView);
-    if (!confirm) return { preview, created: [], policies: existing.map(policyView) };
-    for (const policy of merged.created) this.options.db.upsertPolicy(policy);
-    if (this.options.config.tenant.mode === 'pingone') {
-      const pending = this.options.db.listPolicies().filter((policy) => policy.scaffold && !policy.remoteId);
-      await this.pushScaffold(pending);
+    if (!confirm) {
+      const existing = this.options.db.listPolicies();
+      return { preview: incoming.map(policyView), created: [], policies: existing.map(policyView) };
     }
-    if (merged.created.length > 0) {
-      this.audit(null, 'policy:scaffold', merged.created.map((policy) => policy.name).join(', '));
-    }
-    this.decisionCache = null;
-    await this.refreshFeatures();
-    return { preview, created: merged.created.map(policyView), policies: this.options.db.listPolicies().map(policyView) };
+    return this.authorize.run(() => this.confirmScaffold(incoming));
   }
 
   async setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]> {
@@ -619,7 +611,7 @@ export class Runtime {
     const next = { ...policy, enabled, updatedAt: this.now(), updatedBy: this.session?.username ?? null };
     if (this.options.config.tenant.mode === 'pingone' && next.remoteId) {
       const token = await this.workerAccessToken();
-      await setRemotePolicyEnabled(this.options.config, token, next.remoteId, enabled, this.options.fetchImpl ?? fetch);
+      await setRemotePolicyEnabled(this.options.config, token, next.remoteId, enabled, this.authorize);
     }
     this.options.db.upsertPolicy(next);
     this.audit(null, 'policy:enforcement', `${next.name} ${enabled ? 'enabled' : 'disabled'}`);
@@ -1363,7 +1355,7 @@ export class Runtime {
 
   private async pullRemotePolicies(): Promise<void> {
     const token = await this.workerAccessToken();
-    const remote = await listRemotePolicies(this.options.config, token, this.options.fetchImpl ?? fetch);
+    const remote = await listRemotePolicies(this.options.config, token, this.authorize);
     const local = this.options.db.listPolicies();
     for (const item of remote) {
       const marker = parseScaffoldMarker(item.description);
@@ -1394,16 +1386,29 @@ export class Runtime {
     }
   }
 
-  private async pushScaffold(created: AuthorizePolicy[]): Promise<void> {
-    if (created.length === 0) return;
-    const token = await this.workerAccessToken();
-    const fetchImpl = this.options.fetchImpl ?? fetch;
-    const remote = await listRemotePolicies(this.options.config, token, fetchImpl);
-    for (const policy of created) {
-      const existing = remote.find((item) => item.name === policy.name || item.description.includes(policy.id));
-      const remoteId = existing ? existing.id : await createRemotePolicy(this.options.config, token, policy, fetchImpl);
-      this.options.db.upsertPolicy({ ...policy, remoteId });
+  private async confirmScaffold(incoming: AuthorizePolicy[]): Promise<PolicyScaffoldResult> {
+    const existing = this.options.db.listPolicies();
+    const merged = mergeScaffold(existing, incoming);
+    const preview = incoming.map(policyView);
+    for (const policy of merged.created) this.options.db.upsertPolicy(policy);
+    const pending = this.options.db.listPolicies().filter((policy) => policy.scaffold && !policy.remoteId);
+    const posted = await this.pushScaffold(pending);
+    const created = posted.length > 0 ? posted : merged.created;
+    if (created.length > 0) {
+      this.audit(null, 'policy:scaffold', created.map((policy) => policy.name).join(', '));
     }
+    this.decisionCache = null;
+    await this.refreshFeatures();
+    return { preview, created: created.map(policyView), policies: this.options.db.listPolicies().map(policyView) };
+  }
+
+  private async pushScaffold(pending: AuthorizePolicy[]): Promise<AuthorizePolicy[]> {
+    if (pending.length === 0 || this.options.config.tenant.mode !== 'pingone') return [];
+    const token = await this.workerAccessToken();
+    const synced = await syncRemoteScaffold(this.options.config, token, pending, this.authorize, (policy) => {
+      this.options.db.upsertPolicy(policy);
+    });
+    return synced.created;
   }
 
   private async refreshFeatures(): Promise<void> {
@@ -1432,7 +1437,7 @@ export class Runtime {
         this.options.config,
         token,
         { ...input, userId: this.session.userId, username: this.session.username },
-        this.options.fetchImpl ?? fetch,
+        this.authorize,
       );
       const remote = featuresFromAuthorize(body, this.now());
       this.features = remote ?? local;

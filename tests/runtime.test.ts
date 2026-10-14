@@ -801,6 +801,57 @@ describe('pi.flow runtime', () => {
     await expect(runtime.connectMcp('pingone')).rejects.toThrow(/turned PingOne tools off/);
   });
 
+  it('retries a rate-limited scaffold and does not create the same policies again', async () => {
+    const remote: { id: string; name: string; description: string; enabled: boolean }[] = [];
+    const posts: string[] = [];
+    let limited = true;
+    const secrets = new MemorySecretStore();
+    await secrets.set('workerClientSecret', 'worker-secret');
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+      },
+      async (url, init) => {
+        const target = String(url);
+        const method = init?.method ?? 'GET';
+        const bodyText = String(init?.body ?? '');
+        if (target.includes('/authorizationPolicies') && method === 'GET') {
+          return json(200, { _embedded: { authorizationPolicies: remote } });
+        }
+        if (target.includes('/authorizationPolicies') && method === 'POST') {
+          const body = JSON.parse(bodyText) as { name: string; description: string };
+          if (limited) {
+            limited = false;
+            return new Response(JSON.stringify({ code: 'REQUEST_LIMITED' }), {
+              status: 429,
+              headers: { 'content-type': 'application/json', 'retry-after': '0' },
+            });
+          }
+          if (remote.some((item) => item.name === body.name)) return json(409, { message: 'duplicate' });
+          const id = `policy-${remote.length + 1}`;
+          remote.push({ id, name: body.name, description: body.description, enabled: true });
+          posts.push(body.name);
+          return json(201, { id });
+        }
+        if (target.includes('/as/token') && bodyText.includes('client_credentials')) {
+          return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        }
+        return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+      },
+      secrets,
+      { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+    );
+    await runtime.submitCredentials('ada', 'secret', '');
+    const [first, overlapping] = await Promise.all([runtime.scaffoldPolicies(true), runtime.scaffoldPolicies(true)]);
+    expect(posts).toHaveLength(4);
+    expect(first.created.length + overlapping.created.length).toBe(4);
+    const again = await runtime.scaffoldPolicies(true);
+    expect(again.created).toEqual([]);
+    expect(posts).toHaveLength(4);
+  });
+
   it('reports an external identity provider instead of posting usernamePassword.check', async () => {
     const posted: string[] = [];
     const fetchImpl: typeof fetch = async (url, init) => {

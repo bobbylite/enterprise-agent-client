@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AppState, AuditView, PolicyView } from '@shared/types';
 
 export function PolicyScreen({ onState }: { onState: (state: AppState) => void }) {
@@ -8,6 +8,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
 
   async function load(): Promise<void> {
     const [nextPolicies, nextAudit, nextState] = await Promise.all([
@@ -27,6 +28,8 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
   }, []);
 
   async function run(action: () => Promise<void>): Promise<void> {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError('');
     try {
@@ -34,6 +37,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
@@ -111,9 +115,9 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
                 })
               }
             >
-              Confirm scaffold
+              {busy ? 'Scaffolding…' : 'Confirm scaffold'}
             </button>
-            <button type="button" className="ghost" onClick={() => setPreview(null)}>
+            <button type="button" className="ghost" disabled={busy} onClick={() => setPreview(null)}>
               Cancel
             </button>
           </div>
