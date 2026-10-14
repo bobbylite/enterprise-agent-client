@@ -8,6 +8,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  const [enforcement, setEnforcement] = useState<{ policy: PolicyView; enabled: boolean } | null>(null);
   const busyRef = useRef(false);
 
   async function load(): Promise<void> {
@@ -26,6 +27,15 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
     // Load the policy list once when the tab opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!enforcement) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setEnforcement(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [enforcement]);
 
   async function run(action: () => Promise<void>): Promise<void> {
     if (busyRef.current) return;
@@ -134,22 +144,16 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
               {policy.updatedAt ? ` · ${new Date(policy.updatedAt).toLocaleString()}` : ''}
               {policy.updatedBy ? ` · ${policy.updatedBy}` : ''}
             </p>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => {
-                const next = !policy.enabled;
-                if (!window.confirm(`${next ? 'Enable' : 'Disable'} enforcement for ${policy.name}?`)) return;
-                void run(async () => {
-                  setPolicies(await window.agent.setPolicyEnabled(policy.id, next));
-                  setAudit(await window.agent.listAudit());
-                  onState(await window.agent.getState());
-                  setNotice(`${policy.name} is now ${next ? 'enabled' : 'disabled'}.`);
-                });
-              }}
-            >
-              {policy.enabled ? 'Turn enforcement off' : 'Turn enforcement on'}
-            </button>
+            <div className="row">
+              <button
+                type="button"
+                className={policy.enabled ? 'danger' : 'primary'}
+                disabled={busy}
+                onClick={() => setEnforcement({ policy, enabled: !policy.enabled })}
+              >
+                {policy.enabled ? 'Turn enforcement off' : 'Turn enforcement on'}
+              </button>
+            </div>
           </article>
         ))}
       </div>
@@ -169,6 +173,40 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
           ))}
         </ul>
       </section>
+      {enforcement ? (
+        <div className="modal-backdrop" role="presentation">
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="policy-confirm-title">
+            <p className="eyebrow">Policy</p>
+            <h2 id="policy-confirm-title">{enforcement.enabled ? 'Enable enforcement' : 'Disable enforcement'}</h2>
+            <p>
+              {enforcement.enabled ? 'Enable' : 'Disable'} enforcement for {enforcement.policy.name}?
+            </p>
+            <div className="row">
+              <button type="button" className="ghost" disabled={busy} onClick={() => setEnforcement(null)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={enforcement.enabled ? 'primary' : 'danger'}
+                disabled={busy}
+                autoFocus
+                onClick={() => {
+                  const { policy, enabled } = enforcement;
+                  setEnforcement(null);
+                  void run(async () => {
+                    setPolicies(await window.agent.setPolicyEnabled(policy.id, enabled));
+                    setAudit(await window.agent.listAudit());
+                    onState(await window.agent.getState());
+                    setNotice(`${policy.name} is now ${enabled ? 'enabled' : 'disabled'}.`);
+                  });
+                }}
+              >
+                {enforcement.enabled ? 'Turn enforcement on' : 'Turn enforcement off'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
