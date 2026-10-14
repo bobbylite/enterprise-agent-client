@@ -21,6 +21,7 @@ import {
   featuresFromAuthorize,
   mergeScaffold,
   parseScaffoldMarker,
+  reconcilePolicyCache,
   scaffoldPolicies,
   SCAFFOLD_MARKER,
   type AuthorizePolicy,
@@ -604,9 +605,24 @@ export class Runtime {
 
   async refreshPolicies(): Promise<PolicyView[]> {
     this.requirePolicy();
-    if (this.options.config.tenant.mode === 'pingone') await this.pullRemotePolicies();
-    await this.refreshFeatures();
+    if (this.options.config.tenant.mode === 'pingone') {
+      await this.authorize.run(() =>
+        this.confirmScaffold(scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '')),
+      );
+    } else {
+      await this.refreshFeatures();
+    }
     return this.listPolicies();
+  }
+
+  async resetPolicyCache(): Promise<PolicyView[]> {
+    this.requirePolicy();
+    const removed = this.options.db.listPolicies();
+    for (const policy of removed) this.options.db.deletePolicy(policy.id);
+    this.audit(null, 'policy:reset-cache', removed.map((policy) => policy.name).join(', ') || 'empty');
+    this.decisionCache = null;
+    await this.refreshFeatures();
+    return [];
   }
 
   async scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult> {
@@ -1408,6 +1424,9 @@ export class Runtime {
   private async pullRemotePolicies(): Promise<void> {
     const token = await this.workerAccessToken();
     const remote = await listRemotePolicies(this.options.config, token, this.authorize);
+    const starters = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '');
+    const { dropIds } = reconcilePolicyCache(this.options.db.listPolicies(), remote, starters);
+    for (const id of dropIds) this.options.db.deletePolicy(id);
     const local = this.options.db.listPolicies();
     for (const item of remote) {
       const marker = parseScaffoldMarker(item.description);
@@ -1439,6 +1458,7 @@ export class Runtime {
   }
 
   private async confirmScaffold(incoming: AuthorizePolicy[]): Promise<PolicyScaffoldResult> {
+    if (this.options.config.tenant.mode === 'pingone') await this.pullRemotePolicies();
     const existing = this.options.db.listPolicies();
     const merged = mergeScaffold(existing, incoming);
     const preview = incoming.map(policyView);

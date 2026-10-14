@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { groupsFromClaims, isAdmin } from '../src/shared/access/groups';
-import { evaluatePolicies, failClosed, featuresFromAuthorize, mergeScaffold, scaffoldPolicies } from '../src/shared/authorize/policy';
+import { evaluatePolicies, failClosed, featuresFromAuthorize, mergeScaffold, reconcilePolicyCache, scaffoldPolicies, SCAFFOLD_MARKER } from '../src/shared/authorize/policy';
 import { parseEnterpriseConfig } from '../src/shared/config';
 import { skillFromUpload, zipStore } from '../src/main/skill-files';
 import { parseSkillMarkdown } from '../src/shared/skills/markdown';
@@ -56,6 +56,49 @@ describe('groups and authorize', () => {
       )?.policyTab,
     ).toBe(true);
     expect(featuresFromAuthorize({ decision: 'PERMIT', statements: [] }, 7)).toBeNull();
+  });
+
+  it('drops local scaffold rows that PingOne no longer lists and marks those starters missing', () => {
+    const starters = scaffoldPolicies('Administrator', 10, 'ada');
+    const listed = (policy: (typeof starters)[number], remoteId: string) => ({
+      id: remoteId,
+      name: policy.name,
+      description: `${policy.description}\n\n${SCAFFOLD_MARKER}\n${JSON.stringify({ id: policy.id, when: policy.when, effect: policy.effect })}`,
+      enabled: true,
+      updatedAt: 10,
+    });
+    const local = starters.map((policy, index) => ({ ...policy, remoteId: `policy-${index + 1}` }));
+    const gone = reconcilePolicyCache(local, [], starters);
+    expect(gone.dropIds).toEqual(starters.map((policy) => policy.id));
+    expect(gone.missing.map((policy) => policy.id)).toEqual(starters.map((policy) => policy.id));
+
+    const session = starters[0];
+    const admin = starters[1];
+    if (!session || !admin) throw new Error('missing starters');
+    const partial = reconcilePolicyCache(
+      [
+        ...local,
+        {
+          ...session,
+          id: 'custom-local',
+          name: 'Custom',
+          scaffold: false,
+          remoteId: 'custom-old',
+          description: 'A policy that used to live in PingOne.',
+        },
+      ],
+      [listed(session, 'policy-1'), listed(admin, 'policy-9')],
+      starters,
+    );
+    expect(partial.dropIds).toEqual(['enterprise-agent:read-only', 'enterprise-agent:high-risk', 'custom-local']);
+    expect(partial.missing.map((policy) => policy.id)).toEqual(['enterprise-agent:read-only', 'enterprise-agent:high-risk']);
+    const kept = reconcilePolicyCache(
+      [{ ...session, remoteId: 'policy-1' }],
+      [{ ...listed(session, 'policy-1'), name: 'Renamed in PingOne' }],
+      starters,
+    );
+    expect(kept.dropIds).toEqual([]);
+    expect(kept.missing.map((policy) => policy.id)).not.toContain(session.id);
   });
 
   it('reads SKILL.md from a zip', () => {

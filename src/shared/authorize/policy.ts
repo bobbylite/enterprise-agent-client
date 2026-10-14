@@ -120,6 +120,46 @@ export function mergeScaffold(existing: AuthorizePolicy[], incoming: AuthorizePo
   return { policies: [...existing, ...created], created };
 }
 
+export interface ListedAuthorizationPolicy {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  updatedAt: number | null;
+}
+
+export function remoteOwnsStarter(
+  remote: { name: string; description: string },
+  starter: { id: string; name: string },
+): boolean {
+  const marker = parseScaffoldMarker(remote.description);
+  if (marker?.id === starter.id) return true;
+  if (!remote.description.includes(SCAFFOLD_MARKER)) return false;
+  return remote.description.includes(starter.id) || remote.name === starter.name;
+}
+
+export function reconcilePolicyCache(
+  local: AuthorizePolicy[],
+  remote: ListedAuthorizationPolicy[],
+  starters: AuthorizePolicy[],
+): { dropIds: string[]; missing: AuthorizePolicy[] } {
+  const remoteIds = new Set(remote.map((item) => item.id).filter((id) => id.length > 0));
+  const dropIds = local
+    .filter((policy) => {
+      const liveById = policy.remoteId ? remoteIds.has(policy.remoteId) : false;
+      const liveByMarker = remote.some((item) => remoteOwnsStarter(item, policy));
+      if (isScaffoldRow(policy)) return !liveById && !liveByMarker;
+      return Boolean(policy.remoteId) && !liveById;
+    })
+    .map((policy) => policy.id);
+  const missing = starters.filter((starter) => !remote.some((item) => remoteOwnsStarter(item, starter)));
+  return { dropIds, missing };
+}
+
+function isScaffoldRow(policy: AuthorizePolicy): boolean {
+  return policy.scaffold || policy.id.startsWith('enterprise-agent:') || policy.description.includes(SCAFFOLD_MARKER);
+}
+
 const SCAFFOLD_RANK = [
   'enterprise-agent:session',
   'enterprise-agent:admin',

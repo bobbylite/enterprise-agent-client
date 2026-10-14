@@ -80,6 +80,7 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
   handle(Ipc.listPolicies, () => runtime.listPolicies());
   handle(Ipc.refreshPolicies, () => runtime.refreshPolicies());
   handle(Ipc.scaffoldPolicies, (confirm: boolean) => runtime.scaffoldPolicies(confirm));
+  handle(Ipc.resetPolicyCache, () => runtime.resetPolicyCache());
   handle(Ipc.setPolicyEnabled, (id: string, enabled: boolean) => runtime.setPolicyEnabled(id, enabled));
   handle(Ipc.listAudit, () => runtime.listAudit());
 }
