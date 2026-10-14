@@ -37,6 +37,7 @@ import {
   readSkillReferenceFile,
   resolveSkillBundle,
   skillReferenceDenied,
+  skillReferenceToolFields,
   SKILL_REFERENCE_SERVER_ID,
   SKILL_REFERENCE_TOOL,
   type SkillBundle,
@@ -1231,28 +1232,21 @@ export class Runtime {
   }
 
   private skillReferenceTool(): RuntimeTool {
+    const fields = skillReferenceToolFields(this.pingoneBundle?.files ?? []);
     return {
       key: toolKey(SKILL_REFERENCE_SERVER_ID, SKILL_REFERENCE_TOOL),
       serverId: SKILL_REFERENCE_SERVER_ID,
       serverName: 'PingOne skill',
       name: SKILL_REFERENCE_TOOL,
-      description:
-        'Read one file from the built-in PingOne Authorize skill. Call this before any PingOne MCP tool that lists or changes Authorize policies, attributes, statements, or decision endpoints. Returns the file as text and does not run scripts.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          name: {
-            type: 'string',
-            description: 'Relative path such as references/ea-api-operational-quirks.md or scripts/walk_policy_tree.py',
-          },
-        },
-        required: ['name'],
-      },
+      description: fields.description,
+      inputSchema: fields.inputSchema,
       readOnlyHint: true,
+      ...(fields.strict ? { strict: true } : {}),
     };
   }
 
   private readSkillReference(args: unknown): string {
+    if (process.env.AGENT_DEBUG === '1') console.error(`[agent] read_skill_reference args ${JSON.stringify(args)}`);
     if (!this.pingoneBundle) throw new Error('The PingOne Authorize skill bundle is not installed.');
     const name = args && typeof args === 'object' && 'name' in args && typeof args.name === 'string' ? args.name : '';
     return readSkillReferenceFile(this.pingoneBundle.root, name);
