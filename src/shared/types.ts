@@ -460,6 +460,9 @@ export interface InspectedToken {
 export interface AgentBridge {
   getBranding(): Promise<Branding>;
   getState(): Promise<AppState>;
+  onAppState(listener: (state: AppState) => void): () => void;
+  onCollectSignals(listener: () => void): () => void;
+  provideSignals(signals: string): Promise<void>;
   submitCredentials(username: string, password: string, signals: string): Promise<AppState>;
   submitOtp(otp: string, signals: string): Promise<AppState>;
   selectDevice(deviceId: string, signals: string): Promise<AppState>;

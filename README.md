@@ -87,7 +87,7 @@ Sign-in, in order:
 
 1. The login screen collects a username and password and, in real PingOne mode, Protect Signals data.
 2. Preferred login is redirectionless **pi.flow** (`response_mode=pi.flow`) with authorization code and PKCE (S256). The system browser plus a `127.0.0.1` loopback redirect is a configurable fallback.
-3. Protect runs a risk evaluation before the session is stored. Policy maps the level and reason codes to one action: allow, step-up MFA, restrict tools, read-only, or block. The most restrictive matching action wins.
+3. Protect runs a risk evaluation before the session is stored. Policy maps the level and reason codes to one action: allow, step-up MFA, restrict tools, read-only, or block. The most restrictive matching action wins. After sign-in, Protect is polled again on `protect.pollIntervalSeconds` (default 30; `0` turns polling off). Each result updates the risk indicator, the Protect action on the next turn, and the Authorize decision when the level changes.
 4. A blocked result never stores a session. Step-up restarts the flow with `acr_values` when that value is configured. Mock mode accepts any 6-digit one-time code for the new-device scenario.
 5. The user token is stored in the keychain. If a refresh token exists, expiry refreshes it. Otherwise the user signs in again.
 6. The AI Agent application mints its own access token with client credentials. That token is cached until it expires. Each configured audience is then exchanged (RFC 8693) on the same AI Agent client: the user's access token is the `subject_token`, and the agent token is the `actor_token`. Exchange runs only for an MCP server that has an audience. HTTP and SSE receive that token through the client auth provider, and stdio receives it as `MCP_ACCESS_TOKEN`. An HTTP extension with no audience does not exchange a token; its card stays on Needs sign-in until MCP authorization completes.
@@ -337,7 +337,9 @@ IP handling: the example config sets `protect.resolvePublicIp` to `true`. The ma
 
 Map levels and reason codes in `protect.policy`. Levels are `LOW`, `MEDIUM`, `HIGH`, and `UNKNOWN` (default `restrict_tools` when the key is omitted). Reason codes the policy understands: `NEW_DEVICE`, `ANOMALOUS_LOCATION`, `IMPOSSIBLE_TRAVEL`, `BOT`, `ANONYMOUS_NETWORK`. Unknown predictor output is still shown to the user and the agent.
 
-The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-security policy allows the regional PingOne app, auth, and API hosts plus `api.ipify.org`.
+The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-security policy allows the regional PingOne app, auth, and API hosts plus `api.ipify.org`. Each poll asks the window for a fresh Signals payload and keeps the sign-in payload when the window cannot collect one.
+
+`protect.pollIntervalSeconds` is how often a signed-in session is scored again. The default is 30. `0` scores only at sign-in. The process re-reads this value, and `protect.pauseWhenHidden`, from `enterprise.json` when the file changes, so an edit applies without a restart. Polls never overlap. A `429` with `REQUEST_LIMITED` keeps the last level and waits until both the interval and the `Retry-After` header have elapsed. Other transient failures (network errors and HTTP 5xx) also keep the last level. If Protect still cannot score the session, the `UNKNOWN` action applies, which is the existing fail-closed result. Polling stops on sign-out, quit, and access-token expiry. `protect.pauseWhenHidden` skips a poll while the window is hidden or the machine is suspended, and runs one when it becomes active again. Mock mode does not call PingOne: each poll, and a scenario change on the sign-in screen, re-applies the selected scenario so the indicator and the Authorize gates move with it. Keep the interval at 30 seconds or more. A shorter interval multiplies risk-evaluation calls by the number of signed-in clients and is what trips Protect `REQUEST_LIMITED`.
 
 ### 7. Groups claim and the Policy tab
 
@@ -397,7 +399,7 @@ Each agent has a Skills tab. A skill is a name, description, instructions, optio
 - Mock PingOne sign-in with the five risk scenarios, plus the real pi.flow and loopback clients.
 - Keychain session storage, refresh when a refresh token exists, re-auth otherwise.
 - RFC 8693 exchange on the AI Agent client, with the user access token as `subject_token` and the agent's cached client-credentials token as `actor_token`. Worker credentials remain the fallback for exchange. The LangGraph tool node exchanges the audience token and injects it into the MCP call. The PingOne MCP server and Authorize use the worker client-credentials token instead of an exchanged token.
-- Protect evaluation client, reason extraction, policy engine, and risk text in the system prompt.
+- Protect evaluation client, reason extraction, policy engine, and risk text in the system prompt. After sign-in, risk is polled on `protect.pollIntervalSeconds` and pushed to the risk indicator, the Protect action, and the Authorize gates.
 - Group claim `groups` (configurable), admin gate defaulting to `Administrator`, skills upload, the built-in PingOne skill (including the bundled PingOne Authorize guide and on-demand references), and the Policy tab. Authorize decisions can turn the Policy tab, PingOne tools, MCP writes, and chat on or off, and fail closed when the decision endpoint cannot be reached.
 - MCP stdio, Streamable HTTP, and SSE fallback. Extensions use a Goose-style add dialog (name, type, description, endpoint or command, timeout, headers, and keychain environment variables) and cards with an enable switch, edit, and delete. Per-tool allow once / always / deny. Tool cards in the transcript. HTTP extensions without an audience sign in with MCP authorization (RFC 9728 protected resource metadata, RFC 8414 or OpenID discovery, dynamic client registration or a client ID metadata document, authorization code and PKCE S256 on a loopback redirect, refresh, and insufficient_scope step-up). Tokens and client secrets stay in the keychain. The card shows Needs sign-in, then connected, plus a sign-out control and a debug trace with secrets redacted. stdio launched from the macOS GUI gets the usual Homebrew and user bin directories on `PATH`.
 - LangGraph.js turns for chat, group rooms, and routines. Streaming still feeds the Thinking panel, live tool status, and stop that keeps the partial answer. `provider.showReasoning` (default true) hides reasoning for an enterprise policy. Chats can be deleted from the list or the open chat. Deleting a room's history leaves the room, its agents, instructions, and routines in place.
@@ -409,7 +411,7 @@ Each agent has a Skills tab. A skill is a name, description, instructions, optio
 
 - OS installers, auto-update, and code signing.
 - pi.flow statuses this UI does not complete: FIDO2 assertion, push confirmation, magic link, account recovery, and external identity-provider redirects. Those stop with a message that names the flow status and points at the system browser. Identifier-first policies are handled.
-- Continuous Protect re-evaluation during a session, and richer feedback than the completion-status update.
+- Predictor feedback richer than the completion-status update, and a fresh Protect score on a sensitive tool call. Session polling is `protect.pollIntervalSeconds`.
 - Prompt caching and full vision parity. Anthropic extended thinking and OpenAI reasoning summaries stream into the Thinking panel when `provider.showReasoning` is true.
 - Group chat fan-out, @mentions, and debate. Replies are sequential.
 - Routines while the app is closed.
@@ -428,7 +430,7 @@ Each agent has a Skills tab. A skill is a name, description, instructions, optio
 
 1. Package and sign macOS, Windows, and Linux builds.
 2. Finish the remaining pi.flow statuses and PingOne logout plus refresh-token revoke.
-3. Re-evaluate Protect on a timer and on sensitive tool calls, and send predictor feedback beyond completion status.
+3. Re-evaluate Protect on sensitive tool calls, and send predictor feedback beyond completion status. Post-login polling is `protect.pollIntervalSeconds`.
 4. Verify ID tokens against the environment JWKS.
 5. Let step-up and a tool restriction apply together when policy asks for both.
 6. Use each agent's own provider, and surface that choice in the UI.

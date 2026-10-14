@@ -51,8 +51,9 @@ import {
   SKILL_REFERENCE_TOOL,
   type SkillBundle,
 } from './skill-bundle';
-import { buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
+import { RiskEvaluationError, buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
 import { mockRiskPayload } from '@shared/protect/mock';
+import { classifyProtectPollFailure, nextProtectDelayMs } from '@shared/protect/poll';
 import { decideRisk, summarizeRisk, unscoredRisk } from '@shared/protect/policy';
 import { extractRiskReasons, riskLevel } from '@shared/protect/reasons';
 import { renderRiskContext } from '@shared/protect/context';
@@ -102,6 +103,7 @@ import type {
   InspectedToken,
 } from '@shared/types';
 import { compileAgentGraph, runAgentGraph, type AgentGraph, type GraphParticipant } from './agent-graph';
+import { loadEnterprise } from './load-config';
 import type { RuntimeTool } from './runtime-tool';
 import { openCheckpointer, type NodeSqliteSaver } from './checkpoint-sqlite';
 import { Repository, type AgentRow, type McpServerRow, type SkillRow } from './db';
@@ -146,6 +148,11 @@ export interface RuntimeOptions {
   pickFiles?: () => Promise<PickedFile[]>;
   now?: () => number;
   emit?: (event: ChatEvent) => void;
+  onState?: (state: AppState) => void;
+  collectSignals?: () => Promise<string>;
+  protectActive?: () => boolean;
+  schedule?: (delayMs: number, run: () => Promise<void>) => () => void;
+  configPath?: string;
   mockDelayMs?: number;
   version?: string;
   dev?: boolean;
@@ -187,6 +194,11 @@ export class Runtime {
   private readonly authorize: AuthorizeClient;
   private readonly pingoneBundle: SkillBundle | null;
   private firing = false;
+  private protectCancel: (() => void) | null = null;
+  private protectPollTask: Promise<void> | null = null;
+  private protectQueued = false;
+  private protectGeneration = 0;
+  private protectRetryAfterSeconds: number | null = null;
   private activeTurn: AbortController | null = null;
   private activeConversationId = '';
   private cancelledConversations = new Set<string>();
@@ -236,6 +248,7 @@ export class Runtime {
   }
 
   async dispose(): Promise<void> {
+    this.stopProtectPoll();
     this.browserAbort?.abort();
     await this.hub.disconnectAll();
     this.checkpointer.close();
@@ -247,6 +260,18 @@ export class Runtime {
 
   setEmitter(emit: (event: ChatEvent) => void): void {
     this.options.emit = emit;
+  }
+
+  setStatePublisher(onState: (state: AppState) => void): void {
+    this.options.onState = onState;
+  }
+
+  setSignalCollector(collectSignals: () => Promise<string>): void {
+    this.options.collectSignals = collectSignals;
+  }
+
+  setProtectActive(protectActive: () => boolean): void {
+    this.options.protectActive = protectActive;
   }
 
   private emit(event: ChatEvent): void {
@@ -408,6 +433,7 @@ export class Runtime {
     }
     this.scenario = scenario;
     this.options.db.setSetting('mockScenario', scenario);
+    if (this.session) await this.runProtectPoll(true);
     return this.state();
   }
 
@@ -421,6 +447,7 @@ export class Runtime {
   }
 
   async logout(): Promise<AppState> {
+    this.stopProtectPoll();
     this.session = null;
     this.risk = null;
     this.features = failClosed(this.now());
@@ -1824,6 +1851,154 @@ export class Runtime {
     return this.state();
   }
 
+  reloadProtectSettings(): void {
+    this.syncProtectSettingsFromDisk();
+    if (!this.session) {
+      this.stopProtectPoll();
+      return;
+    }
+    this.scheduleProtectPoll();
+  }
+
+  nudgeProtectPoll(): void {
+    if (!this.session || this.shouldPauseProtect()) return;
+    void this.runProtectPoll(false);
+  }
+
+  private syncProtectSettingsFromDisk(): void {
+    const path = this.options.configPath;
+    if (!path) return;
+    try {
+      const next = loadEnterprise(path);
+      this.options.config.protect.pollIntervalSeconds = next.protect.pollIntervalSeconds;
+      this.options.config.protect.pauseWhenHidden = next.protect.pauseWhenHidden;
+    } catch {
+      // Keep the interval already in memory when the file cannot be read.
+    }
+  }
+
+  private protectIntervalSeconds(): number {
+    return this.options.config.protect.pollIntervalSeconds;
+  }
+
+  private shouldPauseProtect(): boolean {
+    if (!this.options.config.protect.enabled || !this.options.config.protect.pauseWhenHidden) return false;
+    if (!this.options.protectActive) return false;
+    return !this.options.protectActive();
+  }
+
+  private scheduleProtectPoll(): void {
+    this.protectCancel?.();
+    this.protectCancel = null;
+    this.syncProtectSettingsFromDisk();
+    const delay = nextProtectDelayMs(this.protectIntervalSeconds(), this.protectRetryAfterSeconds);
+    this.protectRetryAfterSeconds = null;
+    if (delay == null || !this.session || !this.options.config.protect.enabled) return;
+    const schedule = this.options.schedule ?? defaultProtectSchedule;
+    this.protectCancel = schedule(delay, () => this.runProtectPoll(false));
+  }
+
+  private stopProtectPoll(): void {
+    this.protectGeneration += 1;
+    this.protectQueued = false;
+    this.protectRetryAfterSeconds = null;
+    this.protectCancel?.();
+    this.protectCancel = null;
+  }
+
+  private async runProtectPoll(force: boolean): Promise<void> {
+    if (this.protectPollTask) {
+      this.protectQueued = true;
+      while (this.protectPollTask) await this.protectPollTask;
+      return;
+    }
+    const generation = this.protectGeneration;
+    const task = this.executeProtectPoll(generation, force);
+    this.protectPollTask = task;
+    try {
+      await task;
+    } finally {
+      if (this.protectPollTask === task) this.protectPollTask = null;
+    }
+    if (generation !== this.protectGeneration || !this.session) return;
+    if (this.protectQueued) {
+      this.protectQueued = false;
+      await this.runProtectPoll(false);
+      return;
+    }
+    this.scheduleProtectPoll();
+  }
+
+  private async executeProtectPoll(generation: number, force: boolean): Promise<void> {
+    if (!this.session || !this.options.config.protect.enabled) return;
+    if (!force && nextProtectDelayMs(this.protectIntervalSeconds()) == null) return;
+    if (!(await this.ensureSessionForPoll())) return;
+    if (generation !== this.protectGeneration || !this.session) return;
+    if (!force && this.shouldPauseProtect()) return;
+    const signals = await this.freshSignals();
+    if (generation !== this.protectGeneration || !this.session) return;
+    try {
+      const next = await this.evaluateRisk(this.session.userId, this.session.username, signals);
+      if (generation !== this.protectGeneration || !this.session) return;
+      await this.applyPolledRisk(next);
+    } catch (error) {
+      if (generation !== this.protectGeneration || !this.session) return;
+      const kind = classifyProtectPollFailure(error);
+      if (kind === 'rate-limit') {
+        this.protectRetryAfterSeconds = error instanceof RiskEvaluationError ? error.retryAfterSeconds : null;
+        return;
+      }
+      if (kind === 'transient' && this.risk) return;
+      await this.applyPolledRisk(unscoredRisk(this.options.config.protect.policy, this.now(), Boolean(signals)));
+    }
+  }
+
+  private async ensureSessionForPoll(): Promise<boolean> {
+    if (!this.session) return false;
+    const freshness = classifyAccessToken(this.session, this.now());
+    if (freshness === 'valid') return true;
+    if (freshness === 'refresh') {
+      try {
+        await this.refreshSessionToken();
+        return Boolean(this.session);
+      } catch {
+        this.stopProtectPoll();
+        return false;
+      }
+    }
+    this.stopProtectPoll();
+    return false;
+  }
+
+  private async freshSignals(): Promise<string> {
+    const collect = this.options.collectSignals;
+    if (!collect) return this.pendingSignals;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const next = await Promise.race([
+        collect(),
+        new Promise<string>((resolve) => {
+          timer = setTimeout(() => resolve(''), 4_000);
+        }),
+      ]);
+      if (next) this.pendingSignals = next;
+    } catch {
+      // A signals failure keeps the payload from sign-in.
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return this.pendingSignals;
+  }
+
+  private async applyPolledRisk(next: RiskView): Promise<void> {
+    const levelChanged = this.risk?.level !== next.level;
+    this.risk = next;
+    this.options.db.setSetting('risk', JSON.stringify(next));
+    if (levelChanged) this.decisionCache = null;
+    await this.refreshFeatures();
+    this.options.onState?.(this.state());
+  }
+
   private async evaluateRisk(userId: string, username: string, signals: string): Promise<RiskView> {
     const evaluatedAt = this.now();
     if (!this.options.config.protect.enabled) {
@@ -1906,6 +2081,7 @@ export class Runtime {
     this.flow = null;
     this.stepUpRestarted = false;
     await this.exchangeAudiences();
+    this.scheduleProtectPoll();
   }
 
   private async exchangeAudiences(): Promise<void> {
@@ -2243,6 +2419,7 @@ export class Runtime {
     }
     await this.refreshFeatures();
     await this.exchangeAudiences();
+    this.scheduleProtectPoll();
   }
 
   private async hydrateSecrets(): Promise<void> {
@@ -2574,4 +2751,12 @@ function storedTemperature(stored: string | null, configured: number | undefined
 
 function stringClaim(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+function defaultProtectSchedule(delayMs: number, run: () => Promise<void>): () => void {
+  const timer = setTimeout(() => {
+    void run();
+  }, delayMs);
+  timer.unref();
+  return () => clearTimeout(timer);
 }

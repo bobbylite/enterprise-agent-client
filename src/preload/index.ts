@@ -1,10 +1,21 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import { Ipc } from '@shared/channels';
-import type { AgentBridge, ChatEvent } from '@shared/types';
+import type { AgentBridge, AppState, ChatEvent } from '@shared/types';
 
 const api: AgentBridge = {
   getBranding: () => ipcRenderer.invoke(Ipc.getBranding),
   getState: () => ipcRenderer.invoke(Ipc.getState),
+  onAppState: (listener) => {
+    const wrapped = (_event: IpcRendererEvent, payload: AppState) => listener(payload);
+    ipcRenderer.on(Ipc.appState, wrapped);
+    return () => ipcRenderer.removeListener(Ipc.appState, wrapped);
+  },
+  onCollectSignals: (listener) => {
+    const wrapped = () => listener();
+    ipcRenderer.on(Ipc.collectSignals, wrapped);
+    return () => ipcRenderer.removeListener(Ipc.collectSignals, wrapped);
+  },
+  provideSignals: (signals) => ipcRenderer.invoke(Ipc.provideSignals, signals),
   submitCredentials: (username, password, signals) => ipcRenderer.invoke(Ipc.submitCredentials, username, password, signals),
   submitOtp: (otp, signals) => ipcRenderer.invoke(Ipc.submitOtp, otp, signals),
   selectDevice: (deviceId, signals) => ipcRenderer.invoke(Ipc.selectDevice, deviceId, signals),
