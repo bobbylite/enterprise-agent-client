@@ -99,6 +99,19 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
         >
           Scaffold policy
         </button>
+        <button
+          type="button"
+          className="ghost"
+          disabled={busy}
+          onClick={() =>
+            void run(async () => {
+              const result = await window.agent.dryRunAuthorizePolicy();
+              setNotice(`Dry run wrote the policy tree to ${result.path}. Nothing was written to PingOne.`);
+            })
+          }
+        >
+          Dry run policy tree
+        </button>
         <button type="button" className="ghost" disabled={busy} onClick={() => setResetOpen(true)}>
           Reset local policy cache
         </button>

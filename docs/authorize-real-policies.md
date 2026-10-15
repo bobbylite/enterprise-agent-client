@@ -1,6 +1,6 @@
 # Real PingOne Authorize scaffold
 
-Confirming Scaffold in PingOne mode builds a Trust Framework and two policies. It follows the bundled `pingone-authorize-ea-api-build` skill. Nothing in this repository contains an introspection secret.
+Confirming Scaffold in PingOne mode builds a Trust Framework and the `Enterprise Agent Features` policy. It follows the bundled `pingone-authorize-ea-api-build` skill. Nothing in this repository contains an introspection secret.
 
 ## What Scaffold creates
 
@@ -24,12 +24,16 @@ Two top-level HTTP services, with no parent, POST `{authHost}/{environmentId}/as
 
 Service attributes read `$.active`, `$.groups`, `$.sub`, and for the exchanged token `$.act.sub`, `$.aud`, and `$.scope`. Each processor is named `Extract <attribute>`, for example `Extract introspection-groups`.
 
-The parent policy `Enterprise Agent` uses `DENY_OVERRIDES`. The decision is deny when either child denies. `INDETERMINATE` and `NOT_APPLICABLE` fail closed in the client. The user and delegation policies are created inline in that parent PUT, with `type: POLICY` and no id. An existing top-level policy is not moved. A leftover with the exact name `Enterprise Agent User` or `Enterprise Agent Delegation` is deleted first. The parent read has no expand parameter. It may return each child in full or as `{ type: POLICY, value: { id } }`. Scaffold follows the reference before it checks the names.
+The policy `Enterprise Agent Features` uses `DENY_OVERRIDES`. The decision is deny when either child denies. `INDETERMINATE` and `NOT_APPLICABLE` fail closed in the client. Scaffold writes that policy with one PUT. The body is the whole tree: inline `Enterprise Agent User` and `Enterprise Agent Delegation` children, and each child's rules, conditions, and statements. A new child policy is `type: POLICY` with no id. A new rule is `type: RULE` with no id or version. An existing policy is not moved by copying its id into `children`, and nothing is deleted before that PUT succeeds.
+
+The parent read has no expand parameter. It may return each child in full or as `{ type: POLICY, value: { id } }`. Scaffold follows the reference, then checks the child names and the rule payloads. Only after that fresh GET matches does it delete a leftover whose name is exactly `Enterprise Agent User` or `Enterprise Agent Delegation`, and only when that id is not one of the children just kept. A policy with any other name, including an older `Enterprise Agent` parent, is left in place. If the read-back does not match, Scaffold throws and deletes nothing. The error and `~/Library/Logs/enterprise-agent-client/main.log` include the PUT body, the raw GET, and each child as type, name, id, and value.id.
+
+Dry run writes that same JSON to `authorize-policy-tree.json` in the app's user data folder (`~/Library/Application Support/enterprise-agent-client/` on macOS) and does not create, update, or delete anything in PingOne. Attribute ids that are not in PingOne yet appear as `{{name}}`.
 
 1. **Enterprise Agent User** (`FIRST_APPLICABLE`). High risk, a `block` action, or an inactive access token denies. A `read_only` action permits a read-only feature payload. Membership of `access.adminGroup` in `$.groups` permits the full payload (`CONTAINS`, because a JSONPath filter that matches nobody throws and would stop the chain). An active token permits the session payload. There is no catch-all deny.
 2. **Enterprise Agent Delegation** (`FIRST_APPLICABLE`). `authorize.delegations` is an allowlist of `humanSub`, `agentSub`, and optional `audience` and `scope`. The last rule permits when `tx-active` is `true` and `tx-act-sub` is not empty. `isApproved` is not used.
 
-Rules are a full PUT of the policy, including `id` and `version`, `type: RULE`, and `effectSettings.type` of `UNCONDITIONAL_PERMIT` or `UNCONDITIONAL_DENY`. Each statement is an `EMBEDDED_STATEMENT` with code `enterprise-agent-features`, a static payload, `attributes: []`, and `services: []`. Each write is read back.
+Rules travel in that same parent PUT. `effectSettings.type` is `UNCONDITIONAL_PERMIT` or `UNCONDITIONAL_DENY`. Each statement is an `EMBEDDED_STATEMENT` with code `enterprise-agent-features`, a static payload, `attributes: []`, and `services: []`. The PUT is read back with a new GET. A later run that already finds this tree does not write it again and does not delete leftovers.
 
 Scaffold tags the latest authorization version and sets `authorizationVersion.id` on the `Enterprise Agent` decision endpoint. `authorize.alwaysCurrent: true` skips that attachment and is only for development. The endpoint id is stored locally and in `authorize.decisionEndpointId` when the config file is writable.
 
@@ -59,7 +63,7 @@ Scaffold tags the latest authorization version and sets `authorizationVersion.id
 2. Map group membership into the SSO access token `groups` claim, including `Administrator` (or `access.adminGroup`).
 3. Configure RFC 8693 token exchange so the exchanged token includes `act.sub`, plus the audience and scope you want the delegation rules to see.
 4. Give the worker application the Authorize roles for attributes, services, policies, versions, and decision endpoints.
-5. Run Scaffold once from the Policy tab.
+5. Use Dry run policy tree on the Policy tab and read `authorize-policy-tree.json` before the first write. Then run Scaffold once.
 6. In the PingOne console, paste the resource client id into `introspect-client-id` and the resource client secret into `introspect-client-secret`. Do not put that secret in `enterprise.json` or the git repo.
 7. Optional: set `authorize.delegations` to the humans and agents that may be paired. Leave it empty to rely on the active-delegation rule.
 8. Leave `isApproved` out of every rule until the human-in-the-loop flow in issue #20 is configured. A missing attribute throws and becomes a deny.

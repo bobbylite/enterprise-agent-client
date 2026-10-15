@@ -61,6 +61,7 @@ export const Ipc = {
   listPolicies: 'policies:list',
   refreshPolicies: 'policies:refresh',
   scaffoldPolicies: 'policies:scaffold',
+  dryRunAuthorizePolicy: 'policies:dry-run',
   resetPolicyCache: 'policies:reset-cache',
   setPolicyEnabled: 'policies:enabled',
   listAudit: 'audit:list',

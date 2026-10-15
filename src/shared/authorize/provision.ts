@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { EnterpriseConfig } from '../config';
 import type { AuthorizePolicy } from './policy';
 import { AuthorizeClient } from './remote';
@@ -14,16 +16,18 @@ import {
   attributeBody,
   decisionEndpointBody,
   decisionEndpointUpdate,
+  REQUEST_ATTRIBUTES,
+  SERVICE_ATTRIBUTES,
   delegationRulePlans,
-  inlinePolicyChild,
+  featurePolicyTree,
   introspectUrl,
   policyShell,
-  ruleBody,
-  ruleSetHash,
   scaffoldPlan,
   serviceBody,
+  summarizePolicyChildren,
   tagBody,
   userRulePlans,
+  walkPolicyTree,
   writablePolicy,
   type DelegationGrant,
   type RulePlan,
@@ -48,11 +52,17 @@ export interface ProvisionInput {
   delegations: DelegationGrant[];
   alwaysCurrent: boolean;
   shouldContinue?: () => boolean;
+  /** Write the planned tree and do not create, update, or delete anything in PingOne. */
+  dryRun?: boolean;
+  dryRunPath?: string;
+  log?: (level: 'debug' | 'error', message: string) => void;
+  logPath?: string;
 }
 
 export interface ProvisionResult {
   decisionEndpointId: string;
   policies: AuthorizePolicy[];
+  dryRunPath?: string;
 }
 
 interface Resource extends Record<string, unknown> {
@@ -69,6 +79,7 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     'Content-Type': 'application/json',
   };
   const going = () => input.shouldContinue?.() !== false;
+  if (input.dryRun) return dryRunFeaturePolicy(input, api, headers);
 
   const plan = scaffoldPlan(input.config);
   const parent = await ensureResource(input, `${api}/authorizationAttributes`, 'attribute', TRUST_PARENT, attributeBody(TRUST_PARENT), headers, going);
@@ -158,117 +169,235 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     attributeIds.set(attribute.name, saved.id);
   }
 
-  const root = await ensureResource(
-    input,
-    `${api}/authorizationPolicies`,
-    'policy',
-    ROOT_POLICY,
-    policyShell(ROOT_POLICY, 'Denies the Enterprise Agent decision when the user policy or the delegation policy denies.', 'DENY_OVERRIDES'),
-    headers,
-    going,
-  );
   const userPlans = userRulePlans(input.adminGroup);
   const delegationPlans = delegationRulePlans(input.delegations);
   if (!going()) return abandoned(input);
-  const nested = await nestChildren(input, api, headers, root, going);
-  if (!nested) return abandoned(input);
-  const userWithRules = await putRules(input, api, headers, nested.user, userPlans, attributeIds, going);
-  const delegationWithRules = await putRules(input, api, headers, nested.delegation, delegationPlans, attributeIds, going);
-  if (!going()) return abandoned(input);
-  await assertNested(input, api, headers, root.id);
+  const root = await putFeatureTree(input, api, headers, attributeIds, userPlans, delegationPlans, going);
+  if (!root) return abandoned(input);
 
   const endpoint = await ensureDecisionEndpoint(input, api, headers, going);
   return {
     decisionEndpointId: endpoint.id,
-    policies: [libraryPolicy(root, ROOT_POLICY), libraryPolicy(userWithRules, USER_POLICY), libraryPolicy(delegationWithRules, DELEGATION_POLICY)],
+    policies: [libraryPolicy(root.parent, ROOT_POLICY), libraryPolicy(root.user, USER_POLICY), libraryPolicy(root.delegation, DELEGATION_POLICY)],
   };
 }
 
-async function putRules(
-  input: ProvisionInput,
-  api: string,
-  headers: Record<string, string>,
-  policy: Resource,
-  plans: RulePlan[],
-  attributeIds: Map<string, string>,
-  going: () => boolean,
-): Promise<Resource> {
-  const hash = ruleSetHash(plans);
-  const saved = input.store.get('policy-rules', policy.name ?? '');
-  const current = await readResource(input, `${api}/authorizationPolicies/${policy.id}`, headers);
-  if (saved?.contentHash === hash && saved.remoteId === policy.id) {
-    assertRulePayloads(current, plans, attributeIds);
-    return current;
+const MACOS_LOG = '~/Library/Logs/enterprise-agent-client/main.log';
+
+async function dryRunFeaturePolicy(input: ProvisionInput, api: string, headers: Record<string, string>): Promise<ProvisionResult> {
+  const attributeIds = new Map<string, string>();
+  const listed = await listResources(input, `${api}/authorizationAttributes`, 'authorizationAttributes', headers);
+  for (const attribute of listed) {
+    if (attribute.name) attributeIds.set(attribute.name, attribute.id);
   }
-  if (!going()) return current;
-  const existing = new Map(childrenOf(current).map((child) => [String(child.name ?? ''), child]));
-  const rules = plans.map((plan) => {
-    const prior = existing.get(plan.name);
-    const version = typeof prior?.version === 'string' ? prior.version : '';
-    const id = typeof prior?.id === 'string' ? prior.id : '';
-    return ruleBody(plan, attributeIds, id && version ? { id, version } : undefined);
-  });
-  const written = await writePolicy(input, api, headers, writablePolicy(current, rules));
-  assertRulePayloads(written, plans, attributeIds);
-  input.store.put('policy-rules', policy.name ?? '', policy.id, hash);
-  return written;
+  const tree = plannedFeaturePolicy(attributeIds, input.adminGroup, input.delegations);
+  const found = await findNamed(input, `${api}/authorizationPolicies`, 'authorizationPolicies', ROOT_POLICY, headers);
+  const fresh = found?.name === ROOT_POLICY ? await readResource(input, `${api}/authorizationPolicies/${found.id}`, headers) : null;
+  const body = featurePolicyPutBody(fresh, tree);
+  const path = input.dryRunPath;
+  if (!path) throw new Error('Dry run needs a file path.');
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
+  input.log?.('debug', `Authorize dry run wrote ${path}\n${JSON.stringify(body, null, 2)}`);
+  return { decisionEndpointId: '', policies: [], dryRunPath: path };
 }
 
-const CHILD_POLICIES = [
-  {
-    name: USER_POLICY,
-    description: 'User policy. The SSO access token is introspected for groups and active, and Protect risk is supplied by the client.',
-  },
-  {
-    name: DELEGATION_POLICY,
-    description:
-      'Delegation policy. The token-exchanged token is introspected as EnterpriseAgent.tx-token. Approval claims are omitted until human-in-the-loop approval lands.',
-  },
-] as const;
+/** Attribute ids already in PingOne are kept. Missing ones stay as `{{name}}` so the file can be read before any write. */
+export function plannedFeaturePolicy(
+  attributeIds: Map<string, string>,
+  adminGroup: string,
+  delegations: DelegationGrant[],
+): Record<string, unknown> {
+  const ids = new Map(attributeIds);
+  for (const name of attributePlanNames()) {
+    if (!ids.has(name)) ids.set(name, `{{${name}}}`);
+  }
+  return featurePolicyTree(ids, adminGroup, delegations);
+}
 
-async function nestChildren(
+function attributePlanNames(): string[] {
+  return [...REQUEST_ATTRIBUTES.map((item) => item.name), ...SERVICE_ATTRIBUTES.map((item) => item.name)];
+}
+
+function featurePolicyPutBody(fresh: Resource | null, tree: Record<string, unknown>): Record<string, unknown> {
+  const children = Array.isArray(tree.children) ? tree.children : [];
+  if (!fresh?.id || !fresh.version) return tree;
+  const body = writablePolicy(fresh, children);
+  body.name = ROOT_POLICY;
+  body.description = tree.description;
+  body.enabled = true;
+  body.type = 'POLICY';
+  body.combiningAlgorithm = { algorithm: 'DENY_OVERRIDES' };
+  return body;
+}
+
+async function putFeatureTree(
   input: ProvisionInput,
   api: string,
   headers: Record<string, string>,
-  root: Resource,
+  attributeIds: Map<string, string>,
+  userPlans: RulePlan[],
+  delegationPlans: RulePlan[],
   going: () => boolean,
-): Promise<{ user: Resource; delegation: Resource } | null> {
-  const current = await readResource(input, `${api}/authorizationPolicies/${root.id}`, headers);
-  const present = await resolvePolicyChildren(input, api, headers, current);
-  if (nestedReady(current, present)) return requiredChildren(present);
+): Promise<{ parent: Resource; user: Resource; delegation: Resource } | null> {
+  let parent = await featurePolicy(input, api, headers);
+  if (!parent) {
+    if (!going()) return null;
+    parent = await ensureResource(
+      input,
+      `${api}/authorizationPolicies`,
+      'policy',
+      ROOT_POLICY,
+      policyShell(ROOT_POLICY, 'Denies the Enterprise Agent decision when the user policy or the delegation policy denies.', 'DENY_OVERRIDES'),
+      headers,
+      going,
+    );
+  }
+  const before = await readResource(input, `${api}/authorizationPolicies/${parent.id}`, headers);
+  if (before.name !== ROOT_POLICY) {
+    throw new Error(`Refusing to update ${before.name ?? before.id}. Scaffold only writes ${ROOT_POLICY}.`);
+  }
+  const present = await resolvePolicyChildren(input, api, headers, before);
+  const url = `${api}/authorizationPolicies/${before.id}`;
+  if (treeProblems(before, present, userPlans, delegationPlans, attributeIds).length === 0) {
+    input.log?.('debug', policyTrace('Authorize policy tree already present', url, null, before, present));
+    return requiredChildren(before, present);
+  }
   if (!going()) return null;
-  const keep = new Set(present.map((child) => child.id));
-  await deleteOrphanPolicies(input, api, headers, keep, root.id);
-  const fresh = await readResource(input, `${api}/authorizationPolicies/${root.id}`, headers);
-  const retained = await resolvePolicyChildren(input, api, headers, fresh);
-  const retainedNames = new Set(retained.map((child) => child.name));
-  const inline = CHILD_POLICIES.filter((child) => !retainedNames.has(child.name)).map((child) => inlinePolicyChild(child.name, child.description));
-  const references = retained.map((child) => ({ type: 'POLICY', value: { id: child.id } }));
-  const body = writablePolicy(fresh, [...references, ...inline]);
-  body.combiningAlgorithm = { algorithm: 'DENY_OVERRIDES' };
-  const written = await writePolicy(input, api, headers, body);
-  const created = await resolvePolicyChildren(input, api, headers, written);
-  if (!nestedReady(written, created)) throw new Error('PingOne did not keep the user and delegation policies under the parent.');
-  return requiredChildren(created);
+  const fresh = await readResource(input, `${api}/authorizationPolicies/${parent.id}`, headers);
+  if (fresh.name !== ROOT_POLICY) {
+    throw new Error(`Refusing to update ${fresh.name ?? fresh.id}. Scaffold only writes ${ROOT_POLICY}.`);
+  }
+  const tree = featurePolicyTree(attributeIds, input.adminGroup, input.delegations);
+  const body = featurePolicyPutBody(fresh, tree);
+  input.log?.('debug', policyTrace('Authorize policy tree PUT', url, body, null, []));
+  await sendJson(input, url, 'PUT', headers, body);
+  await input.client.paceAfterManagementPost();
+  const read = await readResource(input, url, headers);
+  const created = await resolvePolicyChildren(input, api, headers, read);
+  const trace = policyTrace('Authorize policy tree read-back', url, body, read, created);
+  input.log?.('debug', trace);
+  const problems =
+    read.id !== fresh.id || read.name !== ROOT_POLICY
+      ? [`Read-back was ${read.name ?? read.id}.`]
+      : treeProblems(read, created, userPlans, delegationPlans, attributeIds);
+  if (problems.length > 0) {
+    input.log?.('error', trace);
+    throw new Error(nestingError(fresh, problems, body, read, created, url, input.logPath));
+  }
+  const verified = requiredChildren(read, created);
+  await deleteOrphanPolicies(input, api, headers, new Set([verified.user.id, verified.delegation.id]), fresh.id);
+  return verified;
 }
 
-async function assertNested(input: ProvisionInput, api: string, headers: Record<string, string>, rootId: string): Promise<void> {
-  const read = await readResource(input, `${api}/authorizationPolicies/${rootId}`, headers);
-  const children = await resolvePolicyChildren(input, api, headers, read);
-  if (!nestedReady(read, children)) throw new Error('PingOne did not keep the user and delegation policies under the parent.');
+function policyTrace(
+  title: string,
+  url: string,
+  putBody: Record<string, unknown> | null,
+  getBody: Resource | null,
+  resolved: Resource[],
+): string {
+  const lines = [title, `url ${url}`];
+  if (putBody) {
+    lines.push(`PUT children ${JSON.stringify(summarizePolicyChildren(putBody))}`);
+    lines.push(JSON.stringify(putBody, null, 2));
+  }
+  if (getBody) {
+    lines.push(`GET children ${JSON.stringify(summarizePolicyChildren(getBody))}`);
+    lines.push(walkPolicyTree(getBody).join('\n'));
+    lines.push(resolvedChildrenText(resolved));
+    lines.push(JSON.stringify(getBody, null, 2));
+  }
+  return lines.join('\n');
 }
 
-function nestedReady(parent: Resource, children: Resource[]): boolean {
-  const names = new Set(children.map((child) => child.name));
+function nestingError(
+  parent: Resource,
+  problems: string[],
+  putBody: Record<string, unknown>,
+  getBody: Resource,
+  resolved: Resource[],
+  url: string,
+  logPath?: string,
+): string {
+  const missing = problems.filter((problem) => problem.startsWith('Missing policy '));
+  return [
+    `PingOne did not keep ${missing.map((problem) => problem.replace('Missing policy ', '')).join(' and ') || 'the policy tree'} under ${parent.name ?? ROOT_POLICY} (${parent.id}).`,
+    `Missing: ${missing.join('; ') || 'none'}.`,
+    ...problems.filter((problem) => !problem.startsWith('Missing policy ')),
+    `Children returned: ${JSON.stringify(summarizePolicyChildren(getBody))}`,
+    walkPolicyTree(getBody).join('\n'),
+    resolvedChildrenText(resolved),
+    `PUT ${url}`,
+    JSON.stringify(putBody, null, 2),
+    `GET ${url}`,
+    JSON.stringify(getBody, null, 2),
+    `Main log: ${logPath ?? MACOS_LOG}`,
+  ].join('\n');
+}
+
+function resolvedChildrenText(children: Resource[]): string {
+  if (children.length === 0) return 'Resolved children: none';
+  return children
+    .map((child) => {
+      const rules = childrenOf(child)
+        .map((rule) => rule.name)
+        .filter((name): name is string => typeof name === 'string' && name.length > 0);
+      return `Resolved ${child.name ?? '<unnamed>'} id=${child.id} rules=${rules.join(', ') || 'none'}`;
+    })
+    .join('\n');
+}
+
+function treeProblems(
+  parent: Resource,
+  children: Resource[],
+  userPlans: RulePlan[],
+  delegationPlans: RulePlan[],
+  attributeIds: Map<string, string>,
+): string[] {
+  const problems: string[] = [];
   const algorithm = (parent.combiningAlgorithm as { algorithm?: string } | undefined)?.algorithm;
-  return names.has(USER_POLICY) && names.has(DELEGATION_POLICY) && algorithm === 'DENY_OVERRIDES';
-}
-
-function requiredChildren(children: Resource[]): { user: Resource; delegation: Resource } {
+  if (algorithm !== 'DENY_OVERRIDES') problems.push(`Combining algorithm is ${algorithm ?? 'missing'}.`);
   const user = children.find((child) => child.name === USER_POLICY);
   const delegation = children.find((child) => child.name === DELEGATION_POLICY);
-  if (!user || !delegation) throw new Error('PingOne did not keep the user and delegation policies under the parent.');
-  return { user, delegation };
+  if (!user) problems.push(`Missing policy ${USER_POLICY}.`);
+  if (!delegation) problems.push(`Missing policy ${DELEGATION_POLICY}.`);
+  if (user) problems.push(...ruleProblems(user, userPlans, attributeIds));
+  if (delegation) problems.push(...ruleProblems(delegation, delegationPlans, attributeIds));
+  return problems;
+}
+
+function ruleProblems(policy: Resource, plans: RulePlan[], attributeIds: Map<string, string>): string[] {
+  try {
+    assertRulePayloads(policy, plans, attributeIds);
+    return [];
+  } catch (error) {
+    return [error instanceof Error ? error.message : String(error)];
+  }
+}
+
+function requiredChildren(parent: Resource, children: Resource[]): { parent: Resource; user: Resource; delegation: Resource } {
+  const user = children.find((child) => child.name === USER_POLICY);
+  const delegation = children.find((child) => child.name === DELEGATION_POLICY);
+  if (!user || !delegation) {
+    throw new Error(`Missing policy ${[user ? '' : USER_POLICY, delegation ? '' : DELEGATION_POLICY].filter(Boolean).join(' and ')}.`);
+  }
+  return { parent, user, delegation };
+}
+
+async function featurePolicy(input: ProvisionInput, api: string, headers: Record<string, string>): Promise<Resource | null> {
+  const cached = input.store.get('policy', ROOT_POLICY);
+  if (cached) {
+    try {
+      const read = await readResource(input, `${api}/authorizationPolicies/${cached.remoteId}`, headers);
+      if (read.name === ROOT_POLICY) return read;
+    } catch {
+      // The saved id is not our policy. Find it by name instead.
+    }
+  }
+  const found = await findNamed(input, `${api}/authorizationPolicies`, 'authorizationPolicies', ROOT_POLICY, headers);
+  if (!found || found.name !== ROOT_POLICY) return null;
+  return readResource(input, `${api}/authorizationPolicies/${found.id}`, headers);
 }
 
 /** A parent read may embed a child or return only `{ type, value: { id } }`. Both are the same placement. */
@@ -295,7 +424,7 @@ async function deleteOrphanPolicies(
   keep: Set<string>,
   rootId: string,
 ): Promise<void> {
-  const names = new Set<string>(CHILD_POLICIES.map((child) => child.name));
+  const names = new Set<string>([USER_POLICY, DELEGATION_POLICY]);
   const listed = await listResources(input, `${api}/authorizationPolicies`, 'authorizationPolicies', headers);
   for (const policy of listed) {
     if (!policy.name || !names.has(policy.name) || policy.id === rootId || keep.has(policy.id)) continue;
@@ -489,15 +618,6 @@ async function findNamed(
 ): Promise<Resource | undefined> {
   const listed = await listResources(input, collection, key, headers);
   return listed.find((item) => item.name === name);
-}
-
-async function writePolicy(input: ProvisionInput, api: string, headers: Record<string, string>, body: Record<string, unknown>): Promise<Resource> {
-  const id = String(body.id);
-  await sendJson(input, `${api}/authorizationPolicies/${id}`, 'PUT', headers, body);
-  await input.client.paceAfterManagementPost();
-  const read = await readResource(input, `${api}/authorizationPolicies/${id}`, headers);
-  if (read.id !== id) throw new Error('PingOne policy read-back id did not match the PUT.');
-  return read;
 }
 
 async function listResources(input: ProvisionInput, url: string, key: string, headers: Record<string, string>): Promise<Resource[]> {

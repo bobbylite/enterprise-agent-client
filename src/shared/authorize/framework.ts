@@ -55,7 +55,7 @@ export const SERVICE_ATTRIBUTES = [
   { name: 'tx-scope', service: DELEGATION_SERVICE, path: '$.scope' },
 ] as const;
 
-export const ROOT_POLICY = 'Enterprise Agent';
+export const ROOT_POLICY = 'Enterprise Agent Features';
 export const USER_POLICY = 'Enterprise Agent User';
 export const DELEGATION_POLICY = 'Enterprise Agent Delegation';
 export const DECISION_ENDPOINT = 'Enterprise Agent';
@@ -546,6 +546,70 @@ function childWriteError(child: unknown): string | null {
 function isPolicyReference(record: { value?: { id?: unknown }; name?: unknown; combiningAlgorithm?: unknown }): boolean {
   const id = record.value?.id;
   return typeof id === 'string' && id.length > 0 && !record.name && !record.combiningAlgorithm;
+}
+
+/** The whole Enterprise Agent Features tree. New inline policies and rules omit id and version. */
+export function featurePolicyTree(attributeIds: Map<string, string>, adminGroup: string, delegations: DelegationGrant[]): Record<string, unknown> {
+  return {
+    type: 'POLICY',
+    name: ROOT_POLICY,
+    description: 'Denies the Enterprise Agent decision when the user policy or the delegation policy denies.',
+    enabled: true,
+    combiningAlgorithm: { algorithm: 'DENY_OVERRIDES' },
+    children: [
+      {
+        ...inlinePolicyChild(
+          USER_POLICY,
+          'User policy. The SSO access token is introspected for groups and active, and Protect risk is supplied by the client.',
+        ),
+        children: userRulePlans(adminGroup).map((plan) => ruleBody(plan, attributeIds)),
+      },
+      {
+        ...inlinePolicyChild(
+          DELEGATION_POLICY,
+          'Delegation policy. The token-exchanged token is introspected as EnterpriseAgent.tx-token. Approval claims are omitted until human-in-the-loop approval lands.',
+        ),
+        children: delegationRulePlans(delegations).map((plan) => ruleBody(plan, attributeIds)),
+      },
+    ],
+  };
+}
+
+export interface PolicyChildSummary {
+  type: string;
+  name: string;
+  id: string;
+  valueId: string;
+}
+
+export function summarizePolicyChildren(body: unknown): PolicyChildSummary[] {
+  const children = (body as { children?: unknown } | null)?.children;
+  if (!Array.isArray(children)) return [];
+  return children.map((child) => {
+    const record = child && typeof child === 'object' ? (child as Record<string, unknown>) : {};
+    const value = record.value && typeof record.value === 'object' ? (record.value as { id?: unknown }) : {};
+    return {
+      type: typeof record.type === 'string' ? record.type : '',
+      name: typeof record.name === 'string' ? record.name : '',
+      id: typeof record.id === 'string' ? record.id : '',
+      valueId: typeof value.id === 'string' ? value.id : '',
+    };
+  });
+}
+
+/** Same walk as scripts/walk_policy_tree.py: id, name, type, and readOnly, then each embedded child. */
+export function walkPolicyTree(node: unknown, depth = 0): string[] {
+  if (!node || typeof node !== 'object') return [];
+  const record = node as Record<string, unknown>;
+  const id = typeof record.id === 'string' && record.id ? record.id : '<no-id>';
+  const name = typeof record.name === 'string' && record.name ? record.name : '<unnamed>';
+  const type = typeof record.type === 'string' && record.type ? `  (${record.type})` : '';
+  const managed = record.managedEntity as { restrictions?: { readOnly?: boolean } } | undefined;
+  const marker = managed?.restrictions?.readOnly ? ' [readOnly]' : '';
+  const lines = [`${'  '.repeat(depth)}${id}  ${name}${type}${marker}`];
+  const children = Array.isArray(record.children) ? record.children : [];
+  for (const child of children) lines.push(...walkPolicyTree(child, depth + 1));
+  return lines;
 }
 
 /** A new child policy inside a parent PUT. PingOne assigns the id. An existing policy's id does not move it. */
