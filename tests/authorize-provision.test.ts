@@ -10,7 +10,7 @@ import {
   decisionTokensReady,
   delegationRulePlans,
   groupsComparisonUsesCollection,
-  recordedPolicyChildren,
+  applyPolicyWrite,
   rulesReferenceIsApproved,
   scaffoldPlan,
   serviceWriteError,
@@ -64,7 +64,15 @@ function pingone(options?: { hidePolicyChildren?: boolean }) {
           return json({ _embedded: { [kind]: rows } });
         }
         const created = `id-${(seq += 1)}`;
-        const saved = { ...(body ?? {}), id: created, version: 'v1', kind, children: body?.children ?? [] };
+        const saved =
+          kind === 'authorizationPolicies'
+            ? {
+                ...applyPolicyWrite('POST', undefined, body, created, new Set(resources.keys()), () => `id-${(seq += 1)}`, (childId, child) => {
+                  resources.set(childId, { ...child, kind: 'authorizationPolicies' });
+                }),
+                kind,
+              }
+            : { ...(body ?? {}), id: created, version: 'v1', kind, children: body?.children ?? [] };
         resources.set(created, saved);
         return json(shown(saved), 201);
       }
@@ -77,9 +85,14 @@ function pingone(options?: { hidePolicyChildren?: boolean }) {
         delete saved.authorizationVersion;
       }
       if (kind === 'authorizationPolicies') {
-        saved.children = recordedPolicyChildren(body?.children, new Set(resources.keys()), () => `id-${(seq += 1)}`, (childId, child) => {
-          resources.set(childId, { ...child, kind: 'authorizationPolicies' });
-        });
+        const prior = resources.get(id);
+        Object.assign(
+          saved,
+          applyPolicyWrite('PUT', prior, body, id, new Set(resources.keys()), () => `id-${(seq += 1)}`, (childId, child) => {
+            resources.set(childId, { ...child, kind: 'authorizationPolicies' });
+          }),
+          { kind },
+        );
       }
       resources.set(id, saved);
       return json(shown(saved));
@@ -222,10 +235,13 @@ describe('real Authorize scaffold', () => {
     expect(service?.body).not.toHaveProperty('channel');
     expect(JSON.stringify(service?.body)).not.toMatch(/client-secret|super-secret|password=/i);
 
-    const treePuts = fake.calls.filter((call) => call.method === 'PUT' && call.body?.name === 'Enterprise Agent Features');
-    expect(treePuts).toHaveLength(1);
-    const tree = treePuts[0]?.body;
-    expect(tree).toMatchObject({ id: expect.any(String), version: expect.any(String), type: 'POLICY' });
+    const treePosts = fake.calls.filter((call) => call.method === 'POST' && call.body?.name === 'Enterprise Agent Features');
+    expect(treePosts).toHaveLength(1);
+    expect(fake.calls.filter((call) => call.method === 'PUT' && String(call.url).includes('/authorizationPolicies/'))).toHaveLength(0);
+    const tree = treePosts[0]?.body;
+    expect(tree).toMatchObject({ type: 'POLICY' });
+    expect(tree).not.toHaveProperty('id');
+    expect(tree).not.toHaveProperty('version');
     const inlineChildren = tree?.children as {
       id?: string;
       type?: string;
@@ -291,6 +307,16 @@ describe('real Authorize scaffold', () => {
       combiningAlgorithm: { algorithm: 'FIRST_APPLICABLE' },
       children: [],
     });
+    fake.resources.set('features-empty', {
+      id: 'features-empty',
+      name: 'Enterprise Agent Features',
+      kind: 'authorizationPolicies',
+      version: '7f917502',
+      type: 'POLICY',
+      enabled: true,
+      combiningAlgorithm: { algorithm: 'DENY_OVERRIDES' },
+      children: [],
+    });
     for (const [id, name] of [
       ['user-orphan', 'Enterprise Agent User'],
       ['delegation-orphan', 'Enterprise Agent Delegation'],
@@ -332,10 +358,14 @@ describe('real Authorize scaffold', () => {
     const deleted = fake.calls.filter((call) => call.method === 'DELETE').map((call) => call.url);
     expect(deleted).toEqual(expect.arrayContaining([expect.stringContaining('/user-orphan'), expect.stringContaining('/delegation-orphan')]));
     expect(deleted.some((url) => url.includes('keep-me') || url.includes('root-existing'))).toBe(false);
-    const putIndex = fake.calls.findIndex((call) => call.method === 'PUT' && call.body?.name === 'Enterprise Agent Features');
-    const deleteIndex = fake.calls.findIndex((call) => call.method === 'DELETE');
-    expect(putIndex).toBeGreaterThan(-1);
-    expect(deleteIndex).toBeGreaterThan(putIndex);
+    const postIndex = fake.calls.findIndex((call) => call.method === 'POST' && call.body?.name === 'Enterprise Agent Features');
+    const shellDelete = fake.calls.findIndex((call) => call.method === 'DELETE' && call.url.includes('/features-empty'));
+    const orphanDelete = fake.calls.findIndex((call) => call.method === 'DELETE' && call.url.includes('/user-orphan'));
+    expect(postIndex).toBeGreaterThan(-1);
+    expect(shellDelete).toBeGreaterThan(-1);
+    expect(shellDelete).toBeLessThan(postIndex);
+    expect(orphanDelete).toBeGreaterThan(postIndex);
+    expect(fake.resources.has('features-empty')).toBe(false);
     expect(fake.calls.some((call) => call.method === 'PUT' && call.url.includes('/root-existing'))).toBe(false);
     expect(fake.resources.get('root-existing')?.children).toEqual([]);
     const parent = [...fake.resources.values()].find((item) => item.name === 'Enterprise Agent Features');
@@ -376,7 +406,7 @@ describe('real Authorize scaffold', () => {
     expect(fake.resources.has('user-orphan')).toBe(true);
     const failure = logs.find((entry) => entry.level === 'error');
     expect(failure?.message).toContain('Enterprise Agent Features');
-    expect(failure?.message).toContain('PUT children');
+    expect(failure?.message).toContain('POST children');
     expect(failure?.message).toContain('GET children');
     expect(failure?.message).toContain('"valueId"');
   });
@@ -427,7 +457,9 @@ describe('real Authorize scaffold', () => {
       name?: string;
       children?: { type?: string; id?: string; name?: string; children?: { type?: string; id?: string; name?: string }[] }[];
     };
-    expect(written).toMatchObject({ id: 'features', version: 'v4', name: 'Enterprise Agent Features', type: 'POLICY' });
+    expect(written).toMatchObject({ name: 'Enterprise Agent Features', type: 'POLICY' });
+    expect(written.id).toBeUndefined();
+    expect(written.version).toBeUndefined();
     expect(written.children?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
     expect(written.children?.every((child) => child.type === 'POLICY' && !child.id)).toBe(true);
     const rules = written.children?.[0]?.children ?? [];
@@ -435,6 +467,48 @@ describe('real Authorize scaffold', () => {
     expect(rules.every((rule) => rule.type === 'RULE' && !rule.id)).toBe(true);
     expect(JSON.stringify(written)).toContain('{{risk-level}}');
     expect(JSON.stringify(written)).not.toContain('isApproved');
+    expect(fake.resources.get('features')?.version).toBe('v4');
+    expect(fake.resources.get('features')?.children).toEqual([]);
+  });
+
+  it('ignores children on a policy PUT and keeps the same version', async () => {
+    const fake = pingone();
+    fake.resources.set('policy-1', {
+      id: 'policy-1',
+      name: 'Enterprise Agent Features',
+      kind: 'authorizationPolicies',
+      version: '7f917502',
+      type: 'POLICY',
+      enabled: true,
+      combiningAlgorithm: { algorithm: 'DENY_OVERRIDES' },
+      children: [],
+    });
+    const response = await fake.client.request('https://api.pingone.com/v1/environments/env-1/authorizationPolicies/policy-1', {
+      method: 'PUT',
+      body: JSON.stringify({
+        type: 'POLICY',
+        id: 'policy-1',
+        version: '7f917502',
+        name: 'Enterprise Agent Features',
+        enabled: true,
+        combiningAlgorithm: { algorithm: 'DENY_OVERRIDES' },
+        children: [
+          {
+            type: 'POLICY',
+            name: 'Enterprise Agent User',
+            description: 'inline',
+            enabled: true,
+            combiningAlgorithm: { algorithm: 'FIRST_APPLICABLE' },
+            children: [],
+          },
+        ],
+      }),
+    });
+    expect(response.status).toBe(200);
+    const read = await fake.client.request('https://api.pingone.com/v1/environments/env-1/authorizationPolicies/policy-1');
+    const body = (await read.json()) as { children?: unknown[]; version?: string };
+    expect(body.children).toEqual([]);
+    expect(body.version).toBe('7f917502');
   });
 
   it('reuses a half-created parent by name and does not replace a console secret', async () => {

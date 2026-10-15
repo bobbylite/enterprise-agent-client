@@ -548,7 +548,7 @@ function isPolicyReference(record: { value?: { id?: unknown }; name?: unknown; c
   return typeof id === 'string' && id.length > 0 && !record.name && !record.combiningAlgorithm;
 }
 
-/** The whole Enterprise Agent Features tree. New inline policies and rules omit id and version. */
+/** The create body for Enterprise Agent Features. New inline policies and rules omit id and version. */
 export function featurePolicyTree(attributeIds: Map<string, string>, adminGroup: string, delegations: DelegationGrant[]): Record<string, unknown> {
   return {
     type: 'POLICY',
@@ -625,9 +625,9 @@ export function inlinePolicyChild(name: string, description: string): Record<str
 }
 
 /**
- * What a parent GET returns after a policy PUT.
+ * What a parent GET returns after a policy POST that included inline children.
  * An inline child with no id is created and referenced. A full copy of an existing policy is not attached.
- * Rules stay embedded. The read API has no expand parameter.
+ * Rules stay embedded on that child. The read API has no expand parameter.
  */
 export function recordedPolicyChildren(
   children: unknown,
@@ -657,6 +657,31 @@ export function recordedPolicyChildren(
     recorded.push({ type: 'POLICY', value: { id } });
   }
   return recorded;
+}
+
+/**
+ * Create accepts inline children. A policy PUT does not.
+ * Live read-back of a PUT that sent children kept `children: []` and the same version.
+ * The create example is the request that includes inline policies and rules.
+ */
+export function applyPolicyWrite(
+  method: 'POST' | 'PUT',
+  prior: Record<string, unknown> | undefined,
+  body: Record<string, unknown> | undefined,
+  id: string,
+  knownIds: ReadonlySet<string>,
+  allocateId: () => string,
+  saveChild: (childId: string, child: Record<string, unknown>) => void,
+): Record<string, unknown> {
+  const incoming = body ?? {};
+  if (method === 'PUT') {
+    const version = typeof prior?.version === 'string' && prior.version ? prior.version : 'v1';
+    const children = Array.isArray(prior?.children) ? prior.children : [];
+    return { ...(prior ?? {}), ...incoming, id, version, children };
+  }
+  const created: Record<string, unknown> = { ...(prior ?? {}), ...incoming, id, version: 'v1' };
+  created.children = recordedPolicyChildren(incoming.children, knownIds, allocateId, saveChild);
+  return created;
 }
 
 function ruleWriteError(child: unknown): string | null {
