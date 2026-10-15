@@ -538,8 +538,61 @@ function childWriteError(child: unknown): string | null {
   if (!child || typeof child !== 'object') return 'INVALID_DATA policy child is missing.';
   const record = child as { type?: unknown; effectSettings?: { type?: unknown }; combiningAlgorithm?: unknown };
   if (record.type === 'RULE' || record.effectSettings) return ruleWriteError(child);
-  if (record.type === 'POLICY' || record.combiningAlgorithm) return policyWriteError(child, true);
+  if (record.type === 'POLICY' && isPolicyReference(record)) return null;
+  if (record.type === 'POLICY' || record.combiningAlgorithm) return policyWriteError(child, false);
   return 'INVALID_DATA policy child type must be POLICY or RULE.';
+}
+
+function isPolicyReference(record: { value?: { id?: unknown }; name?: unknown; combiningAlgorithm?: unknown }): boolean {
+  const id = record.value?.id;
+  return typeof id === 'string' && id.length > 0 && !record.name && !record.combiningAlgorithm;
+}
+
+/** A new child policy inside a parent PUT. PingOne assigns the id. An existing policy's id does not move it. */
+export function inlinePolicyChild(name: string, description: string): Record<string, unknown> {
+  return {
+    type: 'POLICY',
+    name,
+    description,
+    combiningAlgorithm: { algorithm: 'FIRST_APPLICABLE' },
+    enabled: true,
+    children: [],
+  };
+}
+
+/**
+ * What a parent GET returns after a policy PUT.
+ * An inline child with no id is created and referenced. A full copy of an existing policy is not attached.
+ * Rules stay embedded. The read API has no expand parameter.
+ */
+export function recordedPolicyChildren(
+  children: unknown,
+  knownIds: ReadonlySet<string>,
+  allocateId: () => string,
+  save: (id: string, body: Record<string, unknown>) => void,
+): unknown[] {
+  if (!Array.isArray(children)) return [];
+  const recorded: unknown[] = [];
+  for (const child of children) {
+    if (!child || typeof child !== 'object') continue;
+    const record = child as Record<string, unknown>;
+    if (record.type === 'RULE' || record.effectSettings) {
+      recorded.push(record);
+      continue;
+    }
+    const referenced = (record.value as { id?: unknown } | undefined)?.id;
+    if (record.type === 'POLICY' && typeof referenced === 'string' && referenced && !record.name) {
+      recorded.push({ type: 'POLICY', value: { id: referenced } });
+      continue;
+    }
+    const existingId = typeof record.id === 'string' ? record.id : '';
+    if (existingId && knownIds.has(existingId)) continue;
+    if (record.type !== 'POLICY' || typeof record.name !== 'string' || !record.name) continue;
+    const id = allocateId();
+    save(id, { ...record, id, version: 'v1', children: Array.isArray(record.children) ? record.children : [] });
+    recorded.push({ type: 'POLICY', value: { id } });
+  }
+  return recorded;
 }
 
 function ruleWriteError(child: unknown): string | null {
