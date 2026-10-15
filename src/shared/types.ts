@@ -127,6 +127,11 @@ export interface PolicyScaffoldResult {
   policies: PolicyView[];
 }
 
+export interface PolicyCacheReset {
+  policies: PolicyView[];
+  cleared: string;
+}
+
 export interface AuditView {
   id: string;
   at: number;
@@ -520,7 +525,7 @@ export interface AgentBridge {
   listPolicies(): Promise<PolicyView[]>;
   refreshPolicies(): Promise<PolicyView[]>;
   scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult>;
-  resetPolicyCache(): Promise<PolicyView[]>;
+  resetPolicyCache(): Promise<PolicyCacheReset>;
   setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]>;
   listAudit(): Promise<AuditView[]>;
   onChatEvent(listener: (event: ChatEvent) => void): () => void;

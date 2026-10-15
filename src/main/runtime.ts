@@ -72,6 +72,7 @@ import type {
   AppState,
   AuditView,
   FeatureDecision,
+  PolicyCacheReset,
   PolicyScaffoldResult,
   PolicyView,
   SkillInput,
@@ -171,6 +172,7 @@ export class Runtime {
   private mockAdmin = false;
   private features: FeatureDecision = failClosed(0);
   private decisionCache: { key: string; at: number; decision: FeatureDecision } | null = null;
+  private policyEpoch = 0;
   private pkce: PkcePair | null = null;
   private flow: FlowSnapshot | null = null;
   private mfaSatisfied = false;
@@ -668,23 +670,23 @@ export class Runtime {
   async refreshPolicies(): Promise<PolicyView[]> {
     this.requirePolicy();
     if (this.options.config.tenant.mode === 'pingone') {
-      await this.authorize.run(() =>
-        this.confirmScaffold(scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '')),
-      );
-    } else {
-      await this.refreshFeatures();
+      await this.authorize.run(() => this.pullRemotePolicies());
     }
+    this.decisionCache = null;
+    await this.refreshFeatures();
     return this.listPolicies();
   }
 
-  async resetPolicyCache(): Promise<PolicyView[]> {
+  async resetPolicyCache(): Promise<PolicyCacheReset> {
     this.requirePolicy();
+    this.policyEpoch += 1;
+    this.decisionCache = null;
     const removed = this.options.db.listPolicies();
     for (const policy of removed) this.options.db.deletePolicy(policy.id);
-    this.audit(null, 'policy:reset-cache', removed.map((policy) => policy.name).join(', ') || 'empty');
-    this.decisionCache = null;
+    const cleared = policyResetDetail(removed.map((policy) => policy.name));
+    this.audit(null, 'policy:reset-cache', cleared);
     await this.refreshFeatures();
-    return [];
+    return { policies: [], cleared };
   }
 
   async scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult> {
@@ -1620,13 +1622,19 @@ export class Runtime {
   }
 
   private async confirmScaffold(incoming: AuthorizePolicy[]): Promise<PolicyScaffoldResult> {
+    const epoch = this.policyEpoch;
     if (this.options.config.tenant.mode === 'pingone') await this.pullRemotePolicies();
+    if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
     const existing = this.options.db.listPolicies();
     const merged = mergeScaffold(existing, incoming);
     const preview = incoming.map(policyView);
-    for (const policy of merged.created) this.options.db.upsertPolicy(policy);
+    for (const policy of merged.created) {
+      if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
+      this.options.db.upsertPolicy(policy);
+    }
     const pending = this.options.db.listPolicies().filter((policy) => policy.scaffold && !policy.remoteId);
-    const posted = await this.pushScaffold(pending);
+    const posted = await this.pushScaffold(pending, epoch);
+    if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
     const created = posted.length > 0 ? posted : merged.created;
     if (created.length > 0) {
       this.audit(null, 'policy:scaffold', created.map((policy) => policy.name).join(', '));
@@ -1636,13 +1644,30 @@ export class Runtime {
     return { preview, created: created.map(policyView), policies: this.options.db.listPolicies().map(policyView) };
   }
 
-  private async pushScaffold(pending: AuthorizePolicy[]): Promise<AuthorizePolicy[]> {
+  private abandonedScaffold(incoming: AuthorizePolicy[]): PolicyScaffoldResult {
+    return {
+      preview: incoming.map(policyView),
+      created: [],
+      policies: this.options.db.listPolicies().map(policyView),
+    };
+  }
+
+  private async pushScaffold(pending: AuthorizePolicy[], epoch: number): Promise<AuthorizePolicy[]> {
     if (pending.length === 0 || this.options.config.tenant.mode !== 'pingone') return [];
+    if (epoch !== this.policyEpoch) return [];
     const token = await this.workerAccessToken();
-    const synced = await syncRemoteScaffold(this.options.config, token, pending, this.authorize, (policy) => {
-      this.options.db.upsertPolicy(policy);
-    });
-    return synced.created;
+    const synced = await syncRemoteScaffold(
+      this.options.config,
+      token,
+      pending,
+      this.authorize,
+      (policy) => {
+        if (epoch !== this.policyEpoch) return;
+        this.options.db.upsertPolicy(policy);
+      },
+      () => epoch === this.policyEpoch,
+    );
+    return epoch === this.policyEpoch ? synced.created : [];
   }
 
   private async refreshFeatures(): Promise<void> {
@@ -2751,6 +2776,13 @@ function storedTemperature(stored: string | null, configured: number | undefined
 
 function stringClaim(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+function policyResetDetail(names: string[]): string {
+  const count = names.length;
+  const noun = count === 1 ? 'policy' : 'policies';
+  const listed = count === 0 ? '' : ` (${names.join(', ')})`;
+  return `Cleared ${count} local ${noun}${listed}, the Authorize decision cache, and any scaffold still in progress. Nothing in PingOne was deleted.`;
 }
 
 function defaultProtectSchedule(delayMs: number, run: () => Promise<void>): () => void {
