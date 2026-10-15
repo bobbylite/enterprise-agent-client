@@ -110,12 +110,24 @@ describe('real Authorize scaffold', () => {
     expect(posts.indexOf('authorizationAttributes:EnterpriseAgent')).toBeLessThan(posts.indexOf('authorizationServices:EnterpriseAgent User Introspection'));
     expect(posts.indexOf('authorizationServices:EnterpriseAgent User Introspection')).toBeLessThan(posts.indexOf('authorizationPolicies:Enterprise Agent User'));
 
+    const attributePosts = fake.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/authorizationAttributes'));
+    for (const call of attributePosts) {
+      const resolvers = call.body?.resolvers as { valueType?: { type?: string } }[] | undefined;
+      const attributeType = (call.body?.valueType as { type?: string } | undefined)?.type;
+      expect(resolvers?.length).toBeGreaterThan(0);
+      for (const resolver of resolvers ?? []) expect(resolver.valueType).toEqual({ type: attributeType });
+    }
     const request = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'access-token');
-    expect(request?.body?.resolvers).toEqual([{ type: 'REQUEST' }]);
+    expect(request?.body?.resolvers).toEqual([{ type: 'REQUEST', valueType: { type: 'STRING' } }]);
     expect(request?.body).not.toHaveProperty('processor');
     expect(request?.body?.parent).toEqual({ id: store.get('attribute', 'EnterpriseAgent')?.remoteId });
     const score = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'risk-score');
     expect(score?.body?.valueType).toEqual({ type: 'NUMBER' });
+    expect(score?.body?.resolvers).toEqual([{ type: 'REQUEST', valueType: { type: 'NUMBER' } }]);
+    const claim = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'tx-act-sub');
+    expect(claim?.body?.resolvers).toEqual([
+      { type: 'SERVICE', value: { id: store.get('service', 'EnterpriseAgent Delegation Introspection')?.remoteId }, valueType: { type: 'STRING' } },
+    ]);
 
     const service = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'EnterpriseAgent User Introspection');
     expect(service?.body).not.toHaveProperty('parent');
@@ -171,6 +183,50 @@ describe('real Authorize scaffold', () => {
       alwaysCurrent: false,
     });
     expect(fake.calls.filter((call) => call.method === 'POST' || call.method === 'PUT')).toHaveLength(writes);
+  });
+
+  it('reuses a half-created parent by name and does not replace a console secret', async () => {
+    const store = memoryStore();
+    const fake = pingone();
+    fake.resources.set('parent-existing', {
+      id: 'parent-existing',
+      name: 'EnterpriseAgent',
+      type: 'ATTRIBUTE',
+      kind: 'authorizationAttributes',
+      version: 'v1',
+      valueType: { type: 'JSON' },
+      resolvers: [{ type: 'CONSTANT', value: '{}' }],
+    });
+    fake.resources.set('secret-existing', {
+      id: 'secret-existing',
+      name: 'introspect-client-secret',
+      type: 'ATTRIBUTE',
+      kind: 'authorizationAttributes',
+      version: 'v1',
+      parent: { id: 'parent-existing' },
+      valueType: { type: 'STRING' },
+      resolvers: [{ type: 'CONSTANT', value: 'pasted-secret', valueType: { type: 'STRING' } }],
+    });
+    const enterprise = config();
+    const result = await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+    });
+    expect(result.decisionEndpointId).toBeTruthy();
+    expect(fake.calls.filter((call) => call.method === 'POST' && call.body?.name === 'EnterpriseAgent')).toHaveLength(0);
+    expect(fake.calls.filter((call) => call.method === 'POST' && call.body?.name === 'introspect-client-secret')).toHaveLength(0);
+    const repair = fake.calls.find((call) => call.method === 'PUT' && call.url.endsWith('/authorizationAttributes/parent-existing'));
+    expect(repair?.body?.resolvers).toEqual([{ type: 'CONSTANT', value: '{}', valueType: { type: 'JSON' } }]);
+    expect(repair?.body).toMatchObject({ id: 'parent-existing', version: 'v1' });
+    expect(fake.calls.filter((call) => call.url.includes('/authorizationAttributes/secret-existing') && call.method === 'PUT')).toHaveLength(0);
+    expect(fake.resources.get('secret-existing')?.resolvers).toEqual([{ type: 'CONSTANT', value: 'pasted-secret', valueType: { type: 'STRING' } }]);
+    expect(store.get('attribute', 'EnterpriseAgent')?.remoteId).toBe('parent-existing');
+    expect(store.get('attribute', 'introspect-client-secret')?.remoteId).toBe('secret-existing');
   });
 
   it('sends full attribute names, a numeric score, and placeholders', () => {

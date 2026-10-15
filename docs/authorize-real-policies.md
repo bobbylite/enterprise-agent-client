@@ -4,7 +4,7 @@ Confirming Scaffold in PingOne mode builds a Trust Framework and two policies. I
 
 ## What Scaffold creates
 
-Parent attribute `EnterpriseAgent`. These children use a `REQUEST` resolver and have no processor:
+Parent attribute `EnterpriseAgent`. These children use a `REQUEST` resolver and have no processor. Every resolver, including `REQUEST`, `SERVICE`, and `CONSTANT`, carries its own `valueType` and that type matches the attribute:
 
 | Attribute | Type |
 | --- | --- |
