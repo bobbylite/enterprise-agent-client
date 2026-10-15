@@ -7,6 +7,7 @@ import {
   delegationRulePlans,
   groupsComparisonUsesCollection,
   rulesReferenceIsApproved,
+  scaffoldPlan,
   userRulePlans,
 } from '../src/shared/authorize/framework';
 import { provisionAuthorize, type TfStore } from '../src/shared/authorize/provision';
@@ -53,18 +54,33 @@ function pingone() {
         const created = `id-${(seq += 1)}`;
         const saved = { ...(body ?? {}), id: created, version: 'v1', kind, children: body?.children ?? [] };
         resources.set(created, saved);
-        return json(saved, 201);
+        return json(shown(saved), 201);
       }
       if (method === 'GET') {
         const saved = resources.get(id);
-        return saved ? json(saved) : json({ message: 'missing' }, 404);
+        return saved ? json(shown(saved)) : json({ message: 'missing' }, 404);
       }
       const saved = { ...(resources.get(id) ?? {}), ...(body ?? {}), id, version: 'v2', kind };
       resources.set(id, saved);
-      return json(saved);
+      return json(shown(saved));
     },
   });
   return { client, calls, resources };
+}
+
+/** PingOne reads a REQUEST or SERVICE resolver without valueType. The create body still has to send it. */
+function shown(saved: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(saved.resolvers)) return saved;
+  return {
+    ...saved,
+    resolvers: saved.resolvers.map((resolver) => {
+      if (!resolver || typeof resolver !== 'object') return resolver;
+      const record = { ...(resolver as { type?: string; valueType?: unknown }) };
+      if (record.type === 'CONSTANT') return resolver;
+      delete record.valueType;
+      return record;
+    }),
+  };
 }
 
 function json(body: unknown, status = 200): Response {
@@ -82,6 +98,31 @@ function config() {
 }
 
 describe('real Authorize scaffold', () => {
+  it('plans a concrete valueType for every attribute and resolver from the default config', () => {
+    const enterprise = parseEnterpriseConfig(JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')));
+    const plan = scaffoldPlan(enterprise);
+    expect(plan.attributes.length).toBeGreaterThan(0);
+    for (const attribute of plan.attributes) {
+      expect(attribute.valueType.type).toMatch(/^(STRING|NUMBER|JSON|BOOLEAN)$/);
+      expect(attribute.resolvers.length).toBeGreaterThan(0);
+      for (const resolver of attribute.resolvers) {
+        expect(resolver.valueType).toEqual({ type: attribute.valueType.type });
+      }
+      if (attribute.processor) expect(attribute.processor.valueType).toEqual({ type: attribute.valueType.type });
+    }
+    const byName = new Map(plan.attributes.map((attribute) => [attribute.name, attribute]));
+    expect(byName.get('access-token')).toMatchObject({
+      valueType: { type: 'STRING' },
+      resolvers: [{ type: 'REQUEST', valueType: { type: 'STRING' } }],
+    });
+    expect(byName.get('tx-token')?.resolvers[0]?.valueType).toEqual({ type: 'STRING' });
+    expect(byName.get('introspect-client-id')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', valueType: { type: 'STRING' } });
+    expect(byName.get('introspect-client-secret')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', valueType: { type: 'STRING' } });
+    expect(byName.get('risk-score')?.valueType).toEqual({ type: 'NUMBER' });
+    expect(byName.get('risk-score')?.resolvers[0]?.valueType).toEqual({ type: 'NUMBER' });
+    expect(plan.services.map((service) => service.valueType)).toEqual([{ type: 'JSON' }, { type: 'JSON' }]);
+  });
+
   it('builds attributes, services, and both policies, then does not write them again', async () => {
     const store = memoryStore();
     const fake = pingone();
