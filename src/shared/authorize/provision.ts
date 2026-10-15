@@ -317,27 +317,85 @@ async function ensureResource(
   headers: Record<string, string>,
   going: () => boolean,
 ): Promise<Resource> {
+  const remember = (resource: Resource, hash: string) => {
+    input.store.put(kind, name, resource.id, hash);
+    return resource;
+  };
   const cached = input.store.get(kind, name);
   if (cached) {
     const read = await readResource(input, `${collection}/${cached.remoteId}`, headers);
     if (read.id !== cached.remoteId) throw new Error(`PingOne ${kind} ${name} id did not match the saved id.`);
-    return read;
+    return remember(await alignFound(input, collection, headers, read, body), cached.contentHash);
   }
-  const listed = await listResources(input, collection, collectionKey(collection), headers);
-  const found = listed.find((item) => item.name === name);
+  const found = await findNamed(input, collection, collectionKey(collection), name, headers);
   if (found) {
     const read = await readResource(input, `${collection}/${found.id}`, headers);
-    input.store.put(kind, name, read.id, input.store.get('policy-rules', name)?.contentHash ?? '');
-    return read;
+    return remember(await alignFound(input, collection, headers, read, body), input.store.get('policy-rules', name)?.contentHash ?? '');
   }
   if (!going()) throw new Error('Scaffold stopped before creating PingOne resources.');
-  const created = await sendJson(input, collection, 'POST', headers, body);
+  try {
+    const created = await sendJson(input, collection, 'POST', headers, body);
+    await input.client.paceAfterManagementPost();
+    const read = await readResource(input, `${collection}/${created.id}`, headers);
+    if (read.id !== created.id) throw new Error(`PingOne ${kind} ${name} read-back id did not match the create response.`);
+    if (read.name !== name) throw new Error(`PingOne ${kind} read-back name was ${String(read.name)}.`);
+    return remember(read, '');
+  } catch (error) {
+    const recovered = await findNamed(input, collection, collectionKey(collection), name, headers);
+    if (!recovered) throw error;
+    const read = await readResource(input, `${collection}/${recovered.id}`, headers);
+    return remember(await alignFound(input, collection, headers, read, body), '');
+  }
+}
+
+/** A failed create can leave the named object in PingOne. Reuse it, and fill a resolver valueType the API now requires. */
+async function alignFound(
+  input: ProvisionInput,
+  collection: string,
+  headers: Record<string, string>,
+  current: Resource,
+  intended: Record<string, unknown>,
+): Promise<Resource> {
+  if (!collection.includes('authorizationAttributes') || !resolversMissingValueType(current)) return current;
+  const version = typeof current.version === 'string' ? current.version : '';
+  if (!version) throw new Error(`PingOne attribute ${String(current.name)} is missing a version, so it cannot be repaired.`);
+  const resolvers = intendedResolvers(intended, current);
+  const body: Record<string, unknown> = { ...intended, id: current.id, version, resolvers };
+  await sendJson(input, `${collection}/${current.id}`, 'PUT', headers, body);
   await input.client.paceAfterManagementPost();
-  const read = await readResource(input, `${collection}/${created.id}`, headers);
-  if (read.id !== created.id) throw new Error(`PingOne ${kind} ${name} read-back id did not match the create response.`);
-  if (read.name !== name) throw new Error(`PingOne ${kind} read-back name was ${String(read.name)}.`);
-  input.store.put(kind, name, read.id, '');
+  const read = await readResource(input, `${collection}/${current.id}`, headers);
+  if (read.id !== current.id) throw new Error(`PingOne attribute ${String(current.name)} read-back id did not match the repair.`);
+  if (resolversMissingValueType(read)) throw new Error(`PingOne attribute ${String(current.name)} still has a resolver without valueType.`);
   return read;
+}
+
+function resolversMissingValueType(resource: Resource): boolean {
+  const resolvers = resource.resolvers as { valueType?: { type?: string } }[] | undefined;
+  if (!Array.isArray(resolvers) || resolvers.length === 0) return false;
+  return resolvers.some((resolver) => !resolver.valueType?.type);
+}
+
+function intendedResolvers(intended: Record<string, unknown>, current: Resource): unknown[] {
+  const next = Array.isArray(intended.resolvers) ? (intended.resolvers as Record<string, unknown>[]) : [];
+  const prior = Array.isArray(current.resolvers) ? (current.resolvers as { type?: string; value?: unknown }[]) : [];
+  return next.map((resolver, index) => {
+    const existing = prior[index];
+    if (resolver.type === 'CONSTANT' && existing?.type === 'CONSTANT' && typeof existing.value === 'string' && existing.value !== '') {
+      return { ...resolver, value: existing.value };
+    }
+    return resolver;
+  });
+}
+
+async function findNamed(
+  input: ProvisionInput,
+  collection: string,
+  key: string,
+  name: string,
+  headers: Record<string, string>,
+): Promise<Resource | undefined> {
+  const listed = await listResources(input, collection, key, headers);
+  return listed.find((item) => item.name === name);
 }
 
 async function writePolicy(input: ProvisionInput, api: string, headers: Record<string, string>, body: Record<string, unknown>): Promise<Resource> {
@@ -350,10 +408,19 @@ async function writePolicy(input: ProvisionInput, api: string, headers: Record<s
 }
 
 async function listResources(input: ProvisionInput, url: string, key: string, headers: Record<string, string>): Promise<Resource[]> {
-  const response = await input.client.request(url, { headers });
-  if (!response.ok) throw new Error(await errorText(response, `PingOne did not list ${key}`));
-  const body = (await response.json()) as Record<string, unknown>;
-  return embedded(body, key).filter((item): item is Resource => typeof item.id === 'string');
+  const rows: Resource[] = [];
+  const seen = new Set<string>();
+  let next: string | null = url;
+  while (next && !seen.has(next) && seen.size < 20) {
+    seen.add(next);
+    const response = await input.client.request(next, { headers });
+    if (!response.ok) throw new Error(await errorText(response, `PingOne did not list ${key}`));
+    const body = (await response.json()) as Record<string, unknown>;
+    rows.push(...embedded(body, key).filter((item): item is Resource => typeof item.id === 'string'));
+    const links = body._links as { next?: { href?: unknown } } | undefined;
+    next = typeof links?.next?.href === 'string' ? links.next.href : null;
+  }
+  return rows;
 }
 
 async function readResource(input: ProvisionInput, url: string, headers: Record<string, string>): Promise<Resource> {
@@ -380,11 +447,13 @@ async function sendJson(
 
 function assertParent(resource: Resource): void {
   if (resource.parent) throw new Error('EnterpriseAgent parent attribute was created under another parent.');
+  assertResolverValueType(resource, 'JSON');
 }
 
 function assertRequestAttribute(resource: Resource, valueType: string, parentId: string): void {
   const resolvers = resource.resolvers as { type?: string }[] | undefined;
   if (resolvers?.[0]?.type !== 'REQUEST') throw new Error(`${String(resource.name)} is not a REQUEST attribute.`);
+  assertResolverValueType(resource, valueType);
   if (resource.processor) throw new Error(`${String(resource.name)} has a processor. REQUEST attributes must not.`);
   const actual = (resource.valueType as { type?: string } | undefined)?.type;
   if (actual !== valueType) throw new Error(`${String(resource.name)} valueType is ${String(actual)}.`);
@@ -397,6 +466,7 @@ function assertDefinition(resource: Resource, parentId: string): void {
   if (parent !== parentId) throw new Error(`${String(resource.name)} definition is not under EnterpriseAgent.`);
   const resolver = (resource.resolvers as { type?: string }[] | undefined)?.[0];
   if (resolver?.type !== 'CONSTANT') throw new Error(`${String(resource.name)} is not a constant Definition.`);
+  assertResolverValueType(resource, 'STRING');
 }
 
 function assertService(resource: Resource, tokenAttributeId: string, clientId: string, secretId: string): void {
@@ -420,6 +490,7 @@ function assertService(resource: Resource, tokenAttributeId: string, clientId: s
 function assertServiceAttribute(resource: Resource, serviceId: string, path: string, parentId: string): void {
   const resolver = (resource.resolvers as { type?: string; value?: { id?: string } }[] | undefined)?.[0];
   if (resolver?.type !== 'SERVICE' || resolver.value?.id !== serviceId) throw new Error(`${String(resource.name)} does not use its introspection service.`);
+  assertResolverValueType(resource, 'STRING');
   const processor = resource.processor as { type?: string; expression?: string } | undefined;
   if (processor?.type !== 'JSON_PATH' || processor.expression !== path) throw new Error(`${String(resource.name)} JSONPath is ${String(processor?.expression)}.`);
   if ((resource.parent as { id?: string } | undefined)?.id !== parentId) throw new Error(`${String(resource.name)} is not under EnterpriseAgent.`);
@@ -445,6 +516,13 @@ function assertRulePayloads(policy: Resource, plans: RulePlan[], attributeIds: M
     }
   }
   if (JSON.stringify(childrenOf(policy)).includes('isApproved')) throw new Error('A rule references isApproved.');
+}
+
+function assertResolverValueType(resource: Resource, valueType: string): void {
+  const resolver = (resource.resolvers as { valueType?: { type?: string } }[] | undefined)?.[0];
+  if (resolver?.valueType?.type !== valueType) {
+    throw new Error(`${String(resource.name)} resolver valueType is ${String(resolver?.valueType?.type)}.`);
+  }
 }
 
 function childrenOf(policy: Resource): Resource[] {

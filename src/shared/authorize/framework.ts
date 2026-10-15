@@ -91,7 +91,7 @@ export function parentAttributeBody(): Record<string, unknown> {
     description: 'Parent for Enterprise Agent decision attributes. Not an API Access Management attribute.',
     type: 'ATTRIBUTE',
     valueType: { type: 'JSON' },
-    resolvers: [{ type: 'CONSTANT', value: '{}' }],
+    resolvers: [{ type: 'CONSTANT', value: '{}', valueType: { type: 'JSON' } }],
   };
 }
 
@@ -101,7 +101,7 @@ export function requestAttributeBody(parentId: string, name: string, valueType: 
     description: `Request parameter ${fullAttributeName(TRUST_PARENT, name)}. No processor: the resolver already returns the scalar.`,
     type: 'ATTRIBUTE',
     parent: { id: parentId },
-    resolvers: [{ type: 'REQUEST' }],
+    resolvers: [{ type: 'REQUEST', valueType: { type: valueType } }],
     valueType: { type: valueType },
   };
 }
@@ -114,7 +114,7 @@ export function definitionBody(parentId: string, name: string, secret: boolean):
       : 'Paste the custom resource client id in the PingOne console if it is not already set.',
     type: 'ATTRIBUTE',
     parent: { id: parentId },
-    resolvers: [{ type: 'CONSTANT', value: '' }],
+    resolvers: [{ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } }],
     valueType: { type: 'STRING' },
   };
 }
@@ -149,7 +149,7 @@ export function serviceAttributeBody(parentId: string, name: string, serviceId: 
     description: `Claim ${path} from introspection. JSONPath is used because the service returns JSON.`,
     type: 'ATTRIBUTE',
     parent: { id: parentId },
-    resolvers: [{ type: 'SERVICE', value: { id: serviceId } }],
+    resolvers: [{ type: 'SERVICE', value: { id: serviceId }, valueType: { type: 'STRING' } }],
     processor: { type: 'JSON_PATH', expression: path, valueType: { type: 'STRING' } },
     valueType: { type: 'STRING' },
   };
