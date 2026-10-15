@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { AuthorizeClient } from '../src/shared/authorize/remote';
 import {
+  attributeWriteError,
   authorizeWriteError,
   decisionParameters,
   decisionTokensReady,
@@ -115,7 +116,11 @@ describe('real Authorize scaffold', () => {
       for (const resolver of attribute.resolvers) {
         expect(resolver.valueType).toEqual({ type: attribute.valueType.type });
       }
-      if (attribute.processor) expect(attribute.processor.valueType).toEqual({ type: attribute.valueType.type });
+      if (attribute.processor) {
+        expect(attribute.processor.name.startsWith('Extract ')).toBe(true);
+        expect(attribute.processor.valueType).toEqual({ type: attribute.valueType.type });
+        for (const resolver of attribute.resolvers) expect(resolver).not.toHaveProperty('processor');
+      }
     }
     const byName = new Map(plan.attributes.map((attribute) => [attribute.name, attribute]));
     expect(byName.get('access-token')).toMatchObject({
@@ -176,6 +181,14 @@ describe('real Authorize scaffold', () => {
     expect(claim?.body?.resolvers).toEqual([
       { type: 'SERVICE', value: { id: store.get('service', 'EnterpriseAgent Delegation Introspection')?.remoteId }, valueType: { type: 'STRING' } },
     ]);
+    expect(claim?.body?.processor).toEqual({
+      type: 'JSON_PATH',
+      name: 'Extract tx-act-sub',
+      expression: '$.act.sub',
+      valueType: { type: 'STRING' },
+    });
+    const claimResolver = (claim?.body?.resolvers as Record<string, unknown>[] | undefined)?.[0];
+    expect(claimResolver).not.toHaveProperty('processor');
 
     const service = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'EnterpriseAgent User Introspection');
     expect(service?.body).not.toHaveProperty('parent');
@@ -299,6 +312,13 @@ describe('real Authorize scaffold', () => {
         tlsSettings: { tlsValidationType: 'DEFAULT' },
       },
     };
+    expect(attributeWriteError({
+      name: 'introspection-groups',
+      type: 'ATTRIBUTE',
+      valueType: { type: 'STRING' },
+      resolvers: [{ type: 'SERVICE', value: { id: 'svc' }, valueType: { type: 'STRING' } }],
+      processor: { type: 'JSON_PATH', expression: '$.groups', valueType: { type: 'STRING' } },
+    })).toMatch(/processor\.name/);
     expect(serviceWriteError(almost)).toMatch(/maximumConcurrentRequests/);
     expect(serviceWriteError({ ...almost, serviceSettings: { ...almost.serviceSettings, maximumConcurrentRequests: 0 } })).toMatch(/OUT_OF_RANGE/);
     const store = memoryStore();

@@ -4,7 +4,7 @@ Confirming Scaffold in PingOne mode builds a Trust Framework and two policies. I
 
 ## What Scaffold creates
 
-Parent attribute `EnterpriseAgent`. These children use a `REQUEST` resolver and have no processor. Every resolver, including `REQUEST`, `SERVICE`, and `CONSTANT`, carries its own `valueType` on the create body, and that type matches the attribute. A later GET of a `REQUEST` or `SERVICE` resolver may omit `valueType`; the attribute's own `valueType` is what the read-back must show. Tokens are `STRING`. `risk-score` is `NUMBER`.
+Parent attribute `EnterpriseAgent`. These children use a `REQUEST` resolver and have no processor. Every resolver, including `REQUEST`, `SERVICE`, and `CONSTANT`, carries its own `valueType` on the create body, and that type matches the attribute. A later GET of a `REQUEST` or `SERVICE` resolver may omit `valueType`; the attribute's own `valueType` is what the read-back must show. Tokens are `STRING`. `risk-score` is `NUMBER`. Resolvers do not carry a processor. A `SERVICE` claim attribute puts the JSONPath processor on the attribute: `name` (for example `Extract introspection-groups`), `type: JSON_PATH`, `expression`, and `valueType`.
 
 | Attribute | Type |
 | --- | --- |
@@ -22,14 +22,14 @@ Two top-level HTTP services, with no parent, POST `{authHost}/{environmentId}/as
 - `EnterpriseAgent User Introspection` uses `access-token`.
 - `EnterpriseAgent Delegation Introspection` uses `tx-token`.
 
-Service attributes read `$.active`, `$.groups`, `$.sub`, and for the exchanged token `$.act.sub`, `$.aud`, and `$.scope`.
+Service attributes read `$.active`, `$.groups`, `$.sub`, and for the exchanged token `$.act.sub`, `$.aud`, and `$.scope`. Each processor is named `Extract <attribute>`, for example `Extract introspection-groups`.
 
 The parent policy `Enterprise Agent` uses `DENY_OVERRIDES`. The decision is deny when either child denies. `INDETERMINATE` and `NOT_APPLICABLE` fail closed in the client.
 
 1. **Enterprise Agent User** (`FIRST_APPLICABLE`). High risk, a `block` action, or an inactive access token denies. A `read_only` action permits a read-only feature payload. Membership of `access.adminGroup` in `$.groups` permits the full payload (`CONTAINS`, because a JSONPath filter that matches nobody throws and would stop the chain). An active token permits the session payload. There is no catch-all deny.
 2. **Enterprise Agent Delegation** (`FIRST_APPLICABLE`). `authorize.delegations` is an allowlist of `humanSub`, `agentSub`, and optional `audience` and `scope`. The last rule permits when `tx-active` is `true` and `tx-act-sub` is not empty. `isApproved` is not used.
 
-Rules are a full PUT of the policy, including `id` and `version`, `type: RULE`, and `effectSettings.type` of `UNCONDITIONAL_PERMIT` or `UNCONDITIONAL_DENY`. Statement code `enterprise-agent-features` uses a static payload and `attributes: []`. Each write is read back.
+Rules are a full PUT of the policy, including `id` and `version`, `type: RULE`, and `effectSettings.type` of `UNCONDITIONAL_PERMIT` or `UNCONDITIONAL_DENY`. Each statement is an `EMBEDDED_STATEMENT` with code `enterprise-agent-features`, a static payload, `attributes: []`, and `services: []`. Each write is read back.
 
 Scaffold tags the latest authorization version and sets `authorizationVersion.id` on the `Enterprise Agent` decision endpoint. `authorize.alwaysCurrent: true` skips that attachment and is only for development. The endpoint id is stored locally and in `authorize.decisionEndpointId` when the config file is writable.
 
