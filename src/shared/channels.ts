@@ -1,6 +1,9 @@
 export const Ipc = {
   getBranding: 'app:get-branding',
   getState: 'app:get-state',
+  appState: 'app:state',
+  collectSignals: 'protect:collect-signals',
+  provideSignals: 'protect:provide-signals',
   submitCredentials: 'auth:credentials',
   submitOtp: 'auth:otp',
   selectDevice: 'auth:device',

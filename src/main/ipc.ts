@@ -8,6 +8,24 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
   runtime.setEmitter((event: ChatEvent) => {
     if (!window.isDestroyed()) window.webContents.send(Ipc.chatEvent, event);
   });
+  runtime.setStatePublisher((state) => {
+    if (!window.isDestroyed()) window.webContents.send(Ipc.appState, state);
+  });
+  let settleSignals: ((signals: string) => void) | null = null;
+  runtime.setSignalCollector(() => {
+    if (window.isDestroyed()) return Promise.resolve('');
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        settleSignals = null;
+        resolve('');
+      }, 4_000);
+      settleSignals = (signals) => {
+        clearTimeout(timer);
+        resolve(signals);
+      };
+      window.webContents.send(Ipc.collectSignals);
+    });
+  });
 
   const handle = <T extends unknown[]>(channel: string, fn: (...args: T) => Promise<unknown> | unknown) => {
     ipcMain.removeHandler(channel);
@@ -22,6 +40,10 @@ export function bindIpc(ipcMain: IpcMain, runtime: Runtime, window: BrowserWindo
 
   handle(Ipc.getBranding, () => branding);
   handle(Ipc.getState, () => runtime.state());
+  handle(Ipc.provideSignals, (signals: string) => {
+    settleSignals?.(typeof signals === 'string' ? signals : '');
+    settleSignals = null;
+  });
   handle(Ipc.submitCredentials, (username: string, password: string, signals: string) =>
     runtime.submitCredentials(username, password, signals),
   );

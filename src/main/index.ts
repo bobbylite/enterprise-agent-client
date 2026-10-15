@@ -1,5 +1,5 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
-import { readFileSync } from 'node:fs';
+import { app, BrowserWindow, dialog, ipcMain, powerMonitor, shell } from 'electron';
+import { readFileSync, watch } from 'node:fs';
 import { basename, dirname, extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Repository } from './db';
@@ -70,7 +70,8 @@ async function boot(): Promise<void> {
   loadDotEnv(cwd, process.env);
   const appPath = app.getAppPath();
   const branding = loadBranding(resolveBrandingPath(cwd, appPath, process.env));
-  const config = loadEnterprise(resolveEnterprisePath(cwd, appPath, process.env));
+  const configPath = resolveEnterprisePath(cwd, appPath, process.env);
+  const config = loadEnterprise(configPath);
   const db = Repository.open(join(app.getPath('userData'), 'agent.sqlite'));
   const { store, encryptionAvailable } = createSecretStore(db);
   const runtime = await Runtime.create({
@@ -84,6 +85,7 @@ async function boot(): Promise<void> {
     env: process.env,
     version: app.getVersion(),
     dev: !app.isPackaged,
+    configPath,
     openExternal: (url) => shell.openExternal(url),
     pickFiles: async () => {
       const chosen = await dialog.showOpenDialog({
@@ -99,11 +101,33 @@ async function boot(): Promise<void> {
   });
   const window = createWindow(branding.appName, branding.colors.sidebar);
   bindIpc(ipcMain, runtime, window, branding);
+  let suspended = false;
+  const active = () => !suspended && !window.isDestroyed() && window.isVisible();
+  runtime.setProtectActive(active);
+  const onSuspend = () => {
+    suspended = true;
+  };
+  const onResume = () => {
+    suspended = false;
+    runtime.nudgeProtectPoll();
+  };
+  powerMonitor.on('suspend', onSuspend);
+  powerMonitor.on('resume', onResume);
+  window.on('show', () => runtime.nudgeProtectPoll());
+  let configWatcher: ReturnType<typeof watch> | null = null;
+  try {
+    configWatcher = watch(configPath, () => runtime.reloadProtectSettings());
+  } catch {
+    configWatcher = null;
+  }
   const timer = setInterval(() => {
     void runtime.fireDueRoutines(new Date());
   }, 15_000);
   app.on('before-quit', () => {
     clearInterval(timer);
+    powerMonitor.off('suspend', onSuspend);
+    powerMonitor.off('resume', onResume);
+    configWatcher?.close();
     void runtime.dispose();
   });
 }

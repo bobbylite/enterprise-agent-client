@@ -96,6 +96,8 @@ export const enterpriseConfigSchema = z.object({
     resolvePublicIp: z.boolean(),
     reportedIp: z.string(),
     userType: z.enum(['PING_ONE', 'EXTERNAL']),
+    pollIntervalSeconds: z.number().int().nonnegative().default(30),
+    pauseWhenHidden: z.boolean().default(false),
     policy: z.object({
       levels: z.object({
         LOW: riskAction,

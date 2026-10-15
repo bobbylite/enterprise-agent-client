@@ -32,6 +32,8 @@
     "resolvePublicIp": true,
     "reportedIp": "",
     "userType": "EXTERNAL",
+    "pollIntervalSeconds": 30,
+    "pauseWhenHidden": false,
     "policy": {
       "levels": {
         "LOW": "allow",
