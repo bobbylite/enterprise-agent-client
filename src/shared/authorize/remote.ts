@@ -217,6 +217,7 @@ export async function syncRemoteScaffold(
   policies: AuthorizePolicy[],
   client: AuthorizeClient,
   onProgress?: (policy: AuthorizePolicy) => void,
+  shouldContinue: () => boolean = () => true,
 ): Promise<{ policies: AuthorizePolicy[]; created: AuthorizePolicy[] }> {
   return client.run(async () => {
     let remote = await listRemotePolicies(config, accessToken, client);
@@ -228,15 +229,18 @@ export async function syncRemoteScaffold(
       onProgress?.(policy);
     };
     for (let index = 0; index < policies.length; index += 1) {
+      if (!shouldContinue()) break;
       const policy = policies[index];
       if (!policy) continue;
       const existing = matchRemote(policy, remote);
       if (existing) {
+        if (!shouldContinue()) break;
         keep({ ...policy, remoteId: existing.id, enabled: existing.enabled }, false);
         continue;
       }
       try {
         const remoteId = await createRemotePolicy(config, accessToken, policy, client);
+        if (!shouldContinue()) break;
         const saved = { ...policy, remoteId };
         keep(saved, true);
         remote = [

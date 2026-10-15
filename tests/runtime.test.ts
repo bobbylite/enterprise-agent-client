@@ -543,7 +543,11 @@ describe('admin gate', () => {
     expect(audit.some((event) => event.action === 'policy:scaffold' && event.username === 'ada')).toBe(true);
     expect(audit.some((event) => event.action === 'policy:enforcement' && event.detail.includes('disabled'))).toBe(true);
 
-    expect(await runtime.resetPolicyCache()).toEqual([]);
+    const reset = await runtime.resetPolicyCache();
+    expect(reset.policies).toEqual([]);
+    expect(reset.cleared).toMatch(/4 local policies/);
+    expect(reset.cleared).toMatch(/Authorize decision cache/);
+    expect(reset.cleared).toMatch(/scaffold still in progress/);
     expect(await runtime.listPolicies()).toEqual([]);
     expect(runtime.listAudit().some((event) => event.action === 'policy:reset-cache')).toBe(true);
     const restored = await runtime.scaffoldPolicies(true);
@@ -1027,10 +1031,79 @@ describe('pi.flow runtime', () => {
     ]);
 
     remote.splice(0, remote.length);
+    const postsBeforeReset = posts.length;
+    const reset = await runtime.resetPolicyCache();
+    expect(reset.policies).toEqual([]);
+    expect(reset.cleared).toMatch(/4 local policies/);
+    expect(reset.cleared).toMatch(/Authorize decision cache/);
+    expect(posts).toHaveLength(postsBeforeReset);
     const refreshed = await runtime.refreshPolicies();
-    expect(posts).toHaveLength(12);
-    expect(refreshed).toHaveLength(4);
+    expect(posts).toHaveLength(postsBeforeReset);
+    expect(refreshed).toEqual([]);
+    expect(remote).toEqual([]);
+    await runtime.scaffoldPolicies(false);
+    expect(posts).toHaveLength(postsBeforeReset);
+    const created = await runtime.scaffoldPolicies(true);
+    expect(created.created).toHaveLength(4);
+    expect(posts).toHaveLength(postsBeforeReset + 4);
     expect(remote).toHaveLength(4);
+  });
+
+  it('stops creating policies when the local cache is reset during a scaffold', async () => {
+    const remote: { id: string; name: string; description: string; enabled: boolean }[] = [];
+    let posted = 0;
+    const gate: { release: (() => void) | null } = { release: null };
+    const secrets = new MemorySecretStore();
+    await secrets.set('workerClientSecret', 'worker-secret');
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+      },
+      async (url, init) => {
+        const target = String(url);
+        const method = init?.method ?? 'GET';
+        const bodyText = String(init?.body ?? '');
+        if (target.includes('/authorizationPolicies') && method === 'GET') {
+          return json(200, { _embedded: { authorizationPolicies: remote } });
+        }
+        if (target.includes('/authorizationPolicies') && method === 'POST') {
+          posted += 1;
+          if (posted === 1) {
+            await new Promise<void>((resolve) => {
+              gate.release = resolve;
+            });
+          }
+          const body = JSON.parse(bodyText) as { name: string; description: string };
+          const id = `policy-${remote.length + 1}`;
+          remote.push({ id, name: body.name, description: body.description, enabled: true });
+          return json(201, { id });
+        }
+        if (target.includes('/as/token') && bodyText.includes('client_credentials')) {
+          return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        }
+        return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+      },
+      secrets,
+      { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+    );
+    await runtime.submitCredentials('ada', 'secret', '');
+    const scaffolding = runtime.scaffoldPolicies(true);
+    const started = Date.now();
+    while (!gate.release && Date.now() - started < 5000) await new Promise((resolve) => setTimeout(resolve, 10));
+    const release = gate.release;
+    if (!release) throw new Error('The scaffold did not start a create.');
+    const reset = await runtime.resetPolicyCache();
+    expect(reset.cleared).toMatch(/scaffold still in progress/);
+    release();
+    const finished = await scaffolding;
+    expect(posted).toBe(1);
+    expect(finished.created).toEqual([]);
+    expect(await runtime.listPolicies()).toEqual([]);
+    const refreshed = await runtime.refreshPolicies();
+    expect(posted).toBe(1);
+    expect(refreshed.map((policy) => policy.name)).toEqual(['Administrator tools']);
   });
 
   it('reports an external identity provider instead of posting usernamePassword.check', async () => {
