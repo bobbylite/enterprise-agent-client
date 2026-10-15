@@ -357,7 +357,7 @@ async function alignFound(
   intended: Record<string, unknown>,
 ): Promise<Resource> {
   if (collection.includes('authorizationServices')) return alignService(input, collection, headers, current, intended);
-  if (!collection.includes('authorizationAttributes') || !resolversMissingValueType(current)) return current;
+  if (!collection.includes('authorizationAttributes') || (!resolversMissingValueType(current) && !processorMissingName(current))) return current;
   const version = typeof current.version === 'string' ? current.version : '';
   if (!version) throw new Error(`PingOne attribute ${String(current.name)} is missing a version, so it cannot be repaired.`);
   const resolvers = intendedResolvers(intended, current);
@@ -367,6 +367,7 @@ async function alignFound(
   const read = await readResource(input, `${collection}/${current.id}`, headers);
   if (read.id !== current.id) throw new Error(`PingOne attribute ${String(current.name)} read-back id did not match the repair.`);
   if (resolversMissingValueType(read)) throw new Error(`PingOne attribute ${String(current.name)} still has a resolver without valueType.`);
+  if (processorMissingName(read)) throw new Error(`PingOne attribute ${String(current.name)} processor.name is still missing.`);
   return read;
 }
 
@@ -409,6 +410,12 @@ function serviceMissingLimits(resource: Resource): boolean {
     timeout < 0 ||
     timeout > 3000
   );
+}
+
+function processorMissingName(resource: Resource): boolean {
+  const processor = resource.processor as { name?: unknown } | undefined;
+  if (!processor) return false;
+  return typeof processor.name !== 'string' || processor.name.length === 0;
 }
 
 function resolversMissingValueType(resource: Resource): boolean {
@@ -540,8 +547,10 @@ function assertServiceAttribute(resource: Resource, serviceId: string, path: str
   const resolver = (resource.resolvers as { type?: string; value?: { id?: string } }[] | undefined)?.[0];
   if (resolver?.type !== 'SERVICE' || resolver.value?.id !== serviceId) throw new Error(`${String(resource.name)} does not use its introspection service.`);
   assertResolverValueType(resource, 'STRING');
-  const processor = resource.processor as { type?: string; expression?: string } | undefined;
-  if (processor?.type !== 'JSON_PATH' || processor.expression !== path) throw new Error(`${String(resource.name)} JSONPath is ${String(processor?.expression)}.`);
+  const processor = resource.processor as { type?: string; name?: string; expression?: string } | undefined;
+  if (processor?.type !== 'JSON_PATH' || !processor.name || processor.expression !== path) {
+    throw new Error(`${String(resource.name)} JSONPath is ${String(processor?.expression)}.`);
+  }
   if ((resource.parent as { id?: string } | undefined)?.id !== parentId) throw new Error(`${String(resource.name)} is not under EnterpriseAgent.`);
 }
 

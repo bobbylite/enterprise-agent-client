@@ -24,7 +24,7 @@ export interface AttributeSpec {
   description: string;
   valueType: ValueTypeSpec;
   resolvers: ResolverSpec[];
-  processor?: { type: 'JSON_PATH'; expression: string; valueType: ValueTypeSpec };
+  processor?: { type: 'JSON_PATH'; name: string; expression: string; valueType: ValueTypeSpec };
 }
 
 const REQUEST_ATTRIBUTE_SPECS: { name: string; valueType: AttributeValueType }[] = [
@@ -139,7 +139,7 @@ function serviceSpec(name: string, service: string, path: string): AttributeSpec
     description: `Claim ${path} from introspection. JSONPath is used because the service returns JSON.`,
     valueType: typed('STRING'),
     resolvers: [{ type: 'SERVICE', valueType: typed('STRING'), service }],
-    processor: { type: 'JSON_PATH', expression: path, valueType: typed('STRING') },
+    processor: { type: 'JSON_PATH', name: `Extract ${name}`, expression: path, valueType: typed('STRING') },
   };
 }
 
@@ -180,7 +180,9 @@ export function attributeSpec(name: string): AttributeSpec {
   for (const resolver of spec.resolvers) {
     if (!resolver.valueType?.type) throw new Error(`${name} resolver valueType is undefined.`);
   }
-  if (spec.processor && !spec.processor.valueType?.type) throw new Error(`${name} processor valueType is undefined.`);
+  if (spec.processor && (!spec.processor.name || !spec.processor.valueType?.type || !spec.processor.expression)) {
+    throw new Error(`${name} processor is missing name, expression, or valueType.`);
+  }
   return spec;
 }
 
@@ -442,6 +444,7 @@ export function conditionBody(plan: ConditionPlan, attributeIds: Map<string, str
 
 export function statementBody(plan: RulePlan): Record<string, unknown> {
   return {
+    type: 'EMBEDDED_STATEMENT',
     name: FEATURE_STATEMENT,
     description: 'Static feature flags for the desktop client. The payload does not interpolate attributes.',
     code: FEATURE_STATEMENT,
@@ -554,7 +557,8 @@ function ruleWriteError(child: unknown): string | null {
   if (rule.effectSettings?.type !== 'UNCONDITIONAL_PERMIT' && rule.effectSettings?.type !== 'UNCONDITIONAL_DENY') {
     return 'INVALID_DATA effectSettings.type must be UNCONDITIONAL_PERMIT or UNCONDITIONAL_DENY.';
   }
-  if (!rule.condition || typeof rule.condition !== 'object') return 'INVALID_DATA rule condition is required.';
+  const conditionError = conditionWriteError(rule.condition);
+  if (conditionError) return conditionError;
   if (!Array.isArray(rule.statements) || rule.statements.length === 0) return 'INVALID_DATA rule statements are required.';
   for (const statement of rule.statements) {
     const error = statementWriteError(statement);
@@ -566,6 +570,7 @@ function ruleWriteError(child: unknown): string | null {
 function statementWriteError(statement: unknown): string | null {
   if (!statement || typeof statement !== 'object') return 'INVALID_DATA statement is missing.';
   const record = statement as {
+    type?: unknown;
     name?: unknown;
     code?: unknown;
     obligatory?: unknown;
@@ -575,6 +580,7 @@ function statementWriteError(statement: unknown): string | null {
     services?: unknown;
     payload?: unknown;
   };
+  if (record.type !== 'EMBEDDED_STATEMENT') return 'INVALID_DATA statement type must be EMBEDDED_STATEMENT.';
   if (typeof record.name !== 'string' || !record.name) return 'INVALID_DATA statement name is required.';
   if (typeof record.code !== 'string' || !record.code) return 'INVALID_DATA statement code is required.';
   if (typeof record.obligatory !== 'boolean') return 'INVALID_DATA statement obligatory must be boolean.';
@@ -616,7 +622,88 @@ export function tagWriteError(body: unknown): string | null {
   return null;
 }
 
+function conditionWriteError(condition: unknown): string | null {
+  if (!condition || typeof condition !== 'object') return 'INVALID_DATA rule condition is required.';
+  const record = condition as {
+    type?: unknown;
+    conditions?: unknown;
+    left?: { type?: unknown; id?: unknown };
+    comparator?: unknown;
+    right?: { type?: unknown; value?: unknown };
+  };
+  if (record.type === 'AND' || record.type === 'OR') {
+    if (!Array.isArray(record.conditions) || record.conditions.length === 0) return 'INVALID_DATA compound condition needs conditions.';
+    for (const child of record.conditions) {
+      const error = conditionWriteError(child);
+      if (error) return error;
+    }
+    return null;
+  }
+  if (record.type !== 'COMPARISON') return 'INVALID_DATA condition type must be AND, OR, or COMPARISON.';
+  if (record.left?.type !== 'ATTRIBUTE' || typeof record.left.id !== 'string' || !record.left.id) {
+    return 'INVALID_DATA comparison left must be an attribute id.';
+  }
+  if (record.comparator !== 'EQUALS' && record.comparator !== 'NOT_EQUALS' && record.comparator !== 'CONTAINS') {
+    return 'INVALID_DATA comparison comparator is required.';
+  }
+  if (record.right?.type !== 'CONSTANT' || typeof record.right.value !== 'string') {
+    return 'INVALID_DATA comparison right must be a constant string.';
+  }
+  return null;
+}
+
+export function attributeWriteError(body: unknown): string | null {
+  if (!body || typeof body !== 'object') return 'INVALID_DATA attribute body is missing.';
+  const record = body as {
+    name?: unknown;
+    type?: unknown;
+    valueType?: { type?: unknown };
+    parent?: { id?: unknown };
+    resolvers?: unknown;
+    processor?: { type?: unknown; name?: unknown; expression?: unknown; valueType?: { type?: unknown } };
+  };
+  if (typeof record.name !== 'string' || !record.name) return 'INVALID_DATA attribute name is required.';
+  if (record.type !== 'ATTRIBUTE') return 'INVALID_DATA attribute type must be ATTRIBUTE.';
+  if (typeof record.valueType?.type !== 'string' || !record.valueType.type) return 'INVALID_DATA attribute valueType is required.';
+  if (!Array.isArray(record.resolvers) || record.resolvers.length === 0) return 'INVALID_DATA attribute resolvers are required.';
+  for (const resolver of record.resolvers) {
+    const error = resolverWriteError(resolver);
+    if (error) return error;
+  }
+  const service = record.resolvers.some((resolver) => (resolver as { type?: unknown }).type === 'SERVICE');
+  if (service && !record.processor) return 'INVALID_DATA a SERVICE attribute needs a JSON_PATH processor.';
+  if (!service && record.processor) return 'INVALID_DATA only a SERVICE attribute has a processor.';
+  if (record.processor) {
+    const processor = record.processor;
+    if (typeof processor.name !== 'string' || !processor.name) return 'INVALID_DATA EMPTY_VALUE processor.name must not be null.';
+    if (processor.type !== 'JSON_PATH') return 'INVALID_DATA processor.type must be JSON_PATH.';
+    if (typeof processor.expression !== 'string' || !processor.expression.startsWith('$.')) return 'INVALID_DATA processor.expression is required.';
+    if (typeof processor.valueType?.type !== 'string' || !processor.valueType.type) return 'INVALID_DATA processor.valueType is required.';
+  }
+  if (record.parent && (typeof record.parent.id !== 'string' || !record.parent.id)) return 'INVALID_DATA parent.id is required when parent is set.';
+  return null;
+}
+
+function resolverWriteError(resolver: unknown): string | null {
+  if (!resolver || typeof resolver !== 'object') return 'INVALID_DATA resolver is missing.';
+  const record = resolver as { type?: unknown; valueType?: { type?: unknown }; value?: unknown; processor?: unknown };
+  if (record.processor) return 'INVALID_DATA resolvers do not carry a processor. Put it on the attribute.';
+  if (typeof record.valueType?.type !== 'string' || !record.valueType.type) return 'INVALID_DATA resolver valueType must not be null.';
+  if (record.type === 'REQUEST') return null;
+  if (record.type === 'CONSTANT') {
+    if (typeof record.value !== 'string') return 'INVALID_DATA constant resolver value is required.';
+    return null;
+  }
+  if (record.type === 'SERVICE') {
+    const id = (record.value as { id?: unknown } | undefined)?.id;
+    if (typeof id !== 'string' || !id) return 'INVALID_DATA SERVICE resolver value.id is required.';
+    return null;
+  }
+  return 'INVALID_DATA resolver type must be REQUEST, CONSTANT, or SERVICE.';
+}
+
 export function authorizeWriteError(url: string, method: string, body: unknown): string | null {
+  if (url.includes('/authorizationAttributes') && (method === 'POST' || method === 'PUT')) return attributeWriteError(body);
   if (url.includes('/authorizationServices') && (method === 'POST' || method === 'PUT')) return serviceWriteError(body);
   if (url.includes('/authorizationPolicies') && method === 'PUT') return policyWriteError(body, true);
   if (url.includes('/decisionEndpoints') && !url.endsWith('/tag') && method === 'POST') return decisionEndpointCreateError(body);
