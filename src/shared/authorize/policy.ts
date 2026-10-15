@@ -1,4 +1,4 @@
-import type { FeatureDecision, RiskAction, RiskLevel } from '../types';
+import type { FeatureDecision, RiskAction, RiskLevel, SessionRestriction } from '../types';
 
 export const FEATURE_STATEMENT = 'enterprise-agent-features';
 export const SCAFFOLD_MARKER = 'enterprise-agent-scaffold';
@@ -183,6 +183,58 @@ export function parseScaffoldMarker(description: string): { id: string; when: Po
   } catch {
     return null;
   }
+}
+
+/**
+ * Rows already stored win. With none stored and no decision endpoint, use the
+ * built-in starters. Those starters are not written and are not created in PingOne.
+ * A configured decision endpoint is the authority, so an empty table stays empty.
+ */
+export function policiesForEvaluation(
+  stored: AuthorizePolicy[],
+  starters: AuthorizePolicy[],
+  decisionEndpointId: string,
+): AuthorizePolicy[] {
+  if (stored.length > 0) return stored;
+  if (decisionEndpointId.trim()) return [];
+  return starters;
+}
+
+/** Admins keep the Policy tab unless Protect risk is HIGH or the action is block. */
+export function withAdminPolicyTab(decision: FeatureDecision, input: DecisionInput, admin: boolean): FeatureDecision {
+  if (!admin) return decision;
+  if (input.riskLevel === 'HIGH' || input.riskAction === 'block') return decision;
+  if (decision.policyTab) return decision;
+  return { ...decision, policyTab: true };
+}
+
+export function sessionRestriction(decision: FeatureDecision, input: DecisionInput, storedCount: number): SessionRestriction | null {
+  if (decision.chat !== 'read_only') return null;
+  if (input.riskLevel === 'HIGH' || input.riskAction === 'block' || input.riskAction === 'read_only') {
+    const action = input.riskAction === 'read_only' ? 'read-only' : input.riskAction;
+    return {
+      reason: 'risk',
+      message: `Chat is read-only because Protect scored this session ${input.riskLevel} with action ${action}.`,
+    };
+  }
+  if (decision.source === 'fail_closed') {
+    return {
+      reason: 'decision_failure',
+      message:
+        'Chat is read-only because the Authorize decision endpoint denied this session or could not be reached. PingOne tools and MCP writes stay off.',
+    };
+  }
+  if (storedCount === 0) {
+    return {
+      reason: 'empty_policies',
+      message:
+        'Chat is read-only because no Authorize policies are stored on this computer or listed from PingOne, so nothing grants chat. Confirm Scaffold to create the starter policies. Refresh will not create them.',
+    };
+  }
+  return {
+    reason: 'policy',
+    message: 'Chat is read-only because no enabled Authorize policy grants chat for this session.',
+  };
 }
 
 export function evaluatePolicies(policies: AuthorizePolicy[], input: DecisionInput, now: number): FeatureDecision {

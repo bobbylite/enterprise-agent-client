@@ -92,6 +92,14 @@ export interface FeatureDecision {
   fetchedAt: number;
 }
 
+/** Why chat is read-only. Absent when chat is allowed. */
+export type SessionRestrictionReason = 'empty_policies' | 'decision_failure' | 'risk' | 'policy';
+
+export interface SessionRestriction {
+  reason: SessionRestrictionReason;
+  message: string;
+}
+
 export interface SkillView {
   id: string;
   name: string;
@@ -156,6 +164,8 @@ export interface AppState {
   adminGroup: string;
   mockAdmin: boolean;
   features: FeatureDecision;
+  /** Set when chat is read-only, with the reason an admin can act on. */
+  restriction: SessionRestriction | null;
 }
 
 export type ProviderId = 'mock' | 'openai' | 'anthropic' | 'generic';

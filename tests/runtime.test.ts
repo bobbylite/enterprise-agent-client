@@ -539,6 +539,7 @@ describe('admin gate', () => {
     expect(after.features.chat).toBe('read_only');
     expect(after.features.mcpWrites).toBe(false);
     expect(after.features.policyTab).toBe(true);
+    expect(after.restriction?.reason).toBe('policy');
     const audit = runtime.listAudit();
     expect(audit.some((event) => event.action === 'policy:scaffold' && event.username === 'ada')).toBe(true);
     expect(audit.some((event) => event.action === 'policy:enforcement' && event.detail.includes('disabled'))).toBe(true);
@@ -550,6 +551,11 @@ describe('admin gate', () => {
     expect(reset.cleared).toMatch(/scaffold still in progress/);
     expect(await runtime.listPolicies()).toEqual([]);
     expect(runtime.listAudit().some((event) => event.action === 'policy:reset-cache')).toBe(true);
+    const afterReset = runtime.state();
+    expect(afterReset.features.chat).toBe('allow');
+    expect(afterReset.features.policyTab).toBe(true);
+    expect(afterReset.features.source).toBe('starter');
+    expect(afterReset.restriction).toBeNull();
     const restored = await runtime.scaffoldPolicies(true);
     expect(restored.created).toHaveLength(4);
   });
@@ -569,6 +575,7 @@ describe('admin gate', () => {
     expect(state.features.pingoneTools).toBe(false);
     expect(state.features.mcpWrites).toBe(false);
     expect(state.features.chat).toBe('read_only');
+    expect(state.restriction?.reason).toBe('risk');
     await expect(runtime.listPolicies()).rejects.toThrow(/Policy tab/);
     const snapshot = runtime.createConversation();
     await expect(runtime.sendMessage(snapshot.conversation.id, 'hello', [])).rejects.toThrow(/read-only/);
@@ -905,10 +912,15 @@ describe('pi.flow runtime', () => {
     const state = await runtime.submitCredentials('ada', 'secret', '');
     expect(decisionAuth).toBe('Bearer worker-token');
     expect(state.features.source).toBe('fail_closed');
-    expect(state.features.policyTab).toBe(false);
+    expect(state.features.policyTab).toBe(true);
     expect(state.features.pingoneTools).toBe(false);
     expect(state.features.mcpWrites).toBe(false);
     expect(state.features.chat).toBe('read_only');
+    expect(state.restriction?.reason).toBe('decision_failure');
+    expect(state.restriction?.message).toMatch(/decision endpoint/);
+    const preview = await runtime.scaffoldPolicies(false);
+    expect(preview.created).toEqual([]);
+    expect(preview.preview).toHaveLength(4);
   });
 
   it('applies an Authorize feature statement from the worker decision call', async () => {
@@ -1041,6 +1053,13 @@ describe('pi.flow runtime', () => {
     expect(posts).toHaveLength(postsBeforeReset);
     expect(refreshed).toEqual([]);
     expect(remote).toEqual([]);
+    const recovered = runtime.state();
+    expect(recovered.features.source).toBe('starter');
+    expect(recovered.features.policyTab).toBe(true);
+    expect(recovered.features.pingoneTools).toBe(true);
+    expect(recovered.features.chat).toBe('allow');
+    expect(recovered.features.mcpWrites).toBe(true);
+    expect(recovered.restriction).toBeNull();
     await runtime.scaffoldPolicies(false);
     expect(posts).toHaveLength(postsBeforeReset);
     const created = await runtime.scaffoldPolicies(true);

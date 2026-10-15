@@ -133,7 +133,6 @@ export function RoomsScreen({ showReasoning, readOnly }: { showReasoning: boolea
           </div>
         </form>
         {snapshot ? <Transcript messages={snapshot.messages} showReasoning={showReasoning} /> : null}
-        {readOnly ? <p className="notice">Authorize policy made this session read-only.</p> : null}
         {error ? <p className="error">{error}</p> : null}
         {selected ? (
           <form

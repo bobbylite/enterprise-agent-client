@@ -21,8 +21,11 @@ import {
   featuresFromAuthorize,
   mergeScaffold,
   parseScaffoldMarker,
+  policiesForEvaluation,
   reconcilePolicyCache,
   scaffoldPolicies,
+  sessionRestriction as explainRestriction,
+  withAdminPolicyTab,
   SCAFFOLD_MARKER,
   type AuthorizePolicy,
   type DecisionInput,
@@ -313,6 +316,7 @@ export class Runtime {
       adminGroup: this.options.config.access.adminGroup,
       mockAdmin: this.mockAdmin,
       features: this.currentFeatures(),
+      restriction: this.sessionRestriction(),
     };
   }
 
@@ -1475,10 +1479,28 @@ export class Runtime {
     };
   }
 
+  private decisionEndpointId(): string {
+    if (this.options.config.tenant.mode !== 'pingone') return '';
+    return this.options.config.authorize.decisionEndpointId.trim();
+  }
+
   private policiesForDecision(): AuthorizePolicy[] {
-    const stored = this.options.db.listPolicies();
-    if (stored.length > 0) return stored;
-    return scaffoldPolicies(this.options.config.access.adminGroup, this.now(), 'starter');
+    return policiesForEvaluation(
+      this.options.db.listPolicies(),
+      scaffoldPolicies(this.options.config.access.adminGroup, this.now(), 'starter'),
+      this.decisionEndpointId(),
+    );
+  }
+
+  private sessionRestriction() {
+    if (!this.session || this.stepUpRequired) return null;
+    return explainRestriction(this.currentFeatures(), this.decisionInput(), this.options.db.listPolicies().length);
+  }
+
+  private applyFeatures(decision: FeatureDecision, key: string): void {
+    const next = withAdminPolicyTab(decision, this.decisionInput(), this.isAdmin());
+    this.features = next;
+    this.decisionCache = { key, at: this.now(), decision: next };
   }
 
   private requireWritableChat(): void {
@@ -1683,11 +1705,12 @@ export class Runtime {
       this.features = cached.decision;
       return;
     }
+    const stored = this.options.db.listPolicies();
+    const starters = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), 'starter');
+    const endpoint = this.decisionEndpointId();
     const local = evaluatePolicies(this.policiesForDecision(), input, this.now());
-    const endpoint = this.options.config.authorize.decisionEndpointId.trim();
-    if (this.options.config.tenant.mode !== 'pingone' || !endpoint) {
-      this.features = local;
-      this.decisionCache = { key, at: this.now(), decision: local };
+    if (!endpoint) {
+      this.applyFeatures(local, key);
       return;
     }
     try {
@@ -1699,11 +1722,11 @@ export class Runtime {
         this.authorize,
       );
       const remote = featuresFromAuthorize(body, this.now());
-      this.features = remote ?? local;
+      const fallback = stored.length === 0 ? evaluatePolicies(starters, input, this.now()) : local;
+      this.applyFeatures(remote ?? fallback, key);
     } catch {
-      this.features = failClosed(this.now());
+      this.applyFeatures(failClosed(this.now()), key);
     }
-    this.decisionCache = { key, at: this.now(), decision: this.features };
   }
 
   private askApproval(request: ApprovalRequest): Promise<ApprovalChoice> {

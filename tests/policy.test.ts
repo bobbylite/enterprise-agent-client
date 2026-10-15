@@ -1,7 +1,18 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { groupsFromClaims, isAdmin } from '../src/shared/access/groups';
-import { evaluatePolicies, failClosed, featuresFromAuthorize, mergeScaffold, reconcilePolicyCache, scaffoldPolicies, SCAFFOLD_MARKER } from '../src/shared/authorize/policy';
+import {
+  evaluatePolicies,
+  failClosed,
+  featuresFromAuthorize,
+  mergeScaffold,
+  policiesForEvaluation,
+  reconcilePolicyCache,
+  scaffoldPolicies,
+  sessionRestriction,
+  withAdminPolicyTab,
+  SCAFFOLD_MARKER,
+} from '../src/shared/authorize/policy';
 import { parseEnterpriseConfig } from '../src/shared/config';
 import { skillFromUpload, zipStore } from '../src/main/skill-files';
 import { parseSkillMarkdown } from '../src/shared/skills/markdown';
@@ -26,6 +37,37 @@ describe('groups and authorize', () => {
     expect(isAdmin(['Employees'], 'Administrator')).toBe(false);
     expect(isAdmin(['Administrator'], 'Administrator')).toBe(true);
     expect(isAdmin(['administrator'], 'Administrator')).toBe(false);
+  });
+
+  it('evaluates an empty set as denied and uses starters only when no decision endpoint is set', () => {
+    const starters = scaffoldPolicies('Administrator', 10, 'ada');
+    const empty = evaluatePolicies([], { groups: ['Administrator'], riskLevel: 'LOW', riskAction: 'allow' }, 11);
+    expect(empty).toMatchObject({ policyTab: false, pingoneTools: false, mcpWrites: false, chat: 'read_only', source: 'starter' });
+    expect(policiesForEvaluation([], starters, '')).toEqual(starters);
+    expect(policiesForEvaluation([], starters, '   ')).toEqual(starters);
+    expect(policiesForEvaluation([], starters, 'decision-1')).toEqual([]);
+    expect(policiesForEvaluation(starters, [], 'decision-1')).toEqual(starters);
+    const local = evaluatePolicies(policiesForEvaluation([], starters, ''), { groups: ['Administrator'], riskLevel: 'LOW', riskAction: 'allow' }, 12);
+    expect(local.policyTab).toBe(true);
+    expect(local.chat).toBe('allow');
+  });
+
+  it('keeps the Policy tab for an admin unless risk is high or blocked', () => {
+    const closed = failClosed(5);
+    const low = { groups: ['Administrator'], riskLevel: 'LOW' as const, riskAction: 'allow' as const };
+    const opened = withAdminPolicyTab(closed, low, true);
+    expect(opened.policyTab).toBe(true);
+    expect(opened.pingoneTools).toBe(false);
+    expect(opened.mcpWrites).toBe(false);
+    expect(opened.chat).toBe('read_only');
+    expect(withAdminPolicyTab(closed, low, false).policyTab).toBe(false);
+    expect(withAdminPolicyTab(closed, { ...low, riskLevel: 'HIGH' }, true).policyTab).toBe(false);
+    expect(withAdminPolicyTab(closed, { ...low, riskAction: 'block' }, true).policyTab).toBe(false);
+    expect(withAdminPolicyTab(closed, { ...low, riskAction: 'read_only' }, true).policyTab).toBe(true);
+    expect(sessionRestriction(closed, low, 0)).toMatchObject({ reason: 'decision_failure' });
+    expect(sessionRestriction(closed, { ...low, riskLevel: 'HIGH' }, 0)?.reason).toBe('risk');
+    expect(sessionRestriction({ ...closed, source: 'starter' }, low, 0)?.reason).toBe('empty_policies');
+    expect(sessionRestriction({ ...closed, chat: 'allow' }, low, 0)).toBeNull();
   });
 
   it('evaluates starter policies so high risk overrides the admin grant', () => {
