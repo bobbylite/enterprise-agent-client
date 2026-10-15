@@ -8,6 +8,7 @@ import {
   decisionTokensReady,
   delegationRulePlans,
   groupsComparisonUsesCollection,
+  recordedPolicyChildren,
   rulesReferenceIsApproved,
   scaffoldPlan,
   serviceWriteError,
@@ -50,6 +51,10 @@ function pingone() {
         return json({ _embedded: { authorizationVersions: [{ id: 'ver-1' }] } });
       }
       if (marker[3] === 'tag' && method === 'PUT') return json({ id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+      if (id && method === 'DELETE') {
+        resources.delete(id);
+        return new Response(null, { status: 204 });
+      }
       if (id === 'ver-1' && method === 'GET') return json({ id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
       if (!id) {
         if (method === 'GET') {
@@ -68,6 +73,11 @@ function pingone() {
       const saved: Record<string, unknown> = { ...(resources.get(id) ?? {}), ...(body ?? {}), id, version: 'v2', kind };
       if (kind === 'decisionEndpoints' && body && !Object.prototype.hasOwnProperty.call(body, 'authorizationVersion')) {
         delete saved.authorizationVersion;
+      }
+      if (kind === 'authorizationPolicies') {
+        saved.children = recordedPolicyChildren(body?.children, new Set(resources.keys()), () => `id-${(seq += 1)}`, (childId, child) => {
+          resources.set(childId, { ...child, kind: 'authorizationPolicies' });
+        });
       }
       resources.set(id, saved);
       return json(shown(saved));
@@ -158,10 +168,10 @@ describe('real Authorize scaffold', () => {
     expect(posts).toContain('authorizationServices:EnterpriseAgent User Introspection');
     expect(posts).toContain('authorizationServices:EnterpriseAgent Delegation Introspection');
     expect(posts).toContain('authorizationPolicies:Enterprise Agent');
-    expect(posts).toContain('authorizationPolicies:Enterprise Agent User');
-    expect(posts).toContain('authorizationPolicies:Enterprise Agent Delegation');
+    expect(posts).not.toContain('authorizationPolicies:Enterprise Agent User');
+    expect(posts).not.toContain('authorizationPolicies:Enterprise Agent Delegation');
     expect(posts.indexOf('authorizationAttributes:EnterpriseAgent')).toBeLessThan(posts.indexOf('authorizationServices:EnterpriseAgent User Introspection'));
-    expect(posts.indexOf('authorizationServices:EnterpriseAgent User Introspection')).toBeLessThan(posts.indexOf('authorizationPolicies:Enterprise Agent User'));
+    expect(posts.indexOf('authorizationServices:EnterpriseAgent User Introspection')).toBeLessThan(posts.indexOf('authorizationPolicies:Enterprise Agent'));
 
     const attributePosts = fake.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/authorizationAttributes'));
     for (const call of attributePosts) {
@@ -231,8 +241,10 @@ describe('real Authorize scaffold', () => {
     expect(groupsComparisonUsesCollection()).toBe(true);
 
     const parentPut = [...fake.calls].reverse().find((call) => call.method === 'PUT' && call.body?.combiningAlgorithm && JSON.stringify(call.body.combiningAlgorithm).includes('DENY_OVERRIDES'));
-    const childAlgorithms = (parentPut?.body?.children as { combiningAlgorithm?: { algorithm?: string } }[] | undefined)?.map((child) => child.combiningAlgorithm?.algorithm);
-    expect(childAlgorithms).toEqual(['FIRST_APPLICABLE', 'FIRST_APPLICABLE']);
+    const inlineChildren = parentPut?.body?.children as { id?: string; type?: string; name?: string; combiningAlgorithm?: { algorithm?: string } }[] | undefined;
+    expect(inlineChildren?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
+    expect(inlineChildren?.every((child) => child.type === 'POLICY' && !child.id)).toBe(true);
+    expect(inlineChildren?.map((child) => child.combiningAlgorithm?.algorithm)).toEqual(['FIRST_APPLICABLE', 'FIRST_APPLICABLE']);
 
     const endpointPut = fake.calls.find((call) => call.method === 'PUT' && call.url.includes('/decisionEndpoints/'));
     expect(endpointPut?.body?.authorizationVersion).toEqual({ id: 'ver-1' });
@@ -248,6 +260,69 @@ describe('real Authorize scaffold', () => {
       alwaysCurrent: false,
     });
     expect(fake.calls.filter((call) => call.method === 'POST' || call.method === 'PUT')).toHaveLength(writes);
+    expect(fake.calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
+  });
+
+  it('creates the child policies inline and deletes only the exact-name orphans', async () => {
+    const store = memoryStore();
+    const fake = pingone();
+    fake.resources.set('root-existing', {
+      id: 'root-existing',
+      name: 'Enterprise Agent',
+      kind: 'authorizationPolicies',
+      version: 'v1',
+      type: 'POLICY',
+      enabled: true,
+      description: 'parent',
+      combiningAlgorithm: { algorithm: 'FIRST_APPLICABLE' },
+      children: [],
+    });
+    for (const [id, name] of [
+      ['user-orphan', 'Enterprise Agent User'],
+      ['delegation-orphan', 'Enterprise Agent Delegation'],
+    ] as const) {
+      fake.resources.set(id, {
+        id,
+        name,
+        kind: 'authorizationPolicies',
+        version: 'v1',
+        type: 'POLICY',
+        enabled: true,
+        combiningAlgorithm: { algorithm: 'FIRST_APPLICABLE' },
+        children: [],
+      });
+    }
+    fake.resources.set('keep-me', {
+      id: 'keep-me',
+      name: 'Keep Me',
+      kind: 'authorizationPolicies',
+      version: 'v1',
+      type: 'POLICY',
+      enabled: true,
+      children: [],
+    });
+    const enterprise = config();
+    const result = await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+    });
+    expect(result.policies.map((policy) => policy.remoteId)).not.toContain('user-orphan');
+    expect(fake.resources.has('user-orphan')).toBe(false);
+    expect(fake.resources.has('delegation-orphan')).toBe(false);
+    expect(fake.resources.has('keep-me')).toBe(true);
+    const deleted = fake.calls.filter((call) => call.method === 'DELETE').map((call) => call.url);
+    expect(deleted).toEqual(expect.arrayContaining([expect.stringContaining('/user-orphan'), expect.stringContaining('/delegation-orphan')]));
+    expect(deleted.some((url) => url.includes('keep-me'))).toBe(false);
+    const parent = fake.resources.get('root-existing');
+    const refs = parent?.children as { type?: string; name?: string; value?: { id?: string } }[];
+    expect(refs?.map((child) => child.type)).toEqual(['POLICY', 'POLICY']);
+    expect(refs?.every((child) => !child.name && child.value?.id)).toBe(true);
+    expect(refs?.map((child) => fake.resources.get(child.value?.id ?? '')?.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
   });
 
   it('reuses a half-created parent by name and does not replace a console secret', async () => {

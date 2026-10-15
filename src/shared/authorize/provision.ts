@@ -15,6 +15,7 @@ import {
   decisionEndpointBody,
   decisionEndpointUpdate,
   delegationRulePlans,
+  inlinePolicyChild,
   introspectUrl,
   policyShell,
   ruleBody,
@@ -166,36 +167,15 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     headers,
     going,
   );
-  const user = await ensureResource(
-    input,
-    `${api}/authorizationPolicies`,
-    'policy',
-    USER_POLICY,
-    policyShell(USER_POLICY, 'User policy. The SSO access token is introspected for groups and active, and Protect risk is supplied by the client.', 'FIRST_APPLICABLE'),
-    headers,
-    going,
-  );
-  const delegation = await ensureResource(
-    input,
-    `${api}/authorizationPolicies`,
-    'policy',
-    DELEGATION_POLICY,
-    policyShell(
-      DELEGATION_POLICY,
-      'Delegation policy. The token-exchanged token is introspected as EnterpriseAgent.tx-token. Approval claims are omitted until human-in-the-loop approval lands.',
-      'FIRST_APPLICABLE',
-    ),
-    headers,
-    going,
-  );
-
   const userPlans = userRulePlans(input.adminGroup);
   const delegationPlans = delegationRulePlans(input.delegations);
   if (!going()) return abandoned(input);
-  const userWithRules = await putRules(input, api, headers, user, userPlans, attributeIds, going);
-  const delegationWithRules = await putRules(input, api, headers, delegation, delegationPlans, attributeIds, going);
+  const nested = await nestChildren(input, api, headers, root, going);
+  if (!nested) return abandoned(input);
+  const userWithRules = await putRules(input, api, headers, nested.user, userPlans, attributeIds, going);
+  const delegationWithRules = await putRules(input, api, headers, nested.delegation, delegationPlans, attributeIds, going);
   if (!going()) return abandoned(input);
-  await nestChildren(input, api, headers, root, [userWithRules, delegationWithRules], going);
+  await assertNested(input, api, headers, root.id);
 
   const endpoint = await ensureDecisionEndpoint(input, api, headers, going);
   return {
@@ -234,33 +214,96 @@ async function putRules(
   return written;
 }
 
+const CHILD_POLICIES = [
+  {
+    name: USER_POLICY,
+    description: 'User policy. The SSO access token is introspected for groups and active, and Protect risk is supplied by the client.',
+  },
+  {
+    name: DELEGATION_POLICY,
+    description:
+      'Delegation policy. The token-exchanged token is introspected as EnterpriseAgent.tx-token. Approval claims are omitted until human-in-the-loop approval lands.',
+  },
+] as const;
+
 async function nestChildren(
   input: ProvisionInput,
   api: string,
   headers: Record<string, string>,
   root: Resource,
-  children: Resource[],
   going: () => boolean,
-): Promise<void> {
-  if (!going()) return;
+): Promise<{ user: Resource; delegation: Resource } | null> {
   const current = await readResource(input, `${api}/authorizationPolicies/${root.id}`, headers);
-  const names = childrenOf(current).map((child) => child.name);
-  const algorithm = (current.combiningAlgorithm as { algorithm?: string } | undefined)?.algorithm;
-  if (names.includes(USER_POLICY) && names.includes(DELEGATION_POLICY) && algorithm === 'DENY_OVERRIDES') return;
-  const nested = children.map((child) => {
-    const copy = writablePolicy(child, childrenOf(child));
-    copy.combiningAlgorithm = { algorithm: 'FIRST_APPLICABLE' };
-    return copy;
-  });
-  const body = writablePolicy(current, nested);
+  const present = await resolvePolicyChildren(input, api, headers, current);
+  if (nestedReady(current, present)) return requiredChildren(present);
+  if (!going()) return null;
+  const keep = new Set(present.map((child) => child.id));
+  await deleteOrphanPolicies(input, api, headers, keep, root.id);
+  const fresh = await readResource(input, `${api}/authorizationPolicies/${root.id}`, headers);
+  const retained = await resolvePolicyChildren(input, api, headers, fresh);
+  const retainedNames = new Set(retained.map((child) => child.name));
+  const inline = CHILD_POLICIES.filter((child) => !retainedNames.has(child.name)).map((child) => inlinePolicyChild(child.name, child.description));
+  const references = retained.map((child) => ({ type: 'POLICY', value: { id: child.id } }));
+  const body = writablePolicy(fresh, [...references, ...inline]);
   body.combiningAlgorithm = { algorithm: 'DENY_OVERRIDES' };
   const written = await writePolicy(input, api, headers, body);
-  const writtenNames = childrenOf(written).map((child) => child.name);
-  if (!writtenNames.includes(USER_POLICY) || !writtenNames.includes(DELEGATION_POLICY)) {
-    throw new Error('PingOne did not keep the user and delegation policies under the parent.');
+  const created = await resolvePolicyChildren(input, api, headers, written);
+  if (!nestedReady(written, created)) throw new Error('PingOne did not keep the user and delegation policies under the parent.');
+  return requiredChildren(created);
+}
+
+async function assertNested(input: ProvisionInput, api: string, headers: Record<string, string>, rootId: string): Promise<void> {
+  const read = await readResource(input, `${api}/authorizationPolicies/${rootId}`, headers);
+  const children = await resolvePolicyChildren(input, api, headers, read);
+  if (!nestedReady(read, children)) throw new Error('PingOne did not keep the user and delegation policies under the parent.');
+}
+
+function nestedReady(parent: Resource, children: Resource[]): boolean {
+  const names = new Set(children.map((child) => child.name));
+  const algorithm = (parent.combiningAlgorithm as { algorithm?: string } | undefined)?.algorithm;
+  return names.has(USER_POLICY) && names.has(DELEGATION_POLICY) && algorithm === 'DENY_OVERRIDES';
+}
+
+function requiredChildren(children: Resource[]): { user: Resource; delegation: Resource } {
+  const user = children.find((child) => child.name === USER_POLICY);
+  const delegation = children.find((child) => child.name === DELEGATION_POLICY);
+  if (!user || !delegation) throw new Error('PingOne did not keep the user and delegation policies under the parent.');
+  return { user, delegation };
+}
+
+/** A parent read may embed a child or return only `{ type, value: { id } }`. Both are the same placement. */
+async function resolvePolicyChildren(input: ProvisionInput, api: string, headers: Record<string, string>, parent: Resource): Promise<Resource[]> {
+  const resolved: Resource[] = [];
+  for (const child of childrenOf(parent)) {
+    if (child.type === 'RULE' || child.effectSettings) continue;
+    const referenced = (child.value as { id?: string } | undefined)?.id;
+    const id = typeof child.id === 'string' && child.id ? child.id : referenced;
+    if (typeof child.name === 'string' && child.name && id && child.id === id && !referenced) {
+      resolved.push(child);
+      continue;
+    }
+    if (!id) continue;
+    resolved.push(await readResource(input, `${api}/authorizationPolicies/${id}`, headers));
   }
-  const writtenAlgorithm = (written.combiningAlgorithm as { algorithm?: string } | undefined)?.algorithm;
-  if (writtenAlgorithm !== 'DENY_OVERRIDES') throw new Error('PingOne parent policy is not DENY_OVERRIDES.');
+  return resolved;
+}
+
+async function deleteOrphanPolicies(
+  input: ProvisionInput,
+  api: string,
+  headers: Record<string, string>,
+  keep: Set<string>,
+  rootId: string,
+): Promise<void> {
+  const names = new Set<string>(CHILD_POLICIES.map((child) => child.name));
+  const listed = await listResources(input, `${api}/authorizationPolicies`, 'authorizationPolicies', headers);
+  for (const policy of listed) {
+    if (!policy.name || !names.has(policy.name) || policy.id === rootId || keep.has(policy.id)) continue;
+    const response = await input.client.request(`${api}/authorizationPolicies/${policy.id}`, { method: 'DELETE', headers });
+    if (response.status === 404) continue;
+    if (!response.ok) throw new Error(await errorText(response, `PingOne did not delete the orphaned policy ${policy.name}`));
+    await input.client.paceAfterManagementPost();
+  }
 }
 
 async function ensureDecisionEndpoint(input: ProvisionInput, api: string, headers: Record<string, string>, going: () => boolean): Promise<Resource> {

@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { Repository } from '../src/main/db';
 import { Runtime } from '../src/main/runtime';
 import { parseBranding } from '../src/shared/branding';
-import { authorizeWriteError } from '../src/shared/authorize/framework';
+import { authorizeWriteError, recordedPolicyChildren } from '../src/shared/authorize/framework';
 import { parseEnterpriseConfig } from '../src/shared/config';
 import { decodeJwtPayload, encodeJsonSegment } from '../src/shared/ids';
 import { MemorySecretStore } from '../src/shared/secrets';
@@ -1455,6 +1455,10 @@ function authorizeSide(target: string, method: string, bodyText: string): Respon
   }
   const id = idMatch?.[2] === 'tag' ? 'ver-1' : (idMatch?.[2] ?? '');
   if (id === 'ver-1' && method === 'GET') return json(200, { id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+  if (method === 'DELETE') {
+    authorizeResources.delete(id);
+    return new Response(null, { status: 204 });
+  }
   if (method === 'GET') {
     const saved = authorizeResources.get(id);
     return saved ? json(200, saved) : json(404, { message: 'missing' });
@@ -1463,6 +1467,11 @@ function authorizeSide(target: string, method: string, bodyText: string): Respon
     const saved: Record<string, unknown> = { ...(authorizeResources.get(id) ?? {}), ...body, id, version: 'v2', collection };
     if (collection === 'decisionEndpoints' && !Object.prototype.hasOwnProperty.call(body, 'authorizationVersion')) {
       delete saved.authorizationVersion;
+    }
+    if (collection === 'authorizationPolicies') {
+      saved.children = recordedPolicyChildren(body.children, new Set(authorizeResources.keys()), () => `tf-${(authorizeSeq += 1)}`, (childId, child) => {
+        authorizeResources.set(childId, { ...child, collection: 'authorizationPolicies' });
+      });
     }
     authorizeResources.set(id, saved);
     return json(200, saved);

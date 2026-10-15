@@ -24,7 +24,7 @@ Two top-level HTTP services, with no parent, POST `{authHost}/{environmentId}/as
 
 Service attributes read `$.active`, `$.groups`, `$.sub`, and for the exchanged token `$.act.sub`, `$.aud`, and `$.scope`. Each processor is named `Extract <attribute>`, for example `Extract introspection-groups`.
 
-The parent policy `Enterprise Agent` uses `DENY_OVERRIDES`. The decision is deny when either child denies. `INDETERMINATE` and `NOT_APPLICABLE` fail closed in the client.
+The parent policy `Enterprise Agent` uses `DENY_OVERRIDES`. The decision is deny when either child denies. `INDETERMINATE` and `NOT_APPLICABLE` fail closed in the client. The user and delegation policies are created inline in that parent PUT, with `type: POLICY` and no id. An existing top-level policy is not moved. A leftover with the exact name `Enterprise Agent User` or `Enterprise Agent Delegation` is deleted first. The parent read has no expand parameter. It may return each child in full or as `{ type: POLICY, value: { id } }`. Scaffold follows the reference before it checks the names.
 
 1. **Enterprise Agent User** (`FIRST_APPLICABLE`). High risk, a `block` action, or an inactive access token denies. A `read_only` action permits a read-only feature payload. Membership of `access.adminGroup` in `$.groups` permits the full payload (`CONTAINS`, because a JSONPath filter that matches nobody throws and would stop the chain). An active token permits the session payload. There is no catch-all deny.
 2. **Enterprise Agent Delegation** (`FIRST_APPLICABLE`). `authorize.delegations` is an allowlist of `humanSub`, `agentSub`, and optional `audience` and `scope`. The last rule permits when `tx-active` is `true` and `tx-act-sub` is not empty. `isApproved` is not used.
