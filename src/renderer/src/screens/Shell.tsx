@@ -31,6 +31,7 @@ export function Shell({
   const [view, setView] = useState<(typeof NAV)[number][0]>('chat');
   const riskClass = state.risk?.action === 'block' ? 'danger' : state.risk?.action === 'allow' ? 'good' : 'warn';
   const readOnly = state.features.chat === 'read_only';
+  const canScaffold = Boolean(state.session?.admin && state.features.policyTab);
 
   useEffect(() => {
     if (view === 'policy' && !showPolicy) setView('chat');
@@ -71,6 +72,16 @@ export function Shell({
         </div>
       </aside>
       <section className="workspace">
+        {state.restriction ? (
+          <div className="notice access-notice">
+            <p>{state.restriction.message}</p>
+            {canScaffold ? (
+              <button type="button" className="primary" onClick={() => setView('policy')}>
+                Scaffold policies
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} readOnly={readOnly} /> : null}
         {view === 'rooms' ? <RoomsScreen showReasoning={state.showReasoning} readOnly={readOnly} /> : null}
         {view === 'agents' ? <AgentsScreen branding={branding} /> : null}
