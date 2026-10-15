@@ -30,6 +30,8 @@ import {
   type AuthorizePolicy,
   type DecisionInput,
 } from '@shared/authorize/policy';
+import { decisionTokensReady, type DecisionCall } from '@shared/authorize/framework';
+import { provisionAuthorize } from '@shared/authorize/provision';
 import { AuthorizeClient, listRemotePolicies, postDecision, setRemotePolicyEnabled, syncRemoteScaffold } from '@shared/authorize/remote';
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
 import { PINGONE_SKILL_ID, pingoneSkillInstructions, type SkillDraft } from '@shared/skills/markdown';
@@ -687,6 +689,7 @@ export class Runtime {
     this.decisionCache = null;
     const removed = this.options.db.listPolicies();
     for (const policy of removed) this.options.db.deletePolicy(policy.id);
+    this.options.db.clearTfObjects();
     const cleared = policyResetDetail(removed.map((policy) => policy.name));
     this.audit(null, 'policy:reset-cache', cleared);
     await this.refreshFeatures();
@@ -1481,7 +1484,8 @@ export class Runtime {
 
   private decisionEndpointId(): string {
     if (this.options.config.tenant.mode !== 'pingone') return '';
-    return this.options.config.authorize.decisionEndpointId.trim();
+    const saved = this.options.db.getSetting('authorize.decisionEndpointId')?.trim() ?? '';
+    return saved || this.options.config.authorize.decisionEndpointId.trim();
   }
 
   private policiesForDecision(): AuthorizePolicy[] {
@@ -1657,6 +1661,8 @@ export class Runtime {
     const pending = this.options.db.listPolicies().filter((policy) => policy.scaffold && !policy.remoteId);
     const posted = await this.pushScaffold(pending, epoch);
     if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
+    if (this.options.config.tenant.mode === 'pingone') await this.provisionRealPolicies(epoch);
+    if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
     const created = posted.length > 0 ? posted : merged.created;
     if (created.length > 0) {
       this.audit(null, 'policy:scaffold', created.map((policy) => policy.name).join(', '));
@@ -1672,6 +1678,73 @@ export class Runtime {
       created: [],
       policies: this.options.db.listPolicies().map(policyView),
     };
+  }
+
+  private async provisionRealPolicies(epoch: number): Promise<void> {
+    if (epoch !== this.policyEpoch) return;
+    const token = await this.workerAccessToken();
+    const result = await provisionAuthorize({
+      config: this.options.config,
+      accessToken: token,
+      client: this.authorize,
+      store: {
+        get: (kind, name) => this.options.db.getTfObject(kind, name),
+        put: (kind, name, remoteId, contentHash) => this.options.db.upsertTfObject(kind, name, remoteId, contentHash),
+      },
+      adminGroup: this.options.config.access.adminGroup,
+      delegations: this.options.config.authorize.delegations,
+      alwaysCurrent: this.options.config.authorize.alwaysCurrent,
+      shouldContinue: () => epoch === this.policyEpoch,
+    });
+    if (epoch !== this.policyEpoch || !result.decisionEndpointId) return;
+    this.options.db.setSetting('authorize.decisionEndpointId', result.decisionEndpointId);
+    this.options.config.authorize.decisionEndpointId = result.decisionEndpointId;
+    this.persistDecisionEndpoint(result.decisionEndpointId);
+    for (const policy of result.policies) {
+      if (epoch !== this.policyEpoch) return;
+      this.options.db.upsertPolicy(policy);
+    }
+  }
+
+  private persistDecisionEndpoint(id: string): void {
+    const path = this.options.configPath;
+    if (!path) return;
+    try {
+      const raw = JSON.parse(readFileSync(path, 'utf8')) as { authorize?: Record<string, unknown> };
+      raw.authorize = { ...(raw.authorize ?? {}), decisionEndpointId: id };
+      writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
+    } catch {
+      // The settings row and the running config already hold the id.
+    }
+  }
+
+  private async decisionCall(input: DecisionInput): Promise<DecisionCall | null> {
+    if (!this.session) return null;
+    const accessToken = (await this.subjectToken().catch(() => '')).trim();
+    const txToken = (await this.delegationToken()).trim();
+    if (!decisionTokensReady(accessToken, txToken)) return null;
+    return {
+      ...input,
+      userId: this.session.userId,
+      username: this.session.username,
+      accessToken,
+      txToken,
+      adminGroup: this.options.config.access.adminGroup,
+      parentName: 'EnterpriseAgent',
+    };
+  }
+
+  private async delegationToken(): Promise<string> {
+    const configured = this.options.config.authorize.delegationAudience.trim();
+    const match = this.options.config.tokenExchange.audiences.find((item) => item.audience === configured);
+    const audience = match?.audience || this.options.config.tokenExchange.audiences[0]?.audience || '';
+    if (!audience) return '';
+    const scope = match?.scope || this.options.config.tokenExchange.audiences.find((item) => item.audience === audience)?.scope || '';
+    try {
+      return await this.tokenForAudience(audience, scope);
+    } catch {
+      return '';
+    }
   }
 
   private async pushScaffold(pending: AuthorizePolicy[], epoch: number): Promise<AuthorizePolicy[]> {
@@ -1713,14 +1786,14 @@ export class Runtime {
       this.applyFeatures(local, key);
       return;
     }
+    const call = await this.decisionCall(input);
+    if (!call) {
+      this.applyFeatures(failClosed(this.now()), key);
+      return;
+    }
     try {
       const token = await this.workerAccessToken();
-      const body = await postDecision(
-        this.options.config,
-        token,
-        { ...input, userId: this.session.userId, username: this.session.username },
-        this.authorize,
-      );
+      const body = await postDecision(this.options.config, token, call, this.authorize);
       const remote = featuresFromAuthorize(body, this.now());
       const fallback = stored.length === 0 ? evaluatePolicies(starters, input, this.now()) : local;
       this.applyFeatures(remote ?? fallback, key);
@@ -2805,7 +2878,7 @@ function policyResetDetail(names: string[]): string {
   const count = names.length;
   const noun = count === 1 ? 'policy' : 'policies';
   const listed = count === 0 ? '' : ` (${names.join(', ')})`;
-  return `Cleared ${count} local ${noun}${listed}, the Authorize decision cache, and any scaffold still in progress. Nothing in PingOne was deleted.`;
+  return `Cleared ${count} local ${noun}${listed}, the Authorize decision cache, saved Trust Framework ids, and any scaffold still in progress. Nothing in PingOne was deleted.`;
 }
 
 function defaultProtectSchedule(delayMs: number, run: () => Promise<void>): () => void {

@@ -51,23 +51,6 @@ export function riskScore(level: RiskLevel): number {
   return 0;
 }
 
-export function decisionParameters(input: DecisionInput & { userId: string; username: string }): {
-  parameters: Record<string, string>;
-  userContext: { user: { id: string } };
-} {
-  return {
-    parameters: {
-      'user.id': input.userId,
-      'user.name': input.username,
-      'user.groups': JSON.stringify(input.groups),
-      'risk.level': input.riskLevel,
-      'risk.score': String(riskScore(input.riskLevel)),
-      'risk.action': input.riskAction,
-    },
-    userContext: { user: { id: input.userId } },
-  };
-}
-
 export function scaffoldPolicies(adminGroup: string, now: number, updatedBy: string): AuthorizePolicy[] {
   const stamp = { updatedAt: now, updatedBy, enabled: true, scaffold: true, remoteId: null };
   return [
@@ -254,7 +237,7 @@ export function featuresFromAuthorize(body: unknown, now: number): FeatureDecisi
   if (!body || typeof body !== 'object') return null;
   const record = body as { decision?: unknown; statements?: unknown };
   const decision = typeof record.decision === 'string' ? record.decision.toUpperCase() : '';
-  if (decision === 'DENY') return failClosed(now);
+  if (decision === 'DENY' || decision === 'INDETERMINATE' || decision === 'NOT_APPLICABLE') return failClosed(now);
   const statements = Array.isArray(record.statements) ? record.statements : [];
   for (const statement of statements) {
     if (!statement || typeof statement !== 'object') continue;

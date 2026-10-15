@@ -173,7 +173,7 @@ function referenceDirective(files: string[]): string {
     'read_skill_reference returns file text only. Do not execute scripts/walk_policy_tree.py.',
     'Desktop scaffold policies are free-standing library policies. Do not send parent on POST /authorizationPolicies. A 201 from POST-with-parent can still place the policy under the shared Policies root. AAM Custom-node placement is a full PUT of that node when disallowChildren is false.',
     'Worker and AI Agent client-credentials tokens use HTTP Basic (client_secret_basic). Do not put client_id or client_secret in the token request body.',
-    'Trust Framework REQUEST parameters use the attribute full name and a JSON value whose type matches valueType. The desktop decision client uses a separate contract: every parameter value is a string (user.id, user.name, user.groups, risk.level, risk.score, risk.action). Do not send those app keys as numbers, and do not send Trust Framework names to that desktop decision call.',
+    'The desktop decision call sends EnterpriseAgent REQUEST attributes by full name. risk-score is a JSON number. access-token and tx-token are the SSO token and the token-exchanged token. Do not add a processor to a REQUEST attribute. Do not reference isApproved until human-in-the-loop approval is configured.',
     'Available references:',
     ...files.map((file) => `- ${file} — ${referenceBlurb(file)}`),
   ].join('\n');

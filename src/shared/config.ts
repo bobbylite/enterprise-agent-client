@@ -125,8 +125,20 @@ export const enterpriseConfigSchema = z.object({
       decisionEndpointId: z.string().default(''),
       cacheMs: z.number().int().positive().default(30_000),
       mcpServerId: z.string().min(1).default('pingone'),
+      delegationAudience: z.string().default(''),
+      alwaysCurrent: z.boolean().default(false),
+      delegations: z
+        .array(
+          z.object({
+            humanSub: z.string().default(''),
+            agentSub: z.string().default(''),
+            audience: z.string().default(''),
+            scope: z.string().default(''),
+          }),
+        )
+        .default([]),
     })
-    .default({ decisionEndpointId: '', cacheMs: 30_000, mcpServerId: 'pingone' }),
+    .default({ decisionEndpointId: '', cacheMs: 30_000, mcpServerId: 'pingone', delegationAudience: '', alwaysCurrent: false, delegations: [] }),
   agents: z.array(
     z.object({
       id: z.string().min(1),
