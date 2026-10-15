@@ -5,14 +5,38 @@ import { FEATURE_STATEMENT, riskScore, type DecisionInput } from './policy';
 /** Trust Framework parent. Children use this prefix as their full attribute name. */
 export const TRUST_PARENT = 'EnterpriseAgent';
 
-export const REQUEST_ATTRIBUTES = [
+export type AttributeValueType = 'STRING' | 'NUMBER' | 'JSON' | 'BOOLEAN';
+
+export interface ValueTypeSpec {
+  type: AttributeValueType;
+}
+
+export interface ResolverSpec {
+  type: 'REQUEST' | 'CONSTANT' | 'SERVICE';
+  valueType: ValueTypeSpec;
+  /** Constant literal. Definitions stay empty so a console-entered secret is not overwritten. */
+  value?: string;
+  service?: string;
+}
+
+export interface AttributeSpec {
+  name: string;
+  description: string;
+  valueType: ValueTypeSpec;
+  resolvers: ResolverSpec[];
+  processor?: { type: 'JSON_PATH'; expression: string; valueType: ValueTypeSpec };
+}
+
+const REQUEST_ATTRIBUTE_SPECS: { name: string; valueType: AttributeValueType }[] = [
   { name: 'access-token', valueType: 'STRING' },
   { name: 'tx-token', valueType: 'STRING' },
   { name: 'risk-level', valueType: 'STRING' },
   { name: 'risk-score', valueType: 'NUMBER' },
   { name: 'risk-action', valueType: 'STRING' },
   { name: 'admin-group', valueType: 'STRING' },
-] as const;
+];
+
+export const REQUEST_ATTRIBUTES = REQUEST_ATTRIBUTE_SPECS;
 
 export const CLIENT_ID_DEFINITION = 'introspect-client-id';
 export const CLIENT_SECRET_DEFINITION = 'introspect-client-secret';
@@ -85,38 +109,123 @@ export function introspectUrl(config: EnterpriseConfig): string {
   return `${host}/${config.tenant.environmentId}/as/introspect`;
 }
 
-export function parentAttributeBody(): Record<string, unknown> {
-  return {
-    name: TRUST_PARENT,
-    description: 'Parent for Enterprise Agent decision attributes. Not an API Access Management attribute.',
-    type: 'ATTRIBUTE',
-    valueType: { type: 'JSON' },
-    resolvers: [{ type: 'CONSTANT', value: '{}', valueType: { type: 'JSON' } }],
-  };
+function typed(type: AttributeValueType): ValueTypeSpec {
+  return { type };
 }
 
-export function requestAttributeBody(parentId: string, name: string, valueType: string): Record<string, unknown> {
+function requestSpec(name: string, valueType: AttributeValueType): AttributeSpec {
   return {
     name,
     description: `Request parameter ${fullAttributeName(TRUST_PARENT, name)}. No processor: the resolver already returns the scalar.`,
-    type: 'ATTRIBUTE',
-    parent: { id: parentId },
-    resolvers: [{ type: 'REQUEST', valueType: { type: valueType } }],
-    valueType: { type: valueType },
+    valueType: typed(valueType),
+    resolvers: [{ type: 'REQUEST', valueType: typed(valueType) }],
   };
 }
 
-export function definitionBody(parentId: string, name: string, secret: boolean): Record<string, unknown> {
+function definitionSpec(name: string, secret: boolean): AttributeSpec {
   return {
     name,
     description: secret
       ? 'Paste the custom resource client secret in the PingOne console. Scaffold never writes this secret.'
       : 'Paste the custom resource client id in the PingOne console if it is not already set.',
-    type: 'ATTRIBUTE',
-    parent: { id: parentId },
-    resolvers: [{ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } }],
-    valueType: { type: 'STRING' },
+    valueType: typed('STRING'),
+    resolvers: [{ type: 'CONSTANT', value: '', valueType: typed('STRING') }],
   };
+}
+
+function serviceSpec(name: string, service: string, path: string): AttributeSpec {
+  return {
+    name,
+    description: `Claim ${path} from introspection. JSONPath is used because the service returns JSON.`,
+    valueType: typed('STRING'),
+    resolvers: [{ type: 'SERVICE', valueType: typed('STRING'), service }],
+    processor: { type: 'JSON_PATH', expression: path, valueType: typed('STRING') },
+  };
+}
+
+/** Concrete attribute specs. Every attribute and every resolver has a valueType before any HTTP call. */
+export function attributePlan(): AttributeSpec[] {
+  return [
+    {
+      name: TRUST_PARENT,
+      description: 'Parent for Enterprise Agent decision attributes. Not an API Access Management attribute.',
+      valueType: typed('JSON'),
+      resolvers: [{ type: 'CONSTANT', value: '{}', valueType: typed('JSON') }],
+    },
+    ...REQUEST_ATTRIBUTE_SPECS.map((attribute) => requestSpec(attribute.name, attribute.valueType)),
+    definitionSpec(CLIENT_ID_DEFINITION, false),
+    definitionSpec(CLIENT_SECRET_DEFINITION, true),
+    ...SERVICE_ATTRIBUTES.map((attribute) => serviceSpec(attribute.name, attribute.service, attribute.path)),
+  ];
+}
+
+/** The plan Scaffold will write, built from the enterprise config with no HTTP. */
+export function scaffoldPlan(config: EnterpriseConfig): {
+  attributes: AttributeSpec[];
+  services: { name: string; valueType: ValueTypeSpec; tokenAttribute: string; url: string }[];
+} {
+  return {
+    attributes: attributePlan(),
+    services: [
+      { name: USER_SERVICE, valueType: typed('JSON'), tokenAttribute: 'access-token', url: introspectUrl(config) },
+      { name: DELEGATION_SERVICE, valueType: typed('JSON'), tokenAttribute: 'tx-token', url: introspectUrl(config) },
+    ],
+  };
+}
+
+export function attributeSpec(name: string): AttributeSpec {
+  const spec = attributePlan().find((item) => item.name === name);
+  if (!spec) throw new Error(`No attribute spec for ${name}.`);
+  if (!spec.valueType?.type) throw new Error(`${name} attribute valueType is undefined.`);
+  for (const resolver of spec.resolvers) {
+    if (!resolver.valueType?.type) throw new Error(`${name} resolver valueType is undefined.`);
+  }
+  if (spec.processor && !spec.processor.valueType?.type) throw new Error(`${name} processor valueType is undefined.`);
+  return spec;
+}
+
+export function attributeBody(name: string, links: { parentId?: string; serviceId?: string } = {}): Record<string, unknown> {
+  const spec = attributeSpec(name);
+  const resolvers = spec.resolvers.map((resolver) => {
+    const written: Record<string, unknown> = { type: resolver.type, valueType: resolver.valueType };
+    if (resolver.type === 'CONSTANT') written.value = resolver.value ?? '';
+    if (resolver.type === 'SERVICE') {
+      if (!links.serviceId) throw new Error(`${name} is missing its service id.`);
+      written.value = { id: links.serviceId };
+    }
+    return written;
+  });
+  const body: Record<string, unknown> = {
+    name: spec.name,
+    description: spec.description,
+    type: 'ATTRIBUTE',
+    valueType: spec.valueType,
+    resolvers,
+  };
+  if (links.parentId) body.parent = { id: links.parentId };
+  if (spec.processor) body.processor = spec.processor;
+  return body;
+}
+
+export function parentAttributeBody(): Record<string, unknown> {
+  return attributeBody(TRUST_PARENT);
+}
+
+export function requestAttributeBody(parentId: string, name: string, valueType: string): Record<string, unknown> {
+  const body = attributeBody(name, { parentId });
+  const spec = attributeSpec(name);
+  if (spec.valueType.type !== valueType) throw new Error(`${name} valueType is ${spec.valueType.type}, not ${valueType}.`);
+  return body;
+}
+
+export function definitionBody(parentId: string, name: string, secret: boolean): Record<string, unknown> {
+  const spec = attributeSpec(name);
+  const constant = spec.resolvers[0];
+  if (constant?.type !== 'CONSTANT' || constant.value !== '' || spec.valueType.type !== 'STRING') {
+    throw new Error(`${name} is not an empty STRING Definition.`);
+  }
+  if (secret !== (name === CLIENT_SECRET_DEFINITION)) throw new Error(`${name} secret flag does not match the spec.`);
+  return attributeBody(name, { parentId });
 }
 
 export function serviceBody(name: string, url: string, tokenAttributeId: string, clientIdDefinitionId: string, secretDefinitionId: string): Record<string, unknown> {
@@ -144,15 +253,9 @@ export function serviceBody(name: string, url: string, tokenAttributeId: string,
 }
 
 export function serviceAttributeBody(parentId: string, name: string, serviceId: string, path: string): Record<string, unknown> {
-  return {
-    name,
-    description: `Claim ${path} from introspection. JSONPath is used because the service returns JSON.`,
-    type: 'ATTRIBUTE',
-    parent: { id: parentId },
-    resolvers: [{ type: 'SERVICE', value: { id: serviceId }, valueType: { type: 'STRING' } }],
-    processor: { type: 'JSON_PATH', expression: path, valueType: { type: 'STRING' } },
-    valueType: { type: 'STRING' },
-  };
+  const spec = attributeSpec(name);
+  if (spec.processor?.expression !== path) throw new Error(`${name} JSONPath is ${String(spec.processor?.expression)}.`);
+  return attributeBody(name, { parentId, serviceId });
 }
 
 export interface ConditionPlan {

@@ -7,21 +7,17 @@ import {
   DECISION_ENDPOINT,
   DELEGATION_POLICY,
   DELEGATION_SERVICE,
-  REQUEST_ATTRIBUTES,
   ROOT_POLICY,
-  SERVICE_ATTRIBUTES,
   TRUST_PARENT,
   USER_POLICY,
   USER_SERVICE,
-  definitionBody,
+  attributeBody,
   delegationRulePlans,
   introspectUrl,
-  parentAttributeBody,
   policyShell,
-  requestAttributeBody,
   ruleBody,
   ruleSetHash,
-  serviceAttributeBody,
+  scaffoldPlan,
   serviceBody,
   userRulePlans,
   writablePolicy,
@@ -70,22 +66,23 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
   };
   const going = () => input.shouldContinue?.() !== false;
 
-  const parent = await ensureResource(input, `${api}/authorizationAttributes`, 'attribute', TRUST_PARENT, parentAttributeBody(), headers, going);
+  const plan = scaffoldPlan(input.config);
+  const parent = await ensureResource(input, `${api}/authorizationAttributes`, 'attribute', TRUST_PARENT, attributeBody(TRUST_PARENT), headers, going);
   assertParent(parent);
 
   const requestIds = new Map<string, string>();
-  for (const attribute of REQUEST_ATTRIBUTES) {
+  for (const attribute of plan.attributes.filter((item) => item.resolvers[0]?.type === 'REQUEST')) {
     if (!going()) return abandoned(input);
     const saved = await ensureResource(
       input,
       `${api}/authorizationAttributes`,
       'attribute',
       attribute.name,
-      requestAttributeBody(parent.id, attribute.name, attribute.valueType),
+      attributeBody(attribute.name, { parentId: parent.id }),
       headers,
       going,
     );
-    assertRequestAttribute(saved, attribute.valueType, parent.id);
+    assertRequestAttribute(saved, attribute.valueType.type, parent.id);
     requestIds.set(attribute.name, saved.id);
   }
 
@@ -94,7 +91,7 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     `${api}/authorizationAttributes`,
     'attribute',
     CLIENT_ID_DEFINITION,
-    definitionBody(parent.id, CLIENT_ID_DEFINITION, false),
+    attributeBody(CLIENT_ID_DEFINITION, { parentId: parent.id }),
     headers,
     going,
   );
@@ -103,14 +100,14 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     `${api}/authorizationAttributes`,
     'attribute',
     CLIENT_SECRET_DEFINITION,
-    definitionBody(parent.id, CLIENT_SECRET_DEFINITION, true),
+    attributeBody(CLIENT_SECRET_DEFINITION, { parentId: parent.id }),
     headers,
     going,
   );
   assertDefinition(clientId, parent.id);
   assertDefinition(secret, parent.id);
 
-  const url = introspectUrl(input.config);
+  const url = plan.services[0]?.url || introspectUrl(input.config);
   const accessId = requiredId(requestIds, 'access-token');
   const txId = requiredId(requestIds, 'tx-token');
   const userService = await ensureResource(
@@ -139,19 +136,21 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     [DELEGATION_SERVICE, delegationService.id],
   ]);
   const attributeIds = new Map(requestIds);
-  for (const attribute of SERVICE_ATTRIBUTES) {
+  for (const attribute of plan.attributes.filter((item) => item.resolvers[0]?.type === 'SERVICE')) {
     if (!going()) return abandoned(input);
-    const serviceId = requiredId(serviceIds, attribute.service);
+    const serviceName = attribute.resolvers[0]?.service ?? '';
+    const serviceId = requiredId(serviceIds, serviceName);
+    const path = attribute.processor?.expression ?? '';
     const saved = await ensureResource(
       input,
       `${api}/authorizationAttributes`,
       'attribute',
       attribute.name,
-      serviceAttributeBody(parent.id, attribute.name, serviceId, attribute.path),
+      attributeBody(attribute.name, { parentId: parent.id, serviceId }),
       headers,
       going,
     );
-    assertServiceAttribute(saved, serviceId, attribute.path, parent.id);
+    assertServiceAttribute(saved, serviceId, path, parent.id);
     attributeIds.set(attribute.name, saved.id);
   }
 
@@ -370,9 +369,10 @@ async function alignFound(
 }
 
 function resolversMissingValueType(resource: Resource): boolean {
-  const resolvers = resource.resolvers as { valueType?: { type?: string } }[] | undefined;
+  const resolvers = resource.resolvers as { type?: string; valueType?: { type?: string } }[] | undefined;
   if (!Array.isArray(resolvers) || resolvers.length === 0) return false;
-  return resolvers.some((resolver) => !resolver.valueType?.type);
+  // REQUEST and SERVICE reads omit resolver valueType. Only a constant that was saved without one needs a repair.
+  return resolvers.some((resolver) => resolver.type === 'CONSTANT' && !resolver.valueType?.type);
 }
 
 function intendedResolvers(intended: Record<string, unknown>, current: Resource): unknown[] {
@@ -520,9 +520,10 @@ function assertRulePayloads(policy: Resource, plans: RulePlan[], attributeIds: M
 
 function assertResolverValueType(resource: Resource, valueType: string): void {
   const resolver = (resource.resolvers as { valueType?: { type?: string } }[] | undefined)?.[0];
-  if (resolver?.valueType?.type !== valueType) {
-    throw new Error(`${String(resource.name)} resolver valueType is ${String(resolver?.valueType?.type)}.`);
-  }
+  const actual = resolver?.valueType?.type;
+  // PingOne's GET of a REQUEST or SERVICE resolver omits valueType even when the create body sent it.
+  if (!actual) return;
+  if (actual !== valueType) throw new Error(`${String(resource.name)} resolver valueType is ${actual}.`);
 }
 
 function childrenOf(policy: Resource): Resource[] {
