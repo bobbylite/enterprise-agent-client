@@ -144,11 +144,11 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
                   const state = await window.agent.getState();
                   onState(state);
                   const already = state.mode === 'pingone' ? 'Those starter policies are already in PingOne.' : 'Those starter policies were already stored.';
-                  setNotice(
+                  const createdNote =
                     result.created.length === 0
                       ? already
-                      : `Created ${result.created.length} starter ${result.created.length === 1 ? 'policy' : 'policies'}.`,
-                  );
+                      : `Created ${result.created.length} starter ${result.created.length === 1 ? 'policy' : 'policies'}.`;
+                  setNotice(result.warning ? `${createdNote}\n${result.warning}` : createdNote);
                 })
               }
             >

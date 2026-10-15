@@ -1698,7 +1698,7 @@ export class Runtime {
     const pending = this.options.db.listPolicies().filter((policy) => policy.scaffold && !policy.remoteId);
     const posted = await this.pushScaffold(pending, epoch);
     if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
-    if (this.options.config.tenant.mode === 'pingone') await this.provisionRealPolicies(epoch);
+    const warning = this.options.config.tenant.mode === 'pingone' ? await this.provisionRealPolicies(epoch) : undefined;
     if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
     const created = posted.length > 0 ? posted : merged.created;
     if (created.length > 0) {
@@ -1706,7 +1706,7 @@ export class Runtime {
     }
     this.decisionCache = null;
     await this.refreshFeatures();
-    return { preview, created: created.map(policyView), policies: this.options.db.listPolicies().map(policyView) };
+    return { preview, created: created.map(policyView), policies: this.options.db.listPolicies().map(policyView), warning };
   }
 
   private abandonedScaffold(incoming: AuthorizePolicy[]): PolicyScaffoldResult {
@@ -1717,7 +1717,7 @@ export class Runtime {
     };
   }
 
-  private async provisionRealPolicies(epoch: number): Promise<void> {
+  private async provisionRealPolicies(epoch: number): Promise<string | undefined> {
     if (epoch !== this.policyEpoch) return;
     const token = await this.workerAccessToken();
     const result = await provisionAuthorize({
@@ -1735,14 +1735,15 @@ export class Runtime {
       log: this.options.log,
       logPath: this.options.logPath,
     });
-    if (epoch !== this.policyEpoch || !result.decisionEndpointId) return;
+    if (epoch !== this.policyEpoch || !result.decisionEndpointId) return result.warning;
     this.options.db.setSetting('authorize.decisionEndpointId', result.decisionEndpointId);
     this.options.config.authorize.decisionEndpointId = result.decisionEndpointId;
     this.persistDecisionEndpoint(result.decisionEndpointId);
     for (const policy of result.policies) {
-      if (epoch !== this.policyEpoch) return;
+      if (epoch !== this.policyEpoch) return result.warning;
       this.options.db.upsertPolicy(policy);
     }
+    return result.warning;
   }
 
   private persistDecisionEndpoint(id: string): void {

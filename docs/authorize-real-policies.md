@@ -37,7 +37,9 @@ Dry run writes that same POST JSON to `authorize-policy-tree.json` in the app's 
 
 Rules travel in that same create POST. `effectSettings.type` is `UNCONDITIONAL_PERMIT` or `UNCONDITIONAL_DENY`. Each statement is an `EMBEDDED_STATEMENT` with code `enterprise-agent-features`, a static payload, `attributes: []`, and `services: []`. The create is read back with a new GET. A later run that already finds this tree does not write it again and does not delete leftovers.
 
-Scaffold tags the latest authorization version and sets `authorizationVersion.id` on the `Enterprise Agent` decision endpoint. `authorize.alwaysCurrent: true` skips that attachment and is only for development. The endpoint id is stored locally and in `authorize.decisionEndpointId` when the config file is writable.
+Scaffold reads `GET /authorizationVersions?limit=25`. The list is `_embedded.items`, newest `createdAt` first. A policy change creates those versions; Scaffold does not POST one. It tags the newest with `PUT /authorizationVersions/{id}/tag`, or the version's `_links.tag.href`, then sets `authorizationVersion.id` on the `Enterprise Agent` decision endpoint. The same update sets `policy.id` to the `Enterprise Agent Features` policy. The endpoint id is stored locally and in `authorize.decisionEndpointId` when the config file is writable.
+
+If that list has no usable version, Scaffold does not stop. It leaves the endpoint always-current, with no `authorizationVersion.id`, so the endpoint evaluates the latest policy. That mode is for development and debugging. The Policy tab shows the warning, and `~/Library/Logs/enterprise-agent-client/main.log` includes the raw versions response. `authorize.alwaysCurrent: true` also skips the fixed version. If the policy pointer does not stick, Scaffold keeps the endpoint and shows that too.
 
 ## Decision call
 

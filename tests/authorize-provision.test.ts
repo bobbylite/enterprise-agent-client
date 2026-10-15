@@ -32,7 +32,26 @@ function memoryStore(): TfStore & { rows: Map<string, { remoteId: string; conten
   };
 }
 
-function pingone(options?: { hidePolicyChildren?: boolean }) {
+const VERSION_TAG = 'https://api.pingone.com/v1/environments/env-1/authorizationVersions/ver-new/tag';
+
+function versionList(mode: 'items' | 'empty' | 'legacy'): unknown {
+  if (mode === 'empty') return { _embedded: { items: [] } };
+  if (mode === 'legacy') return { _embedded: { authorizationVersions: [{ id: 'ver-1', createdAt: '2026-08-15T17:00:52.000Z' }] } };
+  return {
+    _embedded: {
+      items: [
+        {
+          id: 'ver-new',
+          createdAt: '2026-08-15T17:00:52.000Z',
+          _links: { tag: { href: VERSION_TAG } },
+        },
+        { id: 'ver-old', createdAt: '2026-08-01T16:08:00.000Z' },
+      ],
+    },
+  };
+}
+
+function pingone(options?: { hidePolicyChildren?: boolean; versions?: 'items' | 'empty' | 'legacy'; dropEndpointPolicy?: boolean }) {
   const resources = new Map<string, Record<string, unknown>>();
   const calls: { method: string; url: string; body?: Record<string, unknown> }[] = [];
   let seq = 0;
@@ -45,19 +64,19 @@ function pingone(options?: { hidePolicyChildren?: boolean }) {
       calls.push({ method, url: target, body });
       const rejected = authorizeWriteError(target, method, body);
       if (rejected) return json({ code: 'INVALID_DATA', message: rejected }, 400);
-      const marker = target.match(/\/(authorizationAttributes|authorizationServices|authorizationPolicies|authorizationVersions|decisionEndpoints)(?:\/([^/?]+))?(?:\/(tag))?$/);
+      const marker = target.match(/\/(authorizationAttributes|authorizationServices|authorizationPolicies|authorizationVersions|decisionEndpoints)(?:\/([^/?]+))?(?:\/(tag))?(?:\?.*)?$/);
       if (!marker) return json({ message: target }, 404);
       const kind = marker[1] ?? '';
       const id = marker[2];
-      if (kind === 'authorizationVersions' && !id && method === 'GET') {
-        return json({ _embedded: { authorizationVersions: [{ id: 'ver-1' }] } });
-      }
-      if (marker[3] === 'tag' && method === 'PUT') return json({ id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+      if (kind === 'authorizationVersions' && !id && method === 'GET') return json(versionList(options?.versions ?? 'items'));
+      if (marker[3] === 'tag' && method === 'PUT') return json({ id: id ?? 'ver-new', tag: { updatedAt: '2026-08-15T17:00:52.000Z' } });
       if (id && method === 'DELETE') {
         resources.delete(id);
         return new Response(null, { status: 204 });
       }
-      if (id === 'ver-1' && method === 'GET') return json({ id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+      if (kind === 'authorizationVersions' && id && method === 'GET') {
+        return json({ id, tag: { updatedAt: '2026-08-15T17:00:52.000Z' } });
+      }
       if (!id) {
         if (method === 'GET') {
           const rows = [...resources.values()].filter((item) => item.kind === kind);
@@ -78,7 +97,10 @@ function pingone(options?: { hidePolicyChildren?: boolean }) {
       }
       if (method === 'GET') {
         const saved = resources.get(id);
-        return saved ? json(shown(saved, options?.hidePolicyChildren === true)) : json({ message: 'missing' }, 404);
+        if (!saved) return json({ message: 'missing' }, 404);
+        const visible = { ...shown(saved, options?.hidePolicyChildren === true) };
+        if (kind === 'decisionEndpoints' && options?.dropEndpointPolicy) delete visible.policy;
+        return json(visible);
       }
       const saved: Record<string, unknown> = { ...(resources.get(id) ?? {}), ...(body ?? {}), id, version: 'v2', kind };
       if (kind === 'decisionEndpoints' && body && !Object.prototype.hasOwnProperty.call(body, 'authorizationVersion')) {
@@ -266,8 +288,14 @@ describe('real Authorize scaffold', () => {
     expect(JSON.stringify(tree)).not.toContain('isApproved');
     expect(groupsComparisonUsesCollection()).toBe(true);
 
+    const policyId = store.get('policy', 'Enterprise Agent Features')?.remoteId;
     const endpointPut = fake.calls.find((call) => call.method === 'PUT' && call.url.includes('/decisionEndpoints/'));
-    expect(endpointPut?.body?.authorizationVersion).toEqual({ id: 'ver-1' });
+    expect(fake.calls.some((call) => call.method === 'GET' && call.url.includes('/authorizationVersions?limit=25'))).toBe(true);
+    expect(fake.calls.some((call) => call.method === 'PUT' && call.url === VERSION_TAG)).toBe(true);
+    expect(endpointPut?.body?.authorizationVersion).toEqual({ id: 'ver-new' });
+    expect(endpointPut?.body?.policy).toEqual({ id: policyId });
+    expect(first.warning).toBeUndefined();
+    expect(first.decisionEndpointId).toBe(store.get('endpoint', 'Enterprise Agent')?.remoteId);
 
     const writes = fake.calls.filter((call) => call.method === 'POST' || call.method === 'PUT').length;
     fake.resources.set('later-orphan', {
@@ -291,6 +319,60 @@ describe('real Authorize scaffold', () => {
     expect(fake.calls.filter((call) => call.method === 'POST' || call.method === 'PUT')).toHaveLength(writes);
     expect(fake.calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
     expect(fake.resources.has('later-orphan')).toBe(true);
+  });
+
+  it('leaves the decision endpoint always-current when PingOne returns no authorization version', async () => {
+    const logs: string[] = [];
+    for (const versions of ['empty', 'legacy'] as const) {
+      const store = memoryStore();
+      const fake = pingone({ versions });
+      const enterprise = config();
+      const result = await provisionAuthorize({
+        config: enterprise,
+        accessToken: 'worker-token',
+        client: fake.client,
+        store,
+        adminGroup: 'Administrator',
+        delegations: enterprise.authorize.delegations,
+        alwaysCurrent: false,
+        log: (_level, message) => logs.push(message),
+      });
+      const policyId = store.get('policy', 'Enterprise Agent Features')?.remoteId;
+      const endpointPut = fake.calls.find((call) => call.method === 'PUT' && call.url.includes('/decisionEndpoints/'));
+      expect(result.decisionEndpointId).toBe(store.get('endpoint', 'Enterprise Agent')?.remoteId);
+      expect(result.warning).toMatch(/always-current/);
+      expect(result.warning).toMatch(/Versions response/);
+      expect(endpointPut?.body?.policy).toEqual({ id: policyId });
+      expect(endpointPut?.body).not.toHaveProperty('authorizationVersion');
+      expect(fake.calls.some((call) => call.method === 'PUT' && call.url.includes('/authorizationVersions/'))).toBe(false);
+    }
+    expect(logs.join('\n')).toContain('"items":[]');
+    expect(logs.join('\n')).toContain('authorizationVersions');
+    expect(logs.join('\n')).toContain('ver-1');
+  });
+
+  it('keeps the tagged endpoint when the policy pointer does not stick', async () => {
+    const store = memoryStore();
+    const fake = pingone({ dropEndpointPolicy: true });
+    const enterprise = config();
+    const logs: string[] = [];
+    const result = await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+      log: (_level, message) => logs.push(message),
+    });
+    const policyId = store.get('policy', 'Enterprise Agent Features')?.remoteId;
+    const endpointPut = fake.calls.find((call) => call.method === 'PUT' && call.url.includes('/decisionEndpoints/'));
+    expect(result.decisionEndpointId).toBeTruthy();
+    expect(result.warning).toMatch(new RegExp(`did not keep policy ${policyId}`));
+    expect(endpointPut?.body?.authorizationVersion).toEqual({ id: 'ver-new' });
+    expect(endpointPut?.body?.policy).toEqual({ id: policyId });
+    expect(logs.join('\n')).toMatch(/did not keep policy/);
   });
 
   it('creates the child policies inline and deletes only the exact-name orphans', async () => {

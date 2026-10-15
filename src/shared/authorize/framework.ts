@@ -496,6 +496,7 @@ export function decisionEndpointBody(): Record<string, unknown> {
 export function decisionEndpointUpdate(
   current: { id: string; name?: unknown; description?: unknown; recordRecentRequests?: unknown },
   versionId?: string,
+  policyId?: string,
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     id: current.id,
@@ -503,6 +504,7 @@ export function decisionEndpointUpdate(
     description: typeof current.description === 'string' ? current.description : 'Enterprise Agent decision endpoint.',
     recordRecentRequests: current.recordRecentRequests !== false,
   };
+  if (policyId) body.policy = { id: policyId };
   if (versionId) body.authorizationVersion = { id: versionId };
   return body;
 }

@@ -102,7 +102,7 @@ button.nav.selected, button.list-item.selected { background: rgba(255, 255, 255,
 .segment button.selected { background: var(--ink); color: var(--paper); }
 .muted { color: #6d645b; font-size: 13px; }
 .error { color: var(--danger); }
-.notice { background: #fff4e8; border-radius: 10px; padding: 10px 12px; }
+.notice { background: #fff4e8; border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; }
 .risk-card { border-radius: 12px; padding: 12px; background: #fde8e6; }
 .risk-card ul { margin: 8px 0; padding-left: 18px; }
 
