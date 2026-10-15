@@ -12,6 +12,8 @@ import {
   USER_POLICY,
   USER_SERVICE,
   attributeBody,
+  decisionEndpointBody,
+  decisionEndpointUpdate,
   delegationRulePlans,
   introspectUrl,
   policyShell,
@@ -19,6 +21,7 @@ import {
   ruleSetHash,
   scaffoldPlan,
   serviceBody,
+  tagBody,
   userRulePlans,
   writablePolicy,
   type DelegationGrant,
@@ -266,7 +269,7 @@ async function ensureDecisionEndpoint(input: ProvisionInput, api: string, header
     `${api}/decisionEndpoints`,
     'endpoint',
     DECISION_ENDPOINT,
-    { name: DECISION_ENDPOINT, description: 'Enterprise Agent decision endpoint.', recordRecentRequests: true },
+    decisionEndpointBody(),
     headers,
     going,
   );
@@ -276,20 +279,18 @@ async function ensureDecisionEndpoint(input: ProvisionInput, api: string, header
   if (input.alwaysCurrent) {
     const current = await readResource(input, `${api}/decisionEndpoints/${endpoint.id}`, headers);
     if (current.authorizationVersion) {
-      const detached = writableEndpoint(current);
-      delete detached.authorizationVersion;
+      const detached = decisionEndpointUpdate(current);
       const written = await sendJson(input, `${api}/decisionEndpoints/${endpoint.id}`, 'PUT', headers, detached);
       if (written.authorizationVersion) throw new Error('PingOne kept a fixed authorization version in always-current mode.');
     }
     return endpoint;
   }
   const versionId = await latestVersionId(input, api, headers);
-  await sendJson(input, `${api}/authorizationVersions/${versionId}/tag`, 'PUT', headers, {});
+  await sendJson(input, `${api}/authorizationVersions/${versionId}/tag`, 'PUT', headers, tagBody());
   const tagged = await readResource(input, `${api}/authorizationVersions/${versionId}`, headers);
   if (!tagged.tag && !tagged.version) throw new Error('PingOne did not return the tagged authorization version.');
   const current = await readResource(input, `${api}/decisionEndpoints/${endpoint.id}`, headers);
-  const attached = writableEndpoint(current);
-  attached.authorizationVersion = { id: versionId };
+  const attached = decisionEndpointUpdate(current, versionId);
   await sendJson(input, `${api}/decisionEndpoints/${endpoint.id}`, 'PUT', headers, attached);
   const read = await readResource(input, `${api}/decisionEndpoints/${endpoint.id}`, headers);
   const attachedId = (read.authorizationVersion as { id?: string } | undefined)?.id;
@@ -355,6 +356,7 @@ async function alignFound(
   current: Resource,
   intended: Record<string, unknown>,
 ): Promise<Resource> {
+  if (collection.includes('authorizationServices')) return alignService(input, collection, headers, current, intended);
   if (!collection.includes('authorizationAttributes') || !resolversMissingValueType(current)) return current;
   const version = typeof current.version === 'string' ? current.version : '';
   if (!version) throw new Error(`PingOne attribute ${String(current.name)} is missing a version, so it cannot be repaired.`);
@@ -366,6 +368,47 @@ async function alignFound(
   if (read.id !== current.id) throw new Error(`PingOne attribute ${String(current.name)} read-back id did not match the repair.`);
   if (resolversMissingValueType(read)) throw new Error(`PingOne attribute ${String(current.name)} still has a resolver without valueType.`);
   return read;
+}
+
+async function alignService(
+  input: ProvisionInput,
+  collection: string,
+  headers: Record<string, string>,
+  current: Resource,
+  intended: Record<string, unknown>,
+): Promise<Resource> {
+  if (!serviceMissingLimits(current)) return current;
+  const version = typeof current.version === 'string' ? current.version : '';
+  if (!version) throw new Error(`PingOne service ${String(current.name)} is missing a version, so it cannot be repaired.`);
+  const body = { ...intended, id: current.id, version };
+  await sendJson(input, `${collection}/${current.id}`, 'PUT', headers, body);
+  await input.client.paceAfterManagementPost();
+  const read = await readResource(input, `${collection}/${current.id}`, headers);
+  if (read.id !== current.id) throw new Error(`PingOne service ${String(current.name)} read-back id did not match the repair.`);
+  if (serviceMissingLimits(read)) throw new Error(`PingOne service ${String(current.name)} is still missing its rate limits.`);
+  return read;
+}
+
+function serviceMissingLimits(resource: Resource): boolean {
+  const settings = resource.serviceSettings as {
+    maximumConcurrentRequests?: unknown;
+    maximumRequestsPerSecond?: unknown;
+    timeoutMilliseconds?: unknown;
+  } | undefined;
+  const concurrent = settings?.maximumConcurrentRequests;
+  const rate = settings?.maximumRequestsPerSecond;
+  const timeout = settings?.timeoutMilliseconds;
+  return (
+    typeof concurrent !== 'number' ||
+    !Number.isInteger(concurrent) ||
+    concurrent < 1 ||
+    typeof rate !== 'number' ||
+    !(rate > 0) ||
+    typeof timeout !== 'number' ||
+    !Number.isInteger(timeout) ||
+    timeout < 0 ||
+    timeout > 3000
+  );
 }
 
 function resolversMissingValueType(resource: Resource): boolean {
@@ -475,6 +518,9 @@ function assertService(resource: Resource, tokenAttributeId: string, clientId: s
     authentication?: { type?: string; name?: { id?: string }; password?: { id?: string } };
     body?: string;
     timeoutMilliseconds?: number;
+    maximumConcurrentRequests?: number;
+    maximumRequestsPerSecond?: number;
+    headers?: unknown;
     contentType?: string;
   };
   if (settings?.authentication?.type !== 'BASIC') throw new Error(`${String(resource.name)} is not BASIC auth.`);
@@ -483,6 +529,9 @@ function assertService(resource: Resource, tokenAttributeId: string, clientId: s
   }
   if (settings.body !== `token={{${tokenAttributeId}}}`) throw new Error(`${String(resource.name)} body does not use the token attribute id.`);
   if (settings.timeoutMilliseconds !== 3000) throw new Error(`${String(resource.name)} timeout is not 3000ms.`);
+  if (settings.maximumConcurrentRequests !== 20) throw new Error(`${String(resource.name)} maximumConcurrentRequests is not 20.`);
+  if (settings.maximumRequestsPerSecond !== 10) throw new Error(`${String(resource.name)} maximumRequestsPerSecond is not 10.`);
+  if (!Array.isArray(settings.headers)) throw new Error(`${String(resource.name)} headers were not saved.`);
   if (settings.contentType !== 'application/x-www-form-urlencoded') throw new Error(`${String(resource.name)} content type is wrong.`);
   if ((resource.valueType as { type?: string } | undefined)?.type !== 'JSON') throw new Error(`${String(resource.name)} is not JSON.`);
 }
@@ -528,16 +577,6 @@ function assertResolverValueType(resource: Resource, valueType: string): void {
 
 function childrenOf(policy: Resource): Resource[] {
   return Array.isArray(policy.children) ? (policy.children as Resource[]) : [];
-}
-
-function writableEndpoint(current: Resource): Record<string, unknown> {
-  const body: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(current)) {
-    if (key.startsWith('_') || key === 'environment') continue;
-    body[key] = value;
-  }
-  body.id = current.id;
-  return body;
 }
 
 function embedded(body: Record<string, unknown>, key: string): Resource[] {
