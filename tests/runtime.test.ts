@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { Repository } from '../src/main/db';
 import { Runtime } from '../src/main/runtime';
 import { parseBranding } from '../src/shared/branding';
+import { authorizeWriteError } from '../src/shared/authorize/framework';
 import { parseEnterpriseConfig } from '../src/shared/config';
 import { decodeJwtPayload, encodeJsonSegment } from '../src/shared/ids';
 import { MemorySecretStore } from '../src/shared/secrets';
@@ -1423,6 +1424,8 @@ function authorizeSide(target: string, method: string, bodyText: string): Respon
   if (!managed) return null;
   const idMatch = target.match(/\/(authorizationAttributes|authorizationServices|authorizationPolicies|authorizationVersions|decisionEndpoints)\/([^/?]+)/);
   const body = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {};
+  const rejected = authorizeWriteError(target, method, body);
+  if (rejected) return json(400, { code: 'INVALID_DATA', message: rejected });
   const collection = target.includes('authorizationAttributes')
     ? 'authorizationAttributes'
     : target.includes('authorizationServices')
@@ -1457,7 +1460,10 @@ function authorizeSide(target: string, method: string, bodyText: string): Respon
     return saved ? json(200, saved) : json(404, { message: 'missing' });
   }
   if (method === 'PUT') {
-    const saved = { ...(authorizeResources.get(id) ?? {}), ...body, id, version: 'v2', collection };
+    const saved: Record<string, unknown> = { ...(authorizeResources.get(id) ?? {}), ...body, id, version: 'v2', collection };
+    if (collection === 'decisionEndpoints' && !Object.prototype.hasOwnProperty.call(body, 'authorizationVersion')) {
+      delete saved.authorizationVersion;
+    }
     authorizeResources.set(id, saved);
     return json(200, saved);
   }

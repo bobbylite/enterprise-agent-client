@@ -2,12 +2,14 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { AuthorizeClient } from '../src/shared/authorize/remote';
 import {
+  authorizeWriteError,
   decisionParameters,
   decisionTokensReady,
   delegationRulePlans,
   groupsComparisonUsesCollection,
   rulesReferenceIsApproved,
   scaffoldPlan,
+  serviceWriteError,
   userRulePlans,
 } from '../src/shared/authorize/framework';
 import { provisionAuthorize, type TfStore } from '../src/shared/authorize/provision';
@@ -37,6 +39,8 @@ function pingone() {
       const method = init?.method ?? 'GET';
       const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
       calls.push({ method, url: target, body });
+      const rejected = authorizeWriteError(target, method, body);
+      if (rejected) return json({ code: 'INVALID_DATA', message: rejected }, 400);
       const marker = target.match(/\/(authorizationAttributes|authorizationServices|authorizationPolicies|authorizationVersions|decisionEndpoints)(?:\/([^/?]+))?(?:\/(tag))?$/);
       if (!marker) return json({ message: target }, 404);
       const kind = marker[1] ?? '';
@@ -60,7 +64,10 @@ function pingone() {
         const saved = resources.get(id);
         return saved ? json(shown(saved)) : json({ message: 'missing' }, 404);
       }
-      const saved = { ...(resources.get(id) ?? {}), ...(body ?? {}), id, version: 'v2', kind };
+      const saved: Record<string, unknown> = { ...(resources.get(id) ?? {}), ...(body ?? {}), id, version: 'v2', kind };
+      if (kind === 'decisionEndpoints' && body && !Object.prototype.hasOwnProperty.call(body, 'authorizationVersion')) {
+        delete saved.authorizationVersion;
+      }
       resources.set(id, saved);
       return json(shown(saved));
     },
@@ -184,6 +191,9 @@ describe('real Authorize scaffold', () => {
     expect(settings.body).toBe(`token={{${store.get('attribute', 'access-token')?.remoteId}}}`);
     expect(settings.url).toBe('https://auth.pingone.com/env-1/as/introspect');
     expect(settings.timeoutMilliseconds).toBe(3000);
+    expect(settings).toMatchObject({ maximumConcurrentRequests: 20, maximumRequestsPerSecond: 10, headers: [] });
+    expect(service?.body).not.toHaveProperty('parent');
+    expect(service?.body).not.toHaveProperty('channel');
     expect(JSON.stringify(service?.body)).not.toMatch(/client-secret|super-secret|password=/i);
 
     const userPut = fake.calls.filter((call) => call.method === 'PUT' && call.url.includes('/authorizationPolicies/')).find((call) => {
@@ -194,6 +204,7 @@ describe('real Authorize scaffold', () => {
     expect(rules[0]?.type).toBe('RULE');
     expect(rules[0]?.effectSettings.type).toBe('UNCONDITIONAL_DENY');
     expect(rules[0]?.statements[0]?.attributes).toEqual([]);
+    expect(rules[0]?.statements[0]).toMatchObject({ services: [], appliesIf: 'PATH_MATCHES' });
     expect(rules.at(-1)?.effectSettings.type).toBe('UNCONDITIONAL_PERMIT');
     expect(rulesReferenceIsApproved(userPut?.body)).toBe(false);
     expect(userPut?.body).toMatchObject({ id: expect.any(String), version: expect.any(String) });
@@ -268,6 +279,76 @@ describe('real Authorize scaffold', () => {
     expect(fake.resources.get('secret-existing')?.resolvers).toEqual([{ type: 'CONSTANT', value: 'pasted-secret', valueType: { type: 'STRING' } }]);
     expect(store.get('attribute', 'EnterpriseAgent')?.remoteId).toBe('parent-existing');
     expect(store.get('attribute', 'introspect-client-secret')?.remoteId).toBe('secret-existing');
+  });
+
+  it('rejects a service without rate limits and reuses attributes from an earlier attempt', async () => {
+    const almost = {
+      type: 'SERVICE',
+      serviceType: 'HTTP',
+      valueType: { type: 'JSON' },
+      serviceSettings: {
+        type: 'HTTP',
+        url: 'https://auth.example/env-1/as/introspect',
+        verb: 'POST',
+        contentType: 'application/x-www-form-urlencoded',
+        body: 'token={{token-id}}',
+        headers: [],
+        maximumRequestsPerSecond: 10,
+        timeoutMilliseconds: 3000,
+        authentication: { type: 'BASIC', name: { id: 'client' }, password: { id: 'secret' } },
+        tlsSettings: { tlsValidationType: 'DEFAULT' },
+      },
+    };
+    expect(serviceWriteError(almost)).toMatch(/maximumConcurrentRequests/);
+    expect(serviceWriteError({ ...almost, serviceSettings: { ...almost.serviceSettings, maximumConcurrentRequests: 0 } })).toMatch(/OUT_OF_RANGE/);
+    const store = memoryStore();
+    const fake = pingone();
+    const rejected = await fake.client.request('https://api.pingone.com/v1/environments/env-1/authorizationServices', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'incomplete', ...almost, serviceSettings: { ...almost.serviceSettings, maximumConcurrentRequests: 0 } }),
+    });
+    expect(rejected.status).toBe(400);
+    const parentId = 'parent-existing';
+    fake.resources.set(parentId, {
+      id: parentId,
+      name: 'EnterpriseAgent',
+      kind: 'authorizationAttributes',
+      version: 'v1',
+      type: 'ATTRIBUTE',
+      valueType: { type: 'JSON' },
+      resolvers: [{ type: 'CONSTANT', value: '{}', valueType: { type: 'JSON' } }],
+    });
+    for (const name of ['access-token', 'tx-token', 'risk-level', 'risk-score', 'risk-action', 'admin-group', 'introspect-client-id', 'introspect-client-secret']) {
+      const definition = name.startsWith('introspect-');
+      fake.resources.set(`attr-${name}`, {
+        id: `attr-${name}`,
+        name,
+        kind: 'authorizationAttributes',
+        version: 'v1',
+        type: 'ATTRIBUTE',
+        parent: { id: parentId },
+        valueType: { type: name === 'risk-score' ? 'NUMBER' : 'STRING' },
+        resolvers: definition
+          ? [{ type: 'CONSTANT', value: name.endsWith('secret') ? 'pasted-secret' : '', valueType: { type: 'STRING' } }]
+          : [{ type: 'REQUEST' }],
+      });
+    }
+    const enterprise = config();
+    const result = await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+    });
+    expect(result.decisionEndpointId).toBeTruthy();
+    const kept = new Set(['EnterpriseAgent', 'access-token', 'tx-token', 'risk-level', 'risk-score', 'risk-action', 'admin-group', 'introspect-client-id', 'introspect-client-secret']);
+    expect(fake.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/authorizationAttributes') && kept.has(String(call.body?.name)))).toEqual([]);
+    const service = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'EnterpriseAgent User Introspection');
+    expect(service?.body?.serviceSettings).toMatchObject({ maximumConcurrentRequests: 20, maximumRequestsPerSecond: 10, timeoutMilliseconds: 3000, headers: [] });
+    expect(fake.resources.get('attr-introspect-client-secret')?.resolvers).toEqual([{ type: 'CONSTANT', value: 'pasted-secret', valueType: { type: 'STRING' } }]);
   });
 
   it('sends full attribute names, a numeric score, and placeholders', () => {

@@ -17,7 +17,7 @@ Parent attribute `EnterpriseAgent`. These children use a `REQUEST` resolver and 
 
 Definitions `introspect-client-id` and `introspect-client-secret` are constant attributes. Scaffold writes an empty value. Paste the custom-resource client id and secret in the PingOne console. The app never sends the secret.
 
-Two top-level HTTP services, with no parent, POST `{authHost}/{environmentId}/as/introspect` as `application/x-www-form-urlencoded`. Authentication is `BASIC` and points at those Definition ids. The body is `token={{<attribute-uuid>}}`. Timeout is 3000ms. Value type is JSON.
+Two top-level HTTP services, with no parent, POST `{authHost}/{environmentId}/as/introspect` as `application/x-www-form-urlencoded`. Authentication is `BASIC` and points at those Definition ids. The body is `token={{<attribute-uuid>}}`. `headers` is an empty array. Timeout is 3000ms. `maximumConcurrentRequests` is 20 and `maximumRequestsPerSecond` is 10. Value type is JSON. `cacheSettings`, a service-level processor, and `channel` are not sent: cache and processor are optional, and `channel` belongs to connector services.
 
 - `EnterpriseAgent User Introspection` uses `access-token`.
 - `EnterpriseAgent Delegation Introspection` uses `tx-token`.
