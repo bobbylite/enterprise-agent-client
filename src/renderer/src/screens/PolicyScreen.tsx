@@ -77,7 +77,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
               onState(state);
               setNotice(
                 state.mode === 'pingone'
-                  ? 'Refreshed from PingOne. Starter policies that were missing there were created again.'
+                  ? 'Refreshed from PingOne. Refresh only lists policies. It does not create any.'
                   : 'Refreshed.',
               );
             })
@@ -193,7 +193,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
             <p className="eyebrow">Policy</p>
             <h2 id="policy-reset-title">Reset local policy cache</h2>
             <p>
-              This clears the policies stored on this computer. It does not delete anything in PingOne. Refresh or Scaffold reads PingOne again and creates any missing starter policies.
+              This clears the policies stored on this computer, the Authorize decision cache, and any scaffold still in progress. It does not delete anything in PingOne. Refresh only lists what PingOne has. Only Confirm scaffold creates policies.
             </p>
             <div className="row">
               <button type="button" className="ghost" disabled={busy} onClick={() => setResetOpen(false)}>
@@ -207,11 +207,12 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
                 onClick={() => {
                   setResetOpen(false);
                   void run(async () => {
-                    setPolicies(await window.agent.resetPolicyCache());
+                    const reset = await window.agent.resetPolicyCache();
+                    setPolicies(reset.policies);
                     setPreview(null);
                     setAudit(await window.agent.listAudit());
                     onState(await window.agent.getState());
-                    setNotice('Local policy cache cleared.');
+                    setNotice(reset.cleared);
                   });
                 }}
               >
