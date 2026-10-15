@@ -1,5 +1,6 @@
 import type { EnterpriseConfig } from '../config';
-import { FEATURE_STATEMENT, SCAFFOLD_MARKER, type AuthorizePolicy, decisionParameters, type DecisionInput } from './policy';
+import { decisionParameters, type DecisionCall } from './framework';
+import { FEATURE_STATEMENT, SCAFFOLD_MARKER, type AuthorizePolicy } from './policy';
 
 const MAX_ATTEMPTS = 4;
 
@@ -291,7 +292,7 @@ export async function setRemotePolicyEnabled(
 export async function postDecision(
   config: EnterpriseConfig,
   accessToken: string,
-  input: DecisionInput & { userId: string; username: string },
+  input: DecisionCall,
   client: AuthorizeClient,
 ): Promise<unknown> {
   const response = await client.request(decisionUrl(config), {

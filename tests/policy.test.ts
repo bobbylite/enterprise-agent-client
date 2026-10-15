@@ -91,6 +91,8 @@ describe('groups and authorize', () => {
     const second = mergeScaffold(first.policies, incoming);
     expect(second.created).toEqual([]);
     expect(featuresFromAuthorize({ decision: 'DENY' }, 5)).toEqual(failClosed(5));
+    expect(featuresFromAuthorize({ decision: 'INDETERMINATE' }, 5)).toEqual(failClosed(5));
+    expect(featuresFromAuthorize({ decision: 'NOT_APPLICABLE' }, 5)).toEqual(failClosed(5));
     expect(
       featuresFromAuthorize(
         { decision: 'PERMIT', statements: [{ code: 'enterprise-agent-features', payload: '{"policyTab":true,"chat":"allow"}' }] },

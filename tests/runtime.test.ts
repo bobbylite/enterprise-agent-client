@@ -898,10 +898,14 @@ describe('pi.flow runtime', () => {
         if (target.includes('/decisionEndpoints/')) {
           decisionAuth = new Headers(init?.headers).get('authorization') ?? '';
           const parameters = (JSON.parse(body) as { parameters: Record<string, string> }).parameters;
-          expect(parameters['user.groups']).toBe(JSON.stringify(['Administrator']));
-          expect(parameters['risk.level']).toBe('LOW');
-          expect(parameters['risk.score']).toBe('10');
-          expect(parameters['risk.action']).toBe('allow');
+          expect(parameters['EnterpriseAgent.admin-group']).toBe('Administrator');
+          expect(parameters['EnterpriseAgent.risk-level']).toBe('LOW');
+          expect(parameters['EnterpriseAgent.risk-score']).toBe(10);
+          expect(parameters['EnterpriseAgent.risk-action']).toBe('allow');
+          expect(typeof parameters['EnterpriseAgent.access-token']).toBe('string');
+          expect(String(parameters['EnterpriseAgent.access-token']).length).toBeGreaterThan(0);
+          expect(String(parameters['EnterpriseAgent.tx-token']).length).toBeGreaterThan(0);
+          expect(parameters['user.groups']).toBeUndefined();
           throw new Error('Authorize unreachable');
         }
         return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
@@ -991,6 +995,8 @@ describe('pi.flow runtime', () => {
         const target = String(url);
         const method = init?.method ?? 'GET';
         const bodyText = String(init?.body ?? '');
+        const side = authorizeSide(target, method, bodyText);
+        if (side) return side;
         if (target.includes('/authorizationPolicies') && method === 'GET') {
           return json(200, { _embedded: { authorizationPolicies: remote } });
         }
@@ -1035,18 +1041,20 @@ describe('pi.flow runtime', () => {
     ]);
     expect(posts).toHaveLength(8);
     const listed = await runtime.listPolicies();
-    expect(listed.map((policy) => policy.id).sort()).toEqual([
+    expect(listed.map((policy) => policy.id).filter((id) => !id.includes(':pingone:')).sort()).toEqual([
       'enterprise-agent:admin',
       'enterprise-agent:high-risk',
       'enterprise-agent:read-only',
       'enterprise-agent:session',
     ]);
+    expect(listed.some((policy) => policy.name === 'Enterprise Agent User')).toBe(true);
 
     remote.splice(0, remote.length);
     const postsBeforeReset = posts.length;
     const reset = await runtime.resetPolicyCache();
     expect(reset.policies).toEqual([]);
-    expect(reset.cleared).toMatch(/4 local policies/);
+    expect(reset.cleared).toMatch(/7 local policies/);
+    expect(reset.cleared).toMatch(/Trust Framework ids/);
     expect(reset.cleared).toMatch(/Authorize decision cache/);
     expect(posts).toHaveLength(postsBeforeReset);
     const refreshed = await runtime.refreshPolicies();
@@ -1054,12 +1062,12 @@ describe('pi.flow runtime', () => {
     expect(refreshed).toEqual([]);
     expect(remote).toEqual([]);
     const recovered = runtime.state();
-    expect(recovered.features.source).toBe('starter');
+    expect(recovered.features.source).toBe('fail_closed');
     expect(recovered.features.policyTab).toBe(true);
-    expect(recovered.features.pingoneTools).toBe(true);
-    expect(recovered.features.chat).toBe('allow');
-    expect(recovered.features.mcpWrites).toBe(true);
-    expect(recovered.restriction).toBeNull();
+    expect(recovered.features.pingoneTools).toBe(false);
+    expect(recovered.features.chat).toBe('read_only');
+    expect(recovered.features.mcpWrites).toBe(false);
+    expect(recovered.restriction?.reason).toBe('decision_failure');
     await runtime.scaffoldPolicies(false);
     expect(posts).toHaveLength(postsBeforeReset);
     const created = await runtime.scaffoldPolicies(true);
@@ -1084,6 +1092,8 @@ describe('pi.flow runtime', () => {
         const target = String(url);
         const method = init?.method ?? 'GET';
         const bodyText = String(init?.body ?? '');
+        const side = authorizeSide(target, method, bodyText);
+        if (side) return side;
         if (target.includes('/authorizationPolicies') && method === 'GET') {
           return json(200, { _embedded: { authorizationPolicies: remote } });
         }
@@ -1403,6 +1413,55 @@ function flowFetch(accessToken: string): typeof fetch {
     }
     return json(500, { message: target });
   };
+}
+
+const authorizeResources = new Map<string, Record<string, unknown>>();
+let authorizeSeq = 0;
+
+function authorizeSide(target: string, method: string, bodyText: string): Response | null {
+  const managed = /authorizationAttributes|authorizationServices|authorizationVersions|decisionEndpoints|authorizationPolicies/.test(target);
+  if (!managed) return null;
+  const idMatch = target.match(/\/(authorizationAttributes|authorizationServices|authorizationPolicies|authorizationVersions|decisionEndpoints)\/([^/?]+)/);
+  const body = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {};
+  const collection = target.includes('authorizationAttributes')
+    ? 'authorizationAttributes'
+    : target.includes('authorizationServices')
+      ? 'authorizationServices'
+      : target.includes('authorizationVersions')
+        ? 'authorizationVersions'
+        : target.includes('decisionEndpoints')
+          ? 'decisionEndpoints'
+          : 'authorizationPolicies';
+  if (collection === 'authorizationPolicies' && !idMatch && method === 'GET') return null;
+  if (collection === 'authorizationPolicies' && !idMatch && method === 'POST' && String(body.description ?? '').includes('enterprise-agent-scaffold')) {
+    return null;
+  }
+  if (collection === 'authorizationVersions' && !idMatch && method === 'GET') {
+    return json(200, { _embedded: { authorizationVersions: [{ id: 'ver-1' }] } });
+  }
+  if (target.endsWith('/tag') && method === 'PUT') return json(200, { id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+  if (!idMatch && method === 'GET') {
+    const rows = [...authorizeResources.values()].filter((item) => item.collection === collection);
+    return json(200, { _embedded: { [collection]: rows } });
+  }
+  if (!idMatch && method === 'POST') {
+    const id = `tf-${(authorizeSeq += 1)}`;
+    const saved = { ...body, id, version: 'v1', collection, children: body.children ?? [] };
+    authorizeResources.set(id, saved);
+    return json(201, saved);
+  }
+  const id = idMatch?.[2] === 'tag' ? 'ver-1' : (idMatch?.[2] ?? '');
+  if (id === 'ver-1' && method === 'GET') return json(200, { id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+  if (method === 'GET') {
+    const saved = authorizeResources.get(id);
+    return saved ? json(200, saved) : json(404, { message: 'missing' });
+  }
+  if (method === 'PUT') {
+    const saved = { ...(authorizeResources.get(id) ?? {}), ...body, id, version: 'v2', collection };
+    authorizeResources.set(id, saved);
+    return json(200, saved);
+  }
+  return null;
 }
 
 function json(status: number, body: unknown): Response {

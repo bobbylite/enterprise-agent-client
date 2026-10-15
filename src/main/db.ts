@@ -216,6 +216,13 @@ export class Repository {
         enabled INTEGER NOT NULL,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS authorize_tf_objects (
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        remote_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (kind, name)
+      );
       CREATE TABLE IF NOT EXISTS authorize_policies (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -752,6 +759,25 @@ export class Repository {
 
   deleteSkill(id: string): void {
     this.db.prepare('DELETE FROM skills WHERE id = ?').run(id);
+  }
+
+  getTfObject(kind: string, name: string): { remoteId: string; contentHash: string } | null {
+    const row = this.db.prepare('SELECT remote_id, content_hash FROM authorize_tf_objects WHERE kind = ? AND name = ?').get(kind, name);
+    if (!row) return null;
+    return { remoteId: text(row.remote_id), contentHash: text(row.content_hash) };
+  }
+
+  upsertTfObject(kind: string, name: string, remoteId: string, contentHash: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO authorize_tf_objects(kind, name, remote_id, content_hash) VALUES (?, ?, ?, ?)
+         ON CONFLICT(kind, name) DO UPDATE SET remote_id = excluded.remote_id, content_hash = excluded.content_hash`,
+      )
+      .run(kind, name, remoteId, contentHash);
+  }
+
+  clearTfObjects(): void {
+    this.db.prepare('DELETE FROM authorize_tf_objects').run();
   }
 
   listPolicies(): AuthorizePolicy[] {

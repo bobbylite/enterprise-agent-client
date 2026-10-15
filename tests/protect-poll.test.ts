@@ -138,6 +138,7 @@ describe('protect polling', () => {
       secrets: await workerSecrets(),
       patch: (config) => {
         protectPatch(config);
+        config.tokenExchange.audiences = [{ id: 'agent', audience: 'api://agent', scope: 'mcp' }];
         config.protect.reportedIp = '203.0.113.8';
         config.protect.pollIntervalSeconds = 30;
         config.authorize.decisionEndpointId = 'endpoint-1';
