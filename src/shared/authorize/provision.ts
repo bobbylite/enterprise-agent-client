@@ -21,14 +21,12 @@ import {
   delegationRulePlans,
   featurePolicyTree,
   introspectUrl,
-  policyShell,
   scaffoldPlan,
   serviceBody,
   summarizePolicyChildren,
   tagBody,
   userRulePlans,
   walkPolicyTree,
-  writablePolicy,
   type DelegationGrant,
   type RulePlan,
 } from './framework';
@@ -172,7 +170,7 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
   const userPlans = userRulePlans(input.adminGroup);
   const delegationPlans = delegationRulePlans(input.delegations);
   if (!going()) return abandoned(input);
-  const root = await putFeatureTree(input, api, headers, attributeIds, userPlans, delegationPlans, going);
+  const root = await postFeatureTree(input, api, headers, attributeIds, userPlans, delegationPlans, going);
   if (!root) return abandoned(input);
 
   const endpoint = await ensureDecisionEndpoint(input, api, headers, going);
@@ -190,10 +188,7 @@ async function dryRunFeaturePolicy(input: ProvisionInput, api: string, headers: 
   for (const attribute of listed) {
     if (attribute.name) attributeIds.set(attribute.name, attribute.id);
   }
-  const tree = plannedFeaturePolicy(attributeIds, input.adminGroup, input.delegations);
-  const found = await findNamed(input, `${api}/authorizationPolicies`, 'authorizationPolicies', ROOT_POLICY, headers);
-  const fresh = found?.name === ROOT_POLICY ? await readResource(input, `${api}/authorizationPolicies/${found.id}`, headers) : null;
-  const body = featurePolicyPutBody(fresh, tree);
+  const body = plannedFeaturePolicy(attributeIds, input.adminGroup, input.delegations);
   const path = input.dryRunPath;
   if (!path) throw new Error('Dry run needs a file path.');
   mkdirSync(dirname(path), { recursive: true });
@@ -219,19 +214,7 @@ function attributePlanNames(): string[] {
   return [...REQUEST_ATTRIBUTES.map((item) => item.name), ...SERVICE_ATTRIBUTES.map((item) => item.name)];
 }
 
-function featurePolicyPutBody(fresh: Resource | null, tree: Record<string, unknown>): Record<string, unknown> {
-  const children = Array.isArray(tree.children) ? tree.children : [];
-  if (!fresh?.id || !fresh.version) return tree;
-  const body = writablePolicy(fresh, children);
-  body.name = ROOT_POLICY;
-  body.description = tree.description;
-  body.enabled = true;
-  body.type = 'POLICY';
-  body.combiningAlgorithm = { algorithm: 'DENY_OVERRIDES' };
-  return body;
-}
-
-async function putFeatureTree(
+async function postFeatureTree(
   input: ProvisionInput,
   api: string,
   headers: Record<string, string>,
@@ -240,54 +223,51 @@ async function putFeatureTree(
   delegationPlans: RulePlan[],
   going: () => boolean,
 ): Promise<{ parent: Resource; user: Resource; delegation: Resource } | null> {
-  let parent = await featurePolicy(input, api, headers);
-  if (!parent) {
+  const collection = `${api}/authorizationPolicies`;
+  const existing = await featurePolicy(input, api, headers);
+  if (existing) {
+    if (existing.name !== ROOT_POLICY) {
+      throw new Error(`Refusing to update ${existing.name ?? existing.id}. Scaffold only writes ${ROOT_POLICY}.`);
+    }
+    const before = await readResource(input, `${collection}/${existing.id}`, headers);
+    if (before.name !== ROOT_POLICY) {
+      throw new Error(`Refusing to update ${before.name ?? before.id}. Scaffold only writes ${ROOT_POLICY}.`);
+    }
+    const present = await resolvePolicyChildren(input, api, headers, before);
+    if (treeProblems(before, present, userPlans, delegationPlans, attributeIds).length === 0) {
+      input.log?.('debug', policyTrace('Authorize policy tree already present', `${collection}/${before.id}`, null, before, present));
+      return requiredChildren(before, present);
+    }
     if (!going()) return null;
-    parent = await ensureResource(
-      input,
-      `${api}/authorizationPolicies`,
-      'policy',
-      ROOT_POLICY,
-      policyShell(ROOT_POLICY, 'Denies the Enterprise Agent decision when the user policy or the delegation policy denies.', 'DENY_OVERRIDES'),
-      headers,
-      going,
-    );
-  }
-  const before = await readResource(input, `${api}/authorizationPolicies/${parent.id}`, headers);
-  if (before.name !== ROOT_POLICY) {
-    throw new Error(`Refusing to update ${before.name ?? before.id}. Scaffold only writes ${ROOT_POLICY}.`);
-  }
-  const present = await resolvePolicyChildren(input, api, headers, before);
-  const url = `${api}/authorizationPolicies/${before.id}`;
-  if (treeProblems(before, present, userPlans, delegationPlans, attributeIds).length === 0) {
-    input.log?.('debug', policyTrace('Authorize policy tree already present', url, null, before, present));
-    return requiredChildren(before, present);
+    // The name is unique, and a PUT does not add children. Remove only this empty shell, then create the tree.
+    await deletePolicy(input, api, headers, before.id);
   }
   if (!going()) return null;
-  const fresh = await readResource(input, `${api}/authorizationPolicies/${parent.id}`, headers);
-  if (fresh.name !== ROOT_POLICY) {
-    throw new Error(`Refusing to update ${fresh.name ?? fresh.id}. Scaffold only writes ${ROOT_POLICY}.`);
-  }
-  const tree = featurePolicyTree(attributeIds, input.adminGroup, input.delegations);
-  const body = featurePolicyPutBody(fresh, tree);
-  input.log?.('debug', policyTrace('Authorize policy tree PUT', url, body, null, []));
-  await sendJson(input, url, 'PUT', headers, body);
+  const body = featurePolicyTree(attributeIds, input.adminGroup, input.delegations);
+  input.log?.('debug', policyTrace('Authorize policy tree POST', collection, body, null, []));
+  const created = await sendJson(input, collection, 'POST', headers, body);
   await input.client.paceAfterManagementPost();
+  const url = `${collection}/${created.id}`;
   const read = await readResource(input, url, headers);
-  const created = await resolvePolicyChildren(input, api, headers, read);
-  const trace = policyTrace('Authorize policy tree read-back', url, body, read, created);
+  const children = await resolvePolicyChildren(input, api, headers, read);
+  const trace = policyTrace('Authorize policy tree read-back', url, body, read, children);
   input.log?.('debug', trace);
-  const problems =
-    read.id !== fresh.id || read.name !== ROOT_POLICY
-      ? [`Read-back was ${read.name ?? read.id}.`]
-      : treeProblems(read, created, userPlans, delegationPlans, attributeIds);
+  const problems = read.name !== ROOT_POLICY ? [`Read-back was ${read.name ?? read.id}.`] : treeProblems(read, children, userPlans, delegationPlans, attributeIds);
   if (problems.length > 0) {
     input.log?.('error', trace);
-    throw new Error(nestingError(fresh, problems, body, read, created, url, input.logPath));
+    throw new Error(nestingError(read, problems, body, read, children, url, input.logPath));
   }
-  const verified = requiredChildren(read, created);
-  await deleteOrphanPolicies(input, api, headers, new Set([verified.user.id, verified.delegation.id]), fresh.id);
+  input.store.put('policy', ROOT_POLICY, read.id, '');
+  const verified = requiredChildren(read, children);
+  await deleteOrphanPolicies(input, api, headers, new Set([verified.user.id, verified.delegation.id]), read.id);
   return verified;
+}
+
+async function deletePolicy(input: ProvisionInput, api: string, headers: Record<string, string>, id: string): Promise<void> {
+  const response = await input.client.request(`${api}/authorizationPolicies/${id}`, { method: 'DELETE', headers });
+  if (response.status === 404) return;
+  if (!response.ok) throw new Error(await errorText(response, `PingOne did not delete policy ${id}`));
+  await input.client.paceAfterManagementPost();
 }
 
 function policyTrace(
@@ -299,7 +279,7 @@ function policyTrace(
 ): string {
   const lines = [title, `url ${url}`];
   if (putBody) {
-    lines.push(`PUT children ${JSON.stringify(summarizePolicyChildren(putBody))}`);
+    lines.push(`POST children ${JSON.stringify(summarizePolicyChildren(putBody))}`);
     lines.push(JSON.stringify(putBody, null, 2));
   }
   if (getBody) {
@@ -328,7 +308,7 @@ function nestingError(
     `Children returned: ${JSON.stringify(summarizePolicyChildren(getBody))}`,
     walkPolicyTree(getBody).join('\n'),
     resolvedChildrenText(resolved),
-    `PUT ${url}`,
+    `POST ${url}`,
     JSON.stringify(putBody, null, 2),
     `GET ${url}`,
     JSON.stringify(getBody, null, 2),

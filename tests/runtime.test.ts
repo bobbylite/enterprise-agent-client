@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { Repository } from '../src/main/db';
 import { Runtime } from '../src/main/runtime';
 import { parseBranding } from '../src/shared/branding';
-import { authorizeWriteError, recordedPolicyChildren } from '../src/shared/authorize/framework';
+import { applyPolicyWrite, authorizeWriteError } from '../src/shared/authorize/framework';
 import { parseEnterpriseConfig } from '../src/shared/config';
 import { decodeJwtPayload, encodeJsonSegment } from '../src/shared/ids';
 import { MemorySecretStore } from '../src/shared/secrets';
@@ -1464,7 +1464,15 @@ function authorizeSide(target: string, method: string, bodyText: string): Respon
   }
   if (!idMatch && method === 'POST') {
     const id = `tf-${(authorizeSeq += 1)}`;
-    const saved = { ...body, id, version: 'v1', collection, children: body.children ?? [] };
+    const saved =
+      collection === 'authorizationPolicies'
+        ? {
+            ...applyPolicyWrite('POST', undefined, body, id, new Set(authorizeResources.keys()), () => `tf-${(authorizeSeq += 1)}`, (childId, child) => {
+              authorizeResources.set(childId, { ...child, collection: 'authorizationPolicies' });
+            }),
+            collection,
+          }
+        : { ...body, id, version: 'v1', collection, children: body.children ?? [] };
     authorizeResources.set(id, saved);
     return json(201, saved);
   }
@@ -1484,9 +1492,14 @@ function authorizeSide(target: string, method: string, bodyText: string): Respon
       delete saved.authorizationVersion;
     }
     if (collection === 'authorizationPolicies') {
-      saved.children = recordedPolicyChildren(body.children, new Set(authorizeResources.keys()), () => `tf-${(authorizeSeq += 1)}`, (childId, child) => {
-        authorizeResources.set(childId, { ...child, collection: 'authorizationPolicies' });
-      });
+      const prior = authorizeResources.get(id);
+      Object.assign(
+        saved,
+        applyPolicyWrite('PUT', prior, body, id, new Set(authorizeResources.keys()), () => `tf-${(authorizeSeq += 1)}`, (childId, child) => {
+          authorizeResources.set(childId, { ...child, collection: 'authorizationPolicies' });
+        }),
+        { collection },
+      );
     }
     authorizeResources.set(id, saved);
     return json(200, saved);
