@@ -73,6 +73,7 @@ const api: AgentBridge = {
   listPolicies: () => ipcRenderer.invoke(Ipc.listPolicies),
   refreshPolicies: () => ipcRenderer.invoke(Ipc.refreshPolicies),
   scaffoldPolicies: (confirm) => ipcRenderer.invoke(Ipc.scaffoldPolicies, confirm),
+  dryRunAuthorizePolicy: () => ipcRenderer.invoke(Ipc.dryRunAuthorizePolicy),
   resetPolicyCache: () => ipcRenderer.invoke(Ipc.resetPolicyCache),
   setPolicyEnabled: (id, enabled) => ipcRenderer.invoke(Ipc.setPolicyEnabled, id, enabled),
   listAudit: () => ipcRenderer.invoke(Ipc.listAudit),

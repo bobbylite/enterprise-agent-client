@@ -31,7 +31,7 @@ import {
   type DecisionInput,
 } from '@shared/authorize/policy';
 import { decisionTokensReady, type DecisionCall } from '@shared/authorize/framework';
-import { provisionAuthorize } from '@shared/authorize/provision';
+import { plannedFeaturePolicy, provisionAuthorize } from '@shared/authorize/provision';
 import { AuthorizeClient, listRemotePolicies, postDecision, setRemotePolicyEnabled, syncRemoteScaffold } from '@shared/authorize/remote';
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
 import { PINGONE_SKILL_ID, pingoneSkillInstructions, type SkillDraft } from '@shared/skills/markdown';
@@ -78,6 +78,7 @@ import type {
   AuditView,
   FeatureDecision,
   PolicyCacheReset,
+  PolicyDryRun,
   PolicyScaffoldResult,
   PolicyView,
   SkillInput,
@@ -163,6 +164,9 @@ export interface RuntimeOptions {
   version?: string;
   dev?: boolean;
   checkpointPath?: string;
+  userDataDir?: string;
+  logPath?: string;
+  log?: (level: 'debug' | 'error', message: string) => void;
 }
 
 const SCENARIOS: MockScenario[] = ['low', 'new_device', 'anomalous_location', 'impossible_travel', 'bot'];
@@ -704,6 +708,39 @@ export class Runtime {
       return { preview: incoming.map(policyView), created: [], policies: existing.map(policyView) };
     }
     return this.authorize.run(() => this.confirmScaffold(incoming));
+  }
+
+  async dryRunAuthorizePolicy(): Promise<PolicyDryRun> {
+    this.requirePolicy();
+    const directory = this.options.userDataDir ?? this.options.attachmentsDir;
+    const path = join(directory, 'authorize-policy-tree.json');
+    if (this.options.config.tenant.mode !== 'pingone') {
+      const body = plannedFeaturePolicy(new Map(), this.options.config.access.adminGroup, this.options.config.authorize.delegations);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
+      this.options.log?.('debug', `Authorize dry run wrote ${path}\n${JSON.stringify(body, null, 2)}`);
+      return { path };
+    }
+    const token = await this.workerAccessToken();
+    const result = await provisionAuthorize({
+      config: this.options.config,
+      accessToken: token,
+      client: this.authorize,
+      store: {
+        get: (kind, name) => this.options.db.getTfObject(kind, name),
+        put: (kind, name, remoteId, contentHash) => this.options.db.upsertTfObject(kind, name, remoteId, contentHash),
+      },
+      adminGroup: this.options.config.access.adminGroup,
+      delegations: this.options.config.authorize.delegations,
+      alwaysCurrent: this.options.config.authorize.alwaysCurrent,
+      shouldContinue: () => true,
+      dryRun: true,
+      dryRunPath: path,
+      log: this.options.log,
+      logPath: this.options.logPath,
+    });
+    if (!result.dryRunPath) throw new Error('Dry run did not write the policy tree.');
+    return { path: result.dryRunPath };
   }
 
   async setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]> {
@@ -1695,6 +1732,8 @@ export class Runtime {
       delegations: this.options.config.authorize.delegations,
       alwaysCurrent: this.options.config.authorize.alwaysCurrent,
       shouldContinue: () => epoch === this.policyEpoch,
+      log: this.options.log,
+      logPath: this.options.logPath,
     });
     if (epoch !== this.policyEpoch || !result.decisionEndpointId) return;
     this.options.db.setSetting('authorize.decisionEndpointId', result.decisionEndpointId);

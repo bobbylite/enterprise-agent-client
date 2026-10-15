@@ -6,6 +6,7 @@ import { Repository } from './db';
 import { bindIpc } from './ipc';
 import { createSecretStore } from './keychain';
 import { loadBranding, loadDotEnv, loadEnterprise, resolveBrandingPath, resolveEnterprisePath } from './load-config';
+import { createAppLog } from './log';
 import { Runtime } from './runtime';
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -72,7 +73,9 @@ async function boot(): Promise<void> {
   const branding = loadBranding(resolveBrandingPath(cwd, appPath, process.env));
   const configPath = resolveEnterprisePath(cwd, appPath, process.env);
   const config = loadEnterprise(configPath);
-  const db = Repository.open(join(app.getPath('userData'), 'agent.sqlite'));
+  const userData = app.getPath('userData');
+  const log = createAppLog(join(app.getPath('logs'), 'main.log'));
+  const db = Repository.open(join(userData, 'agent.sqlite'));
   const { store, encryptionAvailable } = createSecretStore(db);
   const runtime = await Runtime.create({
     config,
@@ -80,7 +83,10 @@ async function boot(): Promise<void> {
     db,
     secrets: store,
     appRoot: cwd,
-    attachmentsDir: join(app.getPath('userData'), 'attachments'),
+    attachmentsDir: join(userData, 'attachments'),
+    userDataDir: userData,
+    logPath: log.path,
+    log: (level, message) => log.write(level, message),
     encryptionAvailable,
     env: process.env,
     version: app.getVersion(),

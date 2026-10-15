@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { AuthorizeClient } from '../src/shared/authorize/remote';
 import {
@@ -30,7 +32,7 @@ function memoryStore(): TfStore & { rows: Map<string, { remoteId: string; conten
   };
 }
 
-function pingone() {
+function pingone(options?: { hidePolicyChildren?: boolean }) {
   const resources = new Map<string, Record<string, unknown>>();
   const calls: { method: string; url: string; body?: Record<string, unknown> }[] = [];
   let seq = 0;
@@ -68,7 +70,7 @@ function pingone() {
       }
       if (method === 'GET') {
         const saved = resources.get(id);
-        return saved ? json(shown(saved)) : json({ message: 'missing' }, 404);
+        return saved ? json(shown(saved, options?.hidePolicyChildren === true)) : json({ message: 'missing' }, 404);
       }
       const saved: Record<string, unknown> = { ...(resources.get(id) ?? {}), ...(body ?? {}), id, version: 'v2', kind };
       if (kind === 'decisionEndpoints' && body && !Object.prototype.hasOwnProperty.call(body, 'authorizationVersion')) {
@@ -87,11 +89,12 @@ function pingone() {
 }
 
 /** PingOne reads a REQUEST or SERVICE resolver without valueType. The create body still has to send it. */
-function shown(saved: Record<string, unknown>): Record<string, unknown> {
-  if (!Array.isArray(saved.resolvers)) return saved;
+function shown(saved: Record<string, unknown>, hidePolicyChildren = false): Record<string, unknown> {
+  const visible = hidePolicyChildren && saved.kind === 'authorizationPolicies' ? { ...saved, children: [] } : saved;
+  if (!Array.isArray(visible.resolvers)) return visible;
   return {
-    ...saved,
-    resolvers: saved.resolvers.map((resolver) => {
+    ...visible,
+    resolvers: visible.resolvers.map((resolver) => {
       if (!resolver || typeof resolver !== 'object') return resolver;
       const record = { ...(resolver as { type?: string; valueType?: unknown }) };
       if (record.type === 'CONSTANT') return resolver;
@@ -167,11 +170,11 @@ describe('real Authorize scaffold', () => {
     expect(posts).toContain('authorizationAttributes:introspect-client-secret');
     expect(posts).toContain('authorizationServices:EnterpriseAgent User Introspection');
     expect(posts).toContain('authorizationServices:EnterpriseAgent Delegation Introspection');
-    expect(posts).toContain('authorizationPolicies:Enterprise Agent');
+    expect(posts).toContain('authorizationPolicies:Enterprise Agent Features');
     expect(posts).not.toContain('authorizationPolicies:Enterprise Agent User');
     expect(posts).not.toContain('authorizationPolicies:Enterprise Agent Delegation');
     expect(posts.indexOf('authorizationAttributes:EnterpriseAgent')).toBeLessThan(posts.indexOf('authorizationServices:EnterpriseAgent User Introspection'));
-    expect(posts.indexOf('authorizationServices:EnterpriseAgent User Introspection')).toBeLessThan(posts.indexOf('authorizationPolicies:Enterprise Agent'));
+    expect(posts.indexOf('authorizationServices:EnterpriseAgent User Introspection')).toBeLessThan(posts.indexOf('authorizationPolicies:Enterprise Agent Features'));
 
     const attributePosts = fake.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/authorizationAttributes'));
     for (const call of attributePosts) {
@@ -219,37 +222,47 @@ describe('real Authorize scaffold', () => {
     expect(service?.body).not.toHaveProperty('channel');
     expect(JSON.stringify(service?.body)).not.toMatch(/client-secret|super-secret|password=/i);
 
-    const userPut = fake.calls.filter((call) => call.method === 'PUT' && call.url.includes('/authorizationPolicies/')).find((call) => {
-      const children = call.body?.children as { name?: string; type?: string }[] | undefined;
-      return children?.some((child) => child.name === 'High risk or inactive token');
-    });
-    const rules = userPut?.body?.children as { type: string; effectSettings: { type: string }; statements: { attributes: unknown[]; payload: string }[]; id?: string }[];
+    const treePuts = fake.calls.filter((call) => call.method === 'PUT' && call.body?.name === 'Enterprise Agent Features');
+    expect(treePuts).toHaveLength(1);
+    const tree = treePuts[0]?.body;
+    expect(tree).toMatchObject({ id: expect.any(String), version: expect.any(String), type: 'POLICY' });
+    const inlineChildren = tree?.children as {
+      id?: string;
+      type?: string;
+      name?: string;
+      combiningAlgorithm?: { algorithm?: string };
+      children?: { type: string; name?: string; effectSettings: { type: string }; statements: { attributes: unknown[]; payload: string }[] }[];
+    }[];
+    expect(inlineChildren.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
+    expect(inlineChildren.every((child) => child.type === 'POLICY' && !child.id)).toBe(true);
+    expect(inlineChildren.map((child) => child.combiningAlgorithm?.algorithm)).toEqual(['FIRST_APPLICABLE', 'FIRST_APPLICABLE']);
+    const rules = inlineChildren[0]?.children ?? [];
     expect(rules[0]?.type).toBe('RULE');
+    expect(rules[0]?.name).toBe('High risk or inactive token');
     expect(rules[0]?.effectSettings.type).toBe('UNCONDITIONAL_DENY');
     expect(rules[0]?.statements[0]?.attributes).toEqual([]);
-    expect(rules[0]?.statements[0]).toMatchObject({ services: [], appliesIf: 'PATH_MATCHES' });
+    expect(rules[0]?.statements[0]).toMatchObject({ services: [], appliesIf: 'PATH_MATCHES', type: 'EMBEDDED_STATEMENT' });
+    expect(rules.every((rule) => !('id' in rule) && !('version' in rule))).toBe(true);
     expect(rules.at(-1)?.effectSettings.type).toBe('UNCONDITIONAL_PERMIT');
-    expect(rulesReferenceIsApproved(userPut?.body)).toBe(false);
-    expect(userPut?.body).toMatchObject({ id: expect.any(String), version: expect.any(String) });
-
-    const delegationPut = fake.calls.filter((call) => call.method === 'PUT' && call.url.includes('/authorizationPolicies/')).find((call) => {
-      const children = call.body?.children as { name?: string }[] | undefined;
-      return children?.some((child) => child.name === 'Mapped human and agent');
-    });
-    expect(JSON.stringify(delegationPut?.body)).toContain('NOT_EQUALS');
-    expect(JSON.stringify(delegationPut?.body)).not.toContain('isApproved');
+    expect(rulesReferenceIsApproved(tree)).toBe(false);
+    expect(JSON.stringify(inlineChildren[1])).toContain('NOT_EQUALS');
+    expect(JSON.stringify(inlineChildren[1])).toContain('Mapped human and agent');
+    expect(JSON.stringify(tree)).not.toContain('isApproved');
     expect(groupsComparisonUsesCollection()).toBe(true);
-
-    const parentPut = [...fake.calls].reverse().find((call) => call.method === 'PUT' && call.body?.combiningAlgorithm && JSON.stringify(call.body.combiningAlgorithm).includes('DENY_OVERRIDES'));
-    const inlineChildren = parentPut?.body?.children as { id?: string; type?: string; name?: string; combiningAlgorithm?: { algorithm?: string } }[] | undefined;
-    expect(inlineChildren?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
-    expect(inlineChildren?.every((child) => child.type === 'POLICY' && !child.id)).toBe(true);
-    expect(inlineChildren?.map((child) => child.combiningAlgorithm?.algorithm)).toEqual(['FIRST_APPLICABLE', 'FIRST_APPLICABLE']);
 
     const endpointPut = fake.calls.find((call) => call.method === 'PUT' && call.url.includes('/decisionEndpoints/'));
     expect(endpointPut?.body?.authorizationVersion).toEqual({ id: 'ver-1' });
 
     const writes = fake.calls.filter((call) => call.method === 'POST' || call.method === 'PUT').length;
+    fake.resources.set('later-orphan', {
+      id: 'later-orphan',
+      name: 'Enterprise Agent User',
+      kind: 'authorizationPolicies',
+      version: 'v1',
+      type: 'POLICY',
+      enabled: true,
+      children: [],
+    });
     await provisionAuthorize({
       config: enterprise,
       accessToken: 'worker-token',
@@ -261,6 +274,7 @@ describe('real Authorize scaffold', () => {
     });
     expect(fake.calls.filter((call) => call.method === 'POST' || call.method === 'PUT')).toHaveLength(writes);
     expect(fake.calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
+    expect(fake.resources.has('later-orphan')).toBe(true);
   });
 
   it('creates the child policies inline and deletes only the exact-name orphans', async () => {
@@ -317,12 +331,110 @@ describe('real Authorize scaffold', () => {
     expect(fake.resources.has('keep-me')).toBe(true);
     const deleted = fake.calls.filter((call) => call.method === 'DELETE').map((call) => call.url);
     expect(deleted).toEqual(expect.arrayContaining([expect.stringContaining('/user-orphan'), expect.stringContaining('/delegation-orphan')]));
-    expect(deleted.some((url) => url.includes('keep-me'))).toBe(false);
-    const parent = fake.resources.get('root-existing');
+    expect(deleted.some((url) => url.includes('keep-me') || url.includes('root-existing'))).toBe(false);
+    const putIndex = fake.calls.findIndex((call) => call.method === 'PUT' && call.body?.name === 'Enterprise Agent Features');
+    const deleteIndex = fake.calls.findIndex((call) => call.method === 'DELETE');
+    expect(putIndex).toBeGreaterThan(-1);
+    expect(deleteIndex).toBeGreaterThan(putIndex);
+    expect(fake.calls.some((call) => call.method === 'PUT' && call.url.includes('/root-existing'))).toBe(false);
+    expect(fake.resources.get('root-existing')?.children).toEqual([]);
+    const parent = [...fake.resources.values()].find((item) => item.name === 'Enterprise Agent Features');
     const refs = parent?.children as { type?: string; name?: string; value?: { id?: string } }[];
     expect(refs?.map((child) => child.type)).toEqual(['POLICY', 'POLICY']);
-    expect(refs?.every((child) => !child.name && child.value?.id)).toBe(true);
+    expect(refs?.every((child) => !child.name && child.value?.id && child.value.id !== 'user-orphan' && child.value.id !== 'delegation-orphan')).toBe(true);
     expect(refs?.map((child) => fake.resources.get(child.value?.id ?? '')?.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
+  });
+
+  it('does not delete anything when the read-back is missing the child policies', async () => {
+    const store = memoryStore();
+    const fake = pingone({ hidePolicyChildren: true });
+    const logs: { level: string; message: string }[] = [];
+    fake.resources.set('user-orphan', {
+      id: 'user-orphan',
+      name: 'Enterprise Agent User',
+      kind: 'authorizationPolicies',
+      version: 'v1',
+      type: 'POLICY',
+      enabled: true,
+      children: [{ type: 'RULE', name: 'High risk or inactive token' }],
+    });
+    const enterprise = config();
+    await expect(
+      provisionAuthorize({
+        config: enterprise,
+        accessToken: 'worker-token',
+        client: fake.client,
+        store,
+        adminGroup: 'Administrator',
+        delegations: enterprise.authorize.delegations,
+        alwaysCurrent: false,
+        log: (level, message) => logs.push({ level, message }),
+        logPath: '/tmp/enterprise-agent-client/main.log',
+      }),
+    ).rejects.toThrow(/Missing policy Enterprise Agent User/);
+    expect(fake.calls.filter((call) => call.method === 'DELETE')).toHaveLength(0);
+    expect(fake.resources.has('user-orphan')).toBe(true);
+    const failure = logs.find((entry) => entry.level === 'error');
+    expect(failure?.message).toContain('Enterprise Agent Features');
+    expect(failure?.message).toContain('PUT children');
+    expect(failure?.message).toContain('GET children');
+    expect(failure?.message).toContain('"valueId"');
+  });
+
+  it('writes the planned tree and does not create, update, or delete PingOne objects', async () => {
+    const store = memoryStore();
+    const fake = pingone();
+    fake.resources.set('old-parent', {
+      id: 'old-parent',
+      name: 'Enterprise Agent',
+      kind: 'authorizationPolicies',
+      version: 'v3',
+      type: 'POLICY',
+      enabled: true,
+      children: [],
+    });
+    fake.resources.set('features', {
+      id: 'features',
+      name: 'Enterprise Agent Features',
+      kind: 'authorizationPolicies',
+      version: 'v4',
+      type: 'POLICY',
+      enabled: true,
+      combiningAlgorithm: { algorithm: 'DENY_OVERRIDES' },
+      children: [],
+    });
+    const directory = mkdtempSync(join(tmpdir(), 'authorize-tree-'));
+    const path = join(directory, 'authorize-policy-tree.json');
+    const enterprise = config();
+    const result = await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+      dryRun: true,
+      dryRunPath: path,
+    });
+    expect(result.dryRunPath).toBe(path);
+    expect(result.policies).toEqual([]);
+    expect(fake.calls.every((call) => call.method === 'GET')).toBe(true);
+    expect(fake.resources.has('old-parent')).toBe(true);
+    const written = JSON.parse(readFileSync(path, 'utf8')) as {
+      id?: string;
+      version?: string;
+      name?: string;
+      children?: { type?: string; id?: string; name?: string; children?: { type?: string; id?: string; name?: string }[] }[];
+    };
+    expect(written).toMatchObject({ id: 'features', version: 'v4', name: 'Enterprise Agent Features', type: 'POLICY' });
+    expect(written.children?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
+    expect(written.children?.every((child) => child.type === 'POLICY' && !child.id)).toBe(true);
+    const rules = written.children?.[0]?.children ?? [];
+    expect(rules[0]?.name).toBe('High risk or inactive token');
+    expect(rules.every((rule) => rule.type === 'RULE' && !rule.id)).toBe(true);
+    expect(JSON.stringify(written)).toContain('{{risk-level}}');
+    expect(JSON.stringify(written)).not.toContain('isApproved');
   });
 
   it('reuses a half-created parent by name and does not replace a console secret', async () => {

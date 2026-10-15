@@ -496,6 +496,7 @@ describe('admin gate', () => {
     expect(employee.features.chat).toBe('allow');
     await expect(runtime.listPolicies()).rejects.toThrow(/Administrator/);
     await expect(runtime.scaffoldPolicies(true)).rejects.toThrow(/Administrator/);
+    await expect(runtime.dryRunAuthorizePolicy()).rejects.toThrow(/Administrator/);
     await expect(runtime.resetPolicyCache()).rejects.toThrow(/Administrator/);
     const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
     const employeePage = runtime.openAgent(branded!.id);
@@ -559,6 +560,20 @@ describe('admin gate', () => {
     expect(afterReset.restriction).toBeNull();
     const restored = await runtime.scaffoldPolicies(true);
     expect(restored.created).toHaveLength(4);
+  });
+
+  it('writes a dry-run policy tree without calling PingOne', async () => {
+    const { runtime } = await boot(0, undefined, async () => {
+      throw new Error('dry run called PingOne');
+    });
+    await runtime.setMockAdmin(true);
+    await runtime.submitCredentials('ada', 'secret', '');
+    const result = await runtime.dryRunAuthorizePolicy();
+    expect(existsSync(result.path)).toBe(true);
+    const body = JSON.parse(readFileSync(result.path, 'utf8')) as { name?: string; children?: { name?: string; id?: string }[] };
+    expect(body.name).toBe('Enterprise Agent Features');
+    expect(body.children?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
+    expect(body.children?.every((child) => !child.id)).toBe(true);
   });
 
   it('locks an administrator session down at high risk', async () => {
