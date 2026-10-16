@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { riskIndicatorClass } from '@shared/protect/reasons';
 import type { AppState, Branding } from '@shared/types';
 import { ApprovalModal } from '../components/ApprovalModal';
 import { AgentsScreen } from './AgentsScreen';
@@ -29,7 +30,7 @@ export function Shell({
   const showPolicy = Boolean(state.session?.admin && state.features.policyTab);
   const nav = NAV.filter(([id]) => id !== 'policy' || showPolicy);
   const [view, setView] = useState<(typeof NAV)[number][0]>('chat');
-  const riskClass = state.risk?.action === 'block' ? 'danger' : state.risk?.action === 'allow' ? 'good' : 'warn';
+  const riskClass = riskIndicatorClass(state.risk?.level);
   const readOnly = state.features.chat === 'read_only';
   const canScaffold = Boolean(state.session?.admin && state.features.policyTab);
 

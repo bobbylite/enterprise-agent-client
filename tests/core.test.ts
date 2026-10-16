@@ -13,7 +13,7 @@ import { renderRiskContext } from '../src/shared/protect/context';
 import { buildRiskEvent, resolvePublicIp } from '../src/shared/protect/evaluate';
 import { mockRiskPayload } from '../src/shared/protect/mock';
 import { decideRisk, summarizeRisk, unscoredRisk } from '../src/shared/protect/policy';
-import { extractRiskReasons } from '../src/shared/protect/reasons';
+import { extractRiskReasons, riskIndicatorClass, riskLevel } from '../src/shared/protect/reasons';
 import {
   createOpenAiProvider,
   isReasoningModel,
@@ -410,6 +410,26 @@ describe('protect policy', () => {
     expect(extractRiskReasons(mockRiskPayload('impossible_travel').details).map((reason) => reason.code)).toContain('IMPOSSIBLE_TRAVEL');
     expect(extractRiskReasons(mockRiskPayload('bot').details).map((reason) => reason.code)).toContain('BOT');
     expect(extractRiskReasons(mockRiskPayload('low').details)).toEqual([]);
+  });
+
+  it('maps Protect level text and scores onto the indicator colors', () => {
+    expect(riskLevel('LOW')).toBe('LOW');
+    expect(riskLevel('low')).toBe('LOW');
+    expect(riskLevel('Low Risk')).toBe('LOW');
+    expect(riskLevel('medium')).toBe('MEDIUM');
+    expect(riskLevel('HIGH_RISK')).toBe('HIGH');
+    expect(riskLevel('unknown')).toBe('UNKNOWN');
+    expect(riskLevel('not-a-level')).toBe('UNKNOWN');
+    expect(riskLevel(10)).toBe('LOW');
+    expect(riskLevel(undefined, 50)).toBe('MEDIUM');
+    expect(riskLevel(undefined, '85')).toBe('HIGH');
+    expect(riskLevel('LOW', 90)).toBe('LOW');
+    expect(riskIndicatorClass('LOW')).toBe('good');
+    expect(riskIndicatorClass('low')).toBe('good');
+    expect(riskIndicatorClass('MEDIUM')).toBe('warn');
+    expect(riskIndicatorClass('high')).toBe('danger');
+    expect(riskIndicatorClass('UNKNOWN')).toBe('unknown');
+    expect(riskIndicatorClass(undefined)).toBe('unknown');
   });
 
   it('lets the most restrictive matching action win', () => {

@@ -130,6 +130,7 @@ button.nav.selected, button.list-item.selected { background: rgba(255, 255, 255,
 .risk-stamp.good span { color: #8dcea3; }
 .risk-stamp.warn span { color: #f0c27a; }
 .risk-stamp.danger span { color: #f0a3a3; }
+.risk-stamp.unknown span { color: #b7b1aa; }
 .workspace { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--paper); }
 .access-notice { margin: 16px 16px 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .access-notice p { margin: 0; }

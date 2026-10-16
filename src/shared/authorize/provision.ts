@@ -6,6 +6,7 @@ import { AuthorizeClient } from './remote';
 import {
   CLIENT_ID_DEFINITION,
   CLIENT_SECRET_DEFINITION,
+  USER_CLIENT_ID_DEFINITION,
   DECISION_ENDPOINT,
   DELEGATION_POLICY,
   DELEGATION_SERVICE,
@@ -23,6 +24,7 @@ import {
   introspectUrl,
   scaffoldPlan,
   serviceBody,
+  userIntrospectionServiceBody,
   summarizePolicyChildren,
   tagBody,
   userRulePlans,
@@ -101,6 +103,16 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     requestIds.set(attribute.name, saved.id);
   }
 
+  const userClientValue = input.config.tenant.clientId.trim();
+  const userClientId = await ensureResource(
+    input,
+    `${api}/authorizationAttributes`,
+    'attribute',
+    USER_CLIENT_ID_DEFINITION,
+    attributeBody(USER_CLIENT_ID_DEFINITION, { parentId: parent.id, ...(userClientValue ? { constantValue: userClientValue } : {}) }),
+    headers,
+    going,
+  );
   const clientId = await ensureResource(
     input,
     `${api}/authorizationAttributes`,
@@ -119,6 +131,7 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     headers,
     going,
   );
+  assertDefinition(userClientId, parent.id);
   assertDefinition(clientId, parent.id);
   assertDefinition(secret, parent.id);
 
@@ -130,7 +143,7 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     `${api}/authorizationServices`,
     'service',
     USER_SERVICE,
-    serviceBody(USER_SERVICE, url, accessId, clientId.id, secret.id),
+    userIntrospectionServiceBody(USER_SERVICE, url, accessId, userClientId.id),
     headers,
     going,
   );
@@ -143,7 +156,7 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     headers,
     going,
   );
-  assertService(userService, accessId, clientId.id, secret.id);
+  assertUserService(userService, accessId, userClientId.id);
   assertService(delegationService, txId, clientId.id, secret.id);
 
   const serviceIds = new Map<string, string>([
@@ -194,9 +207,10 @@ async function dryRunFeaturePolicy(input: ProvisionInput, api: string, headers: 
   const body = plannedFeaturePolicy(attributeIds, input.adminGroup, input.delegations);
   const path = input.dryRunPath;
   if (!path) throw new Error('Dry run needs a file path.');
+  const text = `${JSON.stringify(body, null, 2)}\n`;
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
-  input.log?.('debug', `Authorize dry run wrote ${path}\n${JSON.stringify(body, null, 2)}`);
+  writeFileSync(path, text);
+  input.log?.('debug', `Authorize dry run wrote ${path}\n${text}`);
   return { decisionEndpointId: '', policies: [], dryRunPath: path };
 }
 
@@ -596,17 +610,33 @@ async function alignFound(
   intended: Record<string, unknown>,
 ): Promise<Resource> {
   if (collection.includes('authorizationServices')) return alignService(input, collection, headers, current, intended);
+  if (collection.includes('authorizationAttributes') && constantNeedsUpdate(current, intended)) {
+    return writeAttribute(input, collection, headers, current, intended, false);
+  }
   if (!collection.includes('authorizationAttributes') || (!resolversMissingValueType(current) && !processorMissingName(current))) return current;
   const version = typeof current.version === 'string' ? current.version : '';
   if (!version) throw new Error(`PingOne attribute ${String(current.name)} is missing a version, so it cannot be repaired.`);
-  const resolvers = intendedResolvers(intended, current);
-  const body: Record<string, unknown> = { ...intended, id: current.id, version, resolvers };
+  return writeAttribute(input, collection, headers, current, { ...intended, resolvers: intendedResolvers(intended, current) }, true);
+}
+
+async function writeAttribute(
+  input: ProvisionInput,
+  collection: string,
+  headers: Record<string, string>,
+  current: Resource,
+  intended: Record<string, unknown>,
+  repair: boolean,
+): Promise<Resource> {
+  const version = typeof current.version === 'string' ? current.version : '';
+  if (!version) throw new Error(`PingOne attribute ${String(current.name)} is missing a version, so it cannot be repaired.`);
+  const body: Record<string, unknown> = { ...intended, id: current.id, version };
   await sendJson(input, `${collection}/${current.id}`, 'PUT', headers, body);
   await input.client.paceAfterManagementPost();
   const read = await readResource(input, `${collection}/${current.id}`, headers);
   if (read.id !== current.id) throw new Error(`PingOne attribute ${String(current.name)} read-back id did not match the repair.`);
-  if (resolversMissingValueType(read)) throw new Error(`PingOne attribute ${String(current.name)} still has a resolver without valueType.`);
-  if (processorMissingName(read)) throw new Error(`PingOne attribute ${String(current.name)} processor.name is still missing.`);
+  if (repair && resolversMissingValueType(read)) throw new Error(`PingOne attribute ${String(current.name)} still has a resolver without valueType.`);
+  if (repair && processorMissingName(read)) throw new Error(`PingOne attribute ${String(current.name)} processor.name is still missing.`);
+  if (!repair && constantNeedsUpdate(read, intended)) throw new Error(`PingOne attribute ${String(current.name)} did not keep the configured value.`);
   return read;
 }
 
@@ -617,7 +647,8 @@ async function alignService(
   current: Resource,
   intended: Record<string, unknown>,
 ): Promise<Resource> {
-  if (!serviceMissingLimits(current)) return current;
+  const requestMismatch = serviceRequestMismatch(current, intended);
+  if (!serviceMissingLimits(current) && !requestMismatch) return current;
   const version = typeof current.version === 'string' ? current.version : '';
   if (!version) throw new Error(`PingOne service ${String(current.name)} is missing a version, so it cannot be repaired.`);
   const body = { ...intended, id: current.id, version };
@@ -626,7 +657,41 @@ async function alignService(
   const read = await readResource(input, `${collection}/${current.id}`, headers);
   if (read.id !== current.id) throw new Error(`PingOne service ${String(current.name)} read-back id did not match the repair.`);
   if (serviceMissingLimits(read)) throw new Error(`PingOne service ${String(current.name)} is still missing its rate limits.`);
+  if (serviceRequestMismatch(read, intended)) throw new Error(`PingOne service ${String(current.name)} did not keep the introspection request.`);
   return read;
+}
+
+function serviceRequestMismatch(current: Resource, intended: Record<string, unknown>): boolean {
+  const left = serviceRequest(current);
+  const right = serviceRequest(intended);
+  return left.type !== right.type || left.name !== right.name || left.password !== right.password || left.body !== right.body;
+}
+
+function serviceRequest(body: Record<string, unknown>): { type: string; name: string; password: string; body: string } {
+  const settings = body.serviceSettings as {
+    body?: unknown;
+    authentication?: { type?: unknown; name?: { id?: unknown }; password?: { id?: unknown } };
+  } | undefined;
+  const name = settings?.authentication?.name?.id;
+  const password = settings?.authentication?.password?.id;
+  return {
+    type: typeof settings?.authentication?.type === 'string' ? settings.authentication.type : '',
+    name: typeof name === 'string' ? name : '',
+    password: typeof password === 'string' ? password : '',
+    body: typeof settings?.body === 'string' ? settings.body : '',
+  };
+}
+
+function constantNeedsUpdate(current: Resource, intended: Record<string, unknown>): boolean {
+  const next = constantValue(intended);
+  if (!next) return false;
+  return constantValue(current) !== next;
+}
+
+function constantValue(body: Record<string, unknown>): string {
+  const resolvers = body.resolvers as { type?: string; value?: unknown }[] | undefined;
+  const constant = resolvers?.find((resolver) => resolver.type === 'CONSTANT');
+  return typeof constant?.value === 'string' ? constant.value : '';
 }
 
 function serviceMissingLimits(resource: Resource): boolean {
@@ -749,28 +814,43 @@ function assertDefinition(resource: Resource, parentId: string): void {
   assertResolverValueType(resource, 'STRING');
 }
 
+interface ServiceSettings {
+  authentication?: { type?: string; name?: { id?: string }; password?: { id?: string } };
+  body?: string;
+  timeoutMilliseconds?: number;
+  maximumConcurrentRequests?: number;
+  maximumRequestsPerSecond?: number;
+  headers?: unknown;
+  contentType?: string;
+}
+
+function assertUserService(resource: Resource, tokenAttributeId: string, clientIdAttributeId: string): void {
+  const settings = assertServiceShape(resource);
+  if (settings.authentication?.type !== 'NONE') throw new Error(`${String(resource.name)} is not unauthenticated.`);
+  if (settings.authentication.name || settings.authentication.password) throw new Error(`${String(resource.name)} still has authentication credentials.`);
+  const expected = `token={{${tokenAttributeId}}}&client_id={{${clientIdAttributeId}}}`;
+  if (settings.body !== expected) throw new Error(`${String(resource.name)} body is not token and client_id.`);
+}
+
 function assertService(resource: Resource, tokenAttributeId: string, clientId: string, secretId: string): void {
-  if (resource.parent) throw new Error(`${String(resource.name)} is not a top-level service.`);
-  const settings = resource.serviceSettings as {
-    authentication?: { type?: string; name?: { id?: string }; password?: { id?: string } };
-    body?: string;
-    timeoutMilliseconds?: number;
-    maximumConcurrentRequests?: number;
-    maximumRequestsPerSecond?: number;
-    headers?: unknown;
-    contentType?: string;
-  };
-  if (settings?.authentication?.type !== 'BASIC') throw new Error(`${String(resource.name)} is not BASIC auth.`);
+  const settings = assertServiceShape(resource);
+  if (settings.authentication?.type !== 'BASIC') throw new Error(`${String(resource.name)} is not BASIC auth.`);
   if (settings.authentication.name?.id !== clientId || settings.authentication.password?.id !== secretId) {
     throw new Error(`${String(resource.name)} Basic auth does not point at the Definitions.`);
   }
   if (settings.body !== `token={{${tokenAttributeId}}}`) throw new Error(`${String(resource.name)} body does not use the token attribute id.`);
-  if (settings.timeoutMilliseconds !== 3000) throw new Error(`${String(resource.name)} timeout is not 3000ms.`);
+}
+
+function assertServiceShape(resource: Resource): ServiceSettings {
+  if (resource.parent) throw new Error(`${String(resource.name)} is not a top-level service.`);
+  const settings = resource.serviceSettings as ServiceSettings;
+  if (settings?.timeoutMilliseconds !== 3000) throw new Error(`${String(resource.name)} timeout is not 3000ms.`);
   if (settings.maximumConcurrentRequests !== 20) throw new Error(`${String(resource.name)} maximumConcurrentRequests is not 20.`);
   if (settings.maximumRequestsPerSecond !== 10) throw new Error(`${String(resource.name)} maximumRequestsPerSecond is not 10.`);
   if (!Array.isArray(settings.headers)) throw new Error(`${String(resource.name)} headers were not saved.`);
   if (settings.contentType !== 'application/x-www-form-urlencoded') throw new Error(`${String(resource.name)} content type is wrong.`);
   if ((resource.valueType as { type?: string } | undefined)?.type !== 'JSON') throw new Error(`${String(resource.name)} is not JSON.`);
+  return settings;
 }
 
 function assertServiceAttribute(resource: Resource, serviceId: string, path: string, parentId: string): void {

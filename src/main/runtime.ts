@@ -30,7 +30,7 @@ import {
   type AuthorizePolicy,
   type DecisionInput,
 } from '@shared/authorize/policy';
-import { decisionTokensReady, type DecisionCall } from '@shared/authorize/framework';
+import { decisionTokensReady, introspectionNote as describeIntrospection, type DecisionCall } from '@shared/authorize/framework';
 import { plannedFeaturePolicy, provisionAuthorize } from '@shared/authorize/provision';
 import { AuthorizeClient, listRemotePolicies, postDecision, setRemotePolicyEnabled, syncRemoteScaffold } from '@shared/authorize/remote';
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
@@ -703,11 +703,13 @@ export class Runtime {
   async scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult> {
     this.requirePolicy();
     const incoming = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '');
+    const note = this.introspectionNote();
     if (!confirm) {
       const existing = this.options.db.listPolicies();
-      return { preview: incoming.map(policyView), created: [], policies: existing.map(policyView) };
+      return { preview: incoming.map(policyView), created: [], policies: existing.map(policyView), introspectionNote: note };
     }
-    return this.authorize.run(() => this.confirmScaffold(incoming));
+    const result = await this.authorize.run(() => this.confirmScaffold(incoming));
+    return { ...result, introspectionNote: note };
   }
 
   async dryRunAuthorizePolicy(): Promise<PolicyDryRun> {
@@ -717,9 +719,11 @@ export class Runtime {
     if (this.options.config.tenant.mode !== 'pingone') {
       const body = plannedFeaturePolicy(new Map(), this.options.config.access.adminGroup, this.options.config.authorize.delegations);
       mkdirSync(directory, { recursive: true });
-      writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
-      this.options.log?.('debug', `Authorize dry run wrote ${path}\n${JSON.stringify(body, null, 2)}`);
-      return { path };
+      const text = `${JSON.stringify(body, null, 2)}\n`;
+      writeFileSync(path, text);
+      const note = this.introspectionNote();
+      this.options.log?.('debug', `Authorize dry run wrote ${path}\n${text}\n${note}`);
+      return { path, introspectionNote: note };
     }
     const token = await this.workerAccessToken();
     const result = await provisionAuthorize({
@@ -740,7 +744,7 @@ export class Runtime {
       logPath: this.options.logPath,
     });
     if (!result.dryRunPath) throw new Error('Dry run did not write the policy tree.');
-    return { path: result.dryRunPath };
+    return { path: result.dryRunPath, introspectionNote: this.introspectionNote() };
   }
 
   async setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]> {
@@ -2589,6 +2593,10 @@ export class Runtime {
     await this.copyEnvSecret('openaiApiKey', 'OPENAI_API_KEY');
     await this.copyEnvSecret('anthropicApiKey', 'ANTHROPIC_API_KEY');
     await this.copyEnvSecret('genericApiKey', 'GENERIC_PROVIDER_API_KEY');
+  }
+
+  private introspectionNote(): string {
+    return describeIntrospection(this.options.config.tenant.clientId);
   }
 
   private async copyEnvSecret(account: string, envName: string): Promise<void> {

@@ -11,6 +11,7 @@ import {
   delegationRulePlans,
   groupsComparisonUsesCollection,
   applyPolicyWrite,
+  introspectionNote,
   rulesReferenceIsApproved,
   scaffoldPlan,
   serviceWriteError,
@@ -176,8 +177,10 @@ describe('real Authorize scaffold', () => {
       resolvers: [{ type: 'REQUEST', valueType: { type: 'STRING' } }],
     });
     expect(byName.get('tx-token')?.resolvers[0]?.valueType).toEqual({ type: 'STRING' });
-    expect(byName.get('introspect-client-id')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', valueType: { type: 'STRING' } });
-    expect(byName.get('introspect-client-secret')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', valueType: { type: 'STRING' } });
+    expect(byName.get('introspect-client-id')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } });
+    expect(byName.get('introspect-client-secret')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } });
+    expect(byName.get('user-introspect-client-id')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } });
+    expect(byName.has('user-introspect-client-secret')).toBe(false);
     expect(byName.get('risk-score')?.valueType).toEqual({ type: 'NUMBER' });
     expect(byName.get('risk-score')?.resolvers[0]?.valueType).toEqual({ type: 'NUMBER' });
     expect(plan.services.map((service) => service.valueType)).toEqual([{ type: 'JSON' }, { type: 'JSON' }]);
@@ -202,6 +205,8 @@ describe('real Authorize scaffold', () => {
     expect(posts).toContain('authorizationAttributes:access-token');
     expect(posts).toContain('authorizationAttributes:tx-token');
     expect(posts).toContain('authorizationAttributes:risk-score');
+    expect(posts).toContain('authorizationAttributes:user-introspect-client-id');
+    expect(posts).not.toContain('authorizationAttributes:user-introspect-client-secret');
     expect(posts).toContain('authorizationAttributes:introspect-client-secret');
     expect(posts).toContain('authorizationServices:EnterpriseAgent User Introspection');
     expect(posts).toContain('authorizationServices:EnterpriseAgent Delegation Introspection');
@@ -241,15 +246,23 @@ describe('real Authorize scaffold', () => {
     const service = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'EnterpriseAgent User Introspection');
     expect(service?.body).not.toHaveProperty('parent');
     const settings = service?.body?.serviceSettings as {
-      authentication: { type: string; name: { id: string }; password: { id: string } };
+      authentication: { type: string; name?: { id: string }; password?: { id: string } };
       body: string;
       url: string;
+      contentType: string;
       timeoutMilliseconds: number;
     };
-    expect(settings.authentication.type).toBe('BASIC');
-    expect(settings.authentication.name.id).toBe(store.get('attribute', 'introspect-client-id')?.remoteId);
-    expect(settings.authentication.password.id).toBe(store.get('attribute', 'introspect-client-secret')?.remoteId);
-    expect(settings.body).toBe(`token={{${store.get('attribute', 'access-token')?.remoteId}}}`);
+    const userClientAttributeId = store.get('attribute', 'user-introspect-client-id')?.remoteId;
+    expect(settings.authentication).toEqual({ type: 'NONE' });
+    expect(settings.contentType).toBe('application/x-www-form-urlencoded');
+    expect(settings.body).toBe(`token={{${store.get('attribute', 'access-token')?.remoteId}}}&client_id={{${userClientAttributeId}}}`);
+    const delegation = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'EnterpriseAgent Delegation Introspection');
+    const delegationAuth = (delegation?.body?.serviceSettings as { authentication: { type: string; name: { id: string }; password: { id: string } }; body: string }).authentication;
+    const delegationBody = (delegation?.body?.serviceSettings as { body: string }).body;
+    expect(delegationAuth.type).toBe('BASIC');
+    expect(delegationAuth.name.id).toBe(store.get('attribute', 'introspect-client-id')?.remoteId);
+    expect(delegationAuth.password.id).toBe(store.get('attribute', 'introspect-client-secret')?.remoteId);
+    expect(delegationBody).toBe(`token={{${store.get('attribute', 'tx-token')?.remoteId}}}`);
     expect(settings.url).toBe('https://auth.pingone.com/env-1/as/introspect');
     expect(settings.timeoutMilliseconds).toBe(3000);
     expect(settings).toMatchObject({ maximumConcurrentRequests: 20, maximumRequestsPerSecond: 10, headers: [] });
@@ -321,6 +334,114 @@ describe('real Authorize scaffold', () => {
     expect(fake.resources.has('later-orphan')).toBe(true);
   });
 
+  it('updates an existing user service to unauthenticated introspection and leaves policies alone', async () => {
+    const store = memoryStore();
+    const fake = pingone();
+    const enterprise = config();
+    const ssoClientId = '6853c008-afce-4560-9329-02ff7c8fd8bc';
+    enterprise.tenant.clientId = ssoClientId;
+    const logs: string[] = [];
+    await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+      log: (_level, message) => logs.push(message),
+    });
+    const userClientPost = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'user-introspect-client-id');
+    expect((userClientPost?.body?.resolvers as { value?: string }[] | undefined)?.[0]?.value).toBe(ssoClientId);
+    expect(fake.calls.some((call) => call.body?.name === 'user-introspect-client-secret')).toBe(false);
+    const userServiceId = store.get('service', 'EnterpriseAgent User Introspection')?.remoteId ?? '';
+    const delegationServiceId = store.get('service', 'EnterpriseAgent Delegation Introspection')?.remoteId ?? '';
+    const agentClientId = store.get('attribute', 'introspect-client-id')?.remoteId ?? '';
+    const agentSecretId = store.get('attribute', 'introspect-client-secret')?.remoteId ?? '';
+    const accessId = store.get('attribute', 'access-token')?.remoteId ?? '';
+    const userClientAttribute = store.get('attribute', 'user-introspect-client-id')?.remoteId ?? '';
+    const userService = fake.resources.get(userServiceId);
+    const settings = userService?.serviceSettings as { authentication: { type: string; name?: { id: string }; password?: { id: string } }; body: string };
+    settings.authentication = { type: 'BASIC', name: { id: agentClientId }, password: { id: agentSecretId } };
+    settings.body = `token={{${accessId}}}`;
+    fake.resources.delete(userClientAttribute);
+    store.rows.delete('attribute:user-introspect-client-id');
+    const mark = fake.calls.length;
+    const deletes = fake.calls.filter((call) => call.method === 'DELETE').length;
+    await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+      log: (_level, message) => logs.push(message),
+    });
+    const added = fake.calls.slice(mark);
+    const posts = added.filter((call) => call.method === 'POST').map((call) => String(call.body?.name));
+    expect(posts).toContain('user-introspect-client-id');
+    expect(posts).not.toContain('user-introspect-client-secret');
+    expect(posts).not.toContain('Enterprise Agent Features');
+    const createdClient = added.find((call) => call.method === 'POST' && call.body?.name === 'user-introspect-client-id');
+    expect((createdClient?.body?.resolvers as { value?: string }[] | undefined)?.[0]?.value).toBe(ssoClientId);
+    const servicePut = added.find((call) => call.method === 'PUT' && call.url.includes(`/authorizationServices/${userServiceId}`));
+    const putSettings = servicePut?.body?.serviceSettings as { authentication: { type: string; name?: unknown; password?: unknown }; body: string };
+    const nextClientId = store.get('attribute', 'user-introspect-client-id')?.remoteId;
+    expect(putSettings.authentication).toEqual({ type: 'NONE' });
+    expect(putSettings.body).toBe(`token={{${accessId}}}&client_id={{${nextClientId}}}`);
+    expect(added.filter((call) => call.method === 'PUT' && call.url.includes(`/authorizationServices/${delegationServiceId}`))).toHaveLength(0);
+    expect(added.filter((call) => call.method === 'DELETE')).toHaveLength(0);
+    expect(fake.calls.filter((call) => call.method === 'DELETE')).toHaveLength(deletes);
+    const note = introspectionNote(ssoClientId);
+    expect(note).toContain(ssoClientId);
+    expect(note).toContain('no authentication');
+    expect(note).toContain('user-introspect-client-id');
+    expect(note).toContain('introspect-client-id');
+    expect(note).not.toContain('user-introspect-client-secret');
+    enterprise.tenant.clientId = 'updated-sso-client';
+    const updatedMark = fake.calls.length;
+    await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+      log: (_level, message) => logs.push(message),
+    });
+    const updated = fake.calls.slice(updatedMark);
+    const attributePut = updated.find((call) => call.method === 'PUT' && call.url.includes('/authorizationAttributes/'));
+    expect(JSON.stringify(attributePut?.body)).toContain('updated-sso-client');
+    expect(updated.filter((call) => call.method === 'POST' && String(call.body?.name).includes('Enterprise Agent'))).toHaveLength(0);
+    expect(updated.filter((call) => call.method === 'PUT' && call.url.includes('/authorizationServices/'))).toHaveLength(0);
+    expect(updated.filter((call) => call.method === 'PUT' && call.url.includes('/authorizationPolicies/'))).toHaveLength(0);
+    const directory = mkdtempSync(join(tmpdir(), 'authorize-dry-'));
+    const path = join(directory, 'authorize-policy-tree.json');
+    await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+      dryRun: true,
+      dryRunPath: path,
+      log: (_level, message) => logs.push(message),
+    });
+    const dryRun = readFileSync(path, 'utf8');
+    expect(dryRun).toContain('Enterprise Agent Features');
+    expect(dryRun).not.toContain(ssoClientId);
+  });
+
+  it('rejects a client secret stored in enterprise.json', () => {
+    const raw = JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')) as { authorize: { clientSecret?: string } };
+    raw.authorize.clientSecret = 'do-not-commit';
+    expect(() => parseEnterpriseConfig(raw)).toThrow(/clientSecret/);
+  });
+
   it('leaves the decision endpoint always-current when PingOne returns no authorization version', async () => {
     const logs: string[] = [];
     for (const versions of ['empty', 'legacy'] as const) {
@@ -374,6 +495,7 @@ describe('real Authorize scaffold', () => {
     expect(endpointPut?.body?.policy).toEqual({ id: policyId });
     expect(logs.join('\n')).toMatch(/did not keep policy/);
   });
+
 
   it('creates the child policies inline and deletes only the exact-name orphans', async () => {
     const store = memoryStore();

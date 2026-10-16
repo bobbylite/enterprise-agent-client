@@ -1,4 +1,5 @@
 import type { RiskLevel } from '../types';
+import { riskLevel, riskSignal } from './reasons';
 
 export interface RiskEvaluationResult {
   id?: string;
@@ -84,16 +85,14 @@ export async function createRiskEvaluation(input: {
       `Risk evaluation failed (${response.status}).`;
     throw new RiskEvaluationError(message, response.status, response.status === 429 ? retryAfterSeconds(response) : null);
   }
-  const result = (parsed.result ?? {}) as { level?: string; recommendedAction?: string };
-  const level = result.level?.toUpperCase();
-  if (level !== 'LOW' && level !== 'MEDIUM' && level !== 'HIGH') {
-    throw new Error('Risk evaluation did not return a level.');
-  }
+  const result = (parsed.result ?? {}) as { level?: unknown; score?: unknown; recommendedAction?: string };
+  if (!riskSignal(result.level, result.score)) throw new Error('Risk evaluation did not return a level.');
+  const level = riskLevel(result.level, result.score);
   return {
     id: typeof parsed.id === 'string' ? parsed.id : undefined,
     level,
     details: parsed.details,
-    recommendedAction: result.recommendedAction,
+    recommendedAction: typeof result.recommendedAction === 'string' ? result.recommendedAction : undefined,
   };
 }
 

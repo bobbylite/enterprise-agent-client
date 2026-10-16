@@ -570,6 +570,9 @@ describe('admin gate', () => {
     await runtime.submitCredentials('ada', 'secret', '');
     const result = await runtime.dryRunAuthorizePolicy();
     expect(existsSync(result.path)).toBe(true);
+    expect(result.introspectionNote).toContain('user-introspect-client-id');
+    expect(result.introspectionNote).toContain('no authentication');
+    expect(result.introspectionNote).not.toContain('user-introspect-client-secret');
     const body = JSON.parse(readFileSync(result.path, 'utf8')) as { name?: string; children?: { name?: string; id?: string }[] };
     expect(body.name).toBe('Enterprise Agent Features');
     expect(body.children?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);

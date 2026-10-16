@@ -133,12 +133,16 @@ export interface PolicyScaffoldResult {
   preview: PolicyView[];
   created: PolicyView[];
   policies: PolicyView[];
+  /** Which introspection clients Scaffold will use. The SSO client id is not a secret. */
+  introspectionNote?: string;
   /** Set when the decision endpoint was left always-current, or its policy pointer did not stick. */
   warning?: string;
 }
 
 export interface PolicyDryRun {
   path: string;
+  /** Which introspection clients the dry run would use. Never contains a secret. */
+  introspectionNote?: string;
 }
 
 export interface PolicyCacheReset {
