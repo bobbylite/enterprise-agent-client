@@ -27,8 +27,10 @@ import {
   userIntrospectionServiceBody,
   summarizePolicyChildren,
   tagBody,
+  ruleBody,
   userRulePlans,
   walkPolicyTree,
+  writablePolicy,
   type DelegationGrant,
   type RulePlan,
 } from './framework';
@@ -255,8 +257,21 @@ async function postFeatureTree(
       input.log?.('debug', policyTrace('Authorize policy tree already present', `${collection}/${before.id}`, null, before, present));
       return requiredChildren(before, present);
     }
+    const driftedUser = userRulesOnlyDrift(before, present, userPlans, delegationPlans, attributeIds);
+    if (driftedUser) {
+      if (!going()) return null;
+      await replaceUserRules(input, api, headers, driftedUser, userPlans, attributeIds);
+      const read = await readResource(input, `${collection}/${before.id}`, headers);
+      const children = await resolvePolicyChildren(input, api, headers, read);
+      const problems = treeProblems(read, children, userPlans, delegationPlans, attributeIds);
+      if (problems.length > 0) {
+        throw new Error(`PingOne did not keep the updated ${USER_POLICY} rules. ${problems.join(' ')}`);
+      }
+      input.store.put('policy', ROOT_POLICY, read.id, '');
+      return requiredChildren(read, children);
+    }
     if (!going()) return null;
-    // The name is unique, and a PUT does not add children. Remove only this empty shell, then create the tree.
+    // The name is unique, and a PUT does not add policy children. Remove only this shell, then create the tree.
     await deletePolicy(input, api, headers, before.id);
   }
   if (!going()) return null;
@@ -293,10 +308,11 @@ function policyTrace(
   putBody: Record<string, unknown> | null,
   getBody: Resource | null,
   resolved: Resource[],
+  verb: 'POST' | 'PUT' = 'POST',
 ): string {
   const lines = [title, `url ${url}`];
   if (putBody) {
-    lines.push(`POST children ${JSON.stringify(summarizePolicyChildren(putBody))}`);
+    lines.push(`${verb} children ${JSON.stringify(summarizePolicyChildren(putBody))}`);
     lines.push(JSON.stringify(putBody, null, 2));
   }
   if (getBody) {
@@ -362,6 +378,47 @@ function treeProblems(
   if (user) problems.push(...ruleProblems(user, userPlans, attributeIds));
   if (delegation) problems.push(...ruleProblems(delegation, delegationPlans, attributeIds));
   return problems;
+}
+
+function userRulesOnlyDrift(
+  parent: Resource,
+  children: Resource[],
+  userPlans: RulePlan[],
+  delegationPlans: RulePlan[],
+  attributeIds: Map<string, string>,
+): Resource | null {
+  const algorithm = (parent.combiningAlgorithm as { algorithm?: string } | undefined)?.algorithm;
+  if (algorithm !== 'DENY_OVERRIDES') return null;
+  const user = children.find((child) => child.name === USER_POLICY);
+  const delegation = children.find((child) => child.name === DELEGATION_POLICY);
+  if (!user || !delegation) return null;
+  if (ruleProblems(delegation, delegationPlans, attributeIds).length > 0) return null;
+  if (ruleProblems(user, userPlans, attributeIds).length === 0) return null;
+  return user;
+}
+
+async function replaceUserRules(
+  input: ProvisionInput,
+  api: string,
+  headers: Record<string, string>,
+  user: Resource,
+  plans: RulePlan[],
+  attributeIds: Map<string, string>,
+): Promise<void> {
+  const url = `${api}/authorizationPolicies/${user.id}`;
+  const current = await readResource(input, url, headers);
+  if (current.name !== USER_POLICY) throw new Error(`Refusing to update ${current.name ?? current.id}. Scaffold only rewrites ${USER_POLICY} rules in place.`);
+  const children = plans.map((plan) => ruleBody(plan, attributeIds, existingRule(current, plan.name)));
+  const body = writablePolicy(current, children);
+  input.log?.('debug', policyTrace('Authorize user policy PUT', url, body, null, [], 'PUT'));
+  await sendJson(input, url, 'PUT', headers, body);
+  await input.client.paceAfterManagementPost();
+}
+
+function existingRule(policy: Resource, name: string): { id: string; version: string } | undefined {
+  const rule = childrenOf(policy).find((child) => child.name === name);
+  if (!rule || typeof rule.id !== 'string' || !rule.id || typeof rule.version !== 'string' || !rule.version) return undefined;
+  return { id: rule.id, version: rule.version };
 }
 
 function ruleProblems(policy: Resource, plans: RulePlan[], attributeIds: Map<string, string>): string[] {

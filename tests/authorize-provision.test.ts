@@ -289,7 +289,7 @@ describe('real Authorize scaffold', () => {
     expect(inlineChildren.map((child) => child.combiningAlgorithm?.algorithm)).toEqual(['FIRST_APPLICABLE', 'FIRST_APPLICABLE']);
     const rules = inlineChildren[0]?.children ?? [];
     expect(rules[0]?.type).toBe('RULE');
-    expect(rules[0]?.name).toBe('High risk or inactive token');
+    expect(rules[0]?.name).toBe('Inactive token');
     expect(rules[0]?.effectSettings.type).toBe('UNCONDITIONAL_DENY');
     expect(rules[0]?.statements[0]?.attributes).toEqual([]);
     expect(rules[0]?.statements[0]).toMatchObject({ services: [], appliesIf: 'PATH_MATCHES', type: 'EMBEDDED_STATEMENT' });
@@ -667,12 +667,91 @@ describe('real Authorize scaffold', () => {
     expect(written.children?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
     expect(written.children?.every((child) => child.type === 'POLICY' && !child.id)).toBe(true);
     const rules = written.children?.[0]?.children ?? [];
-    expect(rules[0]?.name).toBe('High risk or inactive token');
+    expect(rules[0]?.name).toBe('Inactive token');
     expect(rules.every((rule) => rule.type === 'RULE' && !rule.id)).toBe(true);
     expect(JSON.stringify(written)).toContain('{{risk-level}}');
     expect(JSON.stringify(written)).not.toContain('isApproved');
     expect(fake.resources.get('features')?.version).toBe('v4');
     expect(fake.resources.get('features')?.children).toEqual([]);
+  });
+
+  it('updates Enterprise Agent User rules in place and leaves the parent tree', async () => {
+    const store = memoryStore();
+    const fake = pingone();
+    const enterprise = config();
+    await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+    });
+    const parent = [...fake.resources.values()].find((item) => item.name === 'Enterprise Agent Features');
+    const refs = parent?.children as { value?: { id?: string } }[];
+    const userId = refs?.[0]?.value?.id ?? '';
+    const delegationId = refs?.[1]?.value?.id ?? '';
+    const user = fake.resources.get(userId);
+    if (!user) throw new Error('missing user policy');
+    user.children = [
+      {
+        type: 'RULE',
+        name: 'Active session',
+        id: 'active-rule',
+        version: 'v-active',
+        enabled: true,
+        effectSettings: { type: 'UNCONDITIONAL_PERMIT' },
+        statements: [{ code: 'enterprise-agent-features', payload: '{"chat":"stale"}', attributes: [] }],
+      },
+    ];
+    const parentVersion = parent?.version;
+    const delegationVersion = fake.resources.get(delegationId)?.version;
+    const mark = fake.calls.length;
+    await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+    });
+    const added = fake.calls.slice(mark);
+    const policyPuts = added.filter((call) => call.method === 'PUT' && call.url.includes('/authorizationPolicies/'));
+    expect(policyPuts.map((call) => call.url)).toEqual([expect.stringContaining(`/authorizationPolicies/${userId}`)]);
+    expect(added.filter((call) => call.method === 'DELETE')).toHaveLength(0);
+    expect(added.filter((call) => call.method === 'POST' && call.body?.name === 'Enterprise Agent Features')).toHaveLength(0);
+    expect(fake.resources.get(parent?.id as string)?.version).toBe(parentVersion);
+    expect(fake.resources.get(delegationId)?.version).toBe(delegationVersion);
+    const rules = fake.resources.get(userId)?.children as {
+      name?: string;
+      id?: string;
+      version?: string;
+      statements?: { payload?: string }[];
+    }[];
+    expect(rules.map((rule) => rule.name)).toContain('Inactive token');
+    expect(rules.map((rule) => rule.name)).toContain('High risk');
+    expect(rules.map((rule) => rule.name)).toContain('Medium risk administrator');
+    expect(rules.map((rule) => rule.name)).not.toContain('Old session');
+    const active = rules.find((rule) => rule.name === 'Active session');
+    expect(active?.id).toBe('active-rule');
+    expect(active?.version).toBe('v-active');
+    const high = rules.find((rule) => rule.name === 'High risk');
+    const payload = (high?.statements as { payload?: string }[] | undefined)?.[0]?.payload;
+    expect(payload).toContain('"chat":"locked"');
+    expect(payload).toContain('"tools":false');
+    const quiet = fake.calls.length;
+    await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+    });
+    expect(fake.calls.slice(quiet).filter((call) => call.method === 'POST' || call.method === 'PUT' || call.method === 'DELETE')).toHaveLength(0);
   });
 
   it('ignores children on a policy PUT and keeps the same version', async () => {

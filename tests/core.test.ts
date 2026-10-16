@@ -538,6 +538,15 @@ describe('instructions and approvals', () => {
     });
     expect(choiceFromUser('always', false)).toMatchObject({ type: 'allow', persistence: 'once' });
     expect(previewApproval({ riskAction: 'block', readOnlyHint: true })).toMatchObject({ type: 'deny' });
+    expect(previewApproval({ riskAction: 'restrict_tools', riskLevel: 'MEDIUM', readOnlyHint: true })).toMatchObject({
+      type: 'deny',
+      reason: 'chat only, tools disabled',
+      automatic: true,
+    });
+    expect(previewApproval({ riskAction: 'allow', riskLevel: 'MEDIUM', readOnlyHint: false, remembered: 'always' })).toMatchObject({
+      type: 'deny',
+      automatic: true,
+    });
   });
 });
 

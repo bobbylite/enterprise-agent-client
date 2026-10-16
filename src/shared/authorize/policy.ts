@@ -3,7 +3,10 @@ import type { FeatureDecision, RiskAction, RiskLevel, SessionRestriction } from 
 export const FEATURE_STATEMENT = 'enterprise-agent-features';
 export const SCAFFOLD_MARKER = 'enterprise-agent-scaffold';
 
-export type FeatureFlags = Pick<FeatureDecision, 'policyTab' | 'pingoneTools' | 'mcpWrites' | 'chat'>;
+export type FeatureFlags = Pick<
+  FeatureDecision,
+  'policyTab' | 'pingoneTools' | 'mcpWrites' | 'tools' | 'agentConfig' | 'extensionConfig' | 'chat'
+>;
 
 export interface PolicyWhen {
   /** User must belong to at least one of these groups. */
@@ -38,6 +41,9 @@ export function failClosed(now: number): FeatureDecision {
     policyTab: false,
     pingoneTools: false,
     mcpWrites: false,
+    tools: false,
+    agentConfig: true,
+    extensionConfig: true,
     chat: 'read_only',
     source: 'fail_closed',
     fetchedAt: now,
@@ -59,13 +65,13 @@ export function scaffoldPolicies(adminGroup: string, now: number, updatedBy: str
       id: 'enterprise-agent:session',
       name: 'Session can use chat',
       description:
-        'When Protect risk is low, medium, or unknown, and the action is allow, step-up, or restrict tools, chat stays available and MCP writes can still be approved.',
+        'When Protect risk is low or unknown, and the action is allow, step-up, or restrict tools, chat stays available and tools can still be approved.',
       when: {
-        riskLevels: ['LOW', 'MEDIUM', 'UNKNOWN'],
+        riskLevels: ['LOW', 'UNKNOWN'],
         riskActions: ['allow', 'step_up_mfa', 'restrict_tools'],
         match: 'all',
       },
-      effect: { chat: 'allow', mcpWrites: true },
+      effect: { chat: 'allow', mcpWrites: true, tools: true, agentConfig: true, extensionConfig: true },
     },
     {
       ...stamp,
@@ -77,19 +83,42 @@ export function scaffoldPolicies(adminGroup: string, now: number, updatedBy: str
     },
     {
       ...stamp,
+      id: 'enterprise-agent:medium',
+      name: 'Medium risk',
+      description: 'Medium Protect risk allows chat and configuration, and turns off every tool invocation.',
+      when: { riskLevels: ['MEDIUM'] },
+      effect: {
+        chat: 'allow',
+        mcpWrites: false,
+        pingoneTools: false,
+        tools: false,
+        agentConfig: true,
+        extensionConfig: true,
+      },
+    },
+    {
+      ...stamp,
       id: 'enterprise-agent:read-only',
       name: 'Read-only risk',
-      description: 'A read-only Protect action disables MCP writes and makes chat read-only.',
+      description: 'A read-only Protect action disables tool invocation and makes chat read-only.',
       when: { riskActions: ['read_only'] },
-      effect: { mcpWrites: false, chat: 'read_only' },
+      effect: { mcpWrites: false, tools: false, chat: 'read_only' },
     },
     {
       ...stamp,
       id: 'enterprise-agent:high-risk',
       name: 'High risk lockdown',
-      description: 'High risk or a blocked session hides admin tools, disables MCP writes, and makes chat read-only.',
+      description: 'High risk or a blocked session locks chat, agent configuration, extension configuration, and every tool.',
       when: { riskLevels: ['HIGH'], riskActions: ['block'], match: 'any' },
-      effect: { policyTab: false, pingoneTools: false, mcpWrites: false, chat: 'read_only' },
+      effect: {
+        policyTab: false,
+        pingoneTools: false,
+        mcpWrites: false,
+        tools: false,
+        agentConfig: false,
+        extensionConfig: false,
+        chat: 'locked',
+      },
     },
   ];
 }
@@ -146,6 +175,7 @@ function isScaffoldRow(policy: AuthorizePolicy): boolean {
 const SCAFFOLD_RANK = [
   'enterprise-agent:session',
   'enterprise-agent:admin',
+  'enterprise-agent:medium',
   'enterprise-agent:read-only',
   'enterprise-agent:high-risk',
 ];
@@ -191,7 +221,75 @@ export function withAdminPolicyTab(decision: FeatureDecision, input: DecisionInp
   return { ...decision, policyTab: true };
 }
 
+/**
+ * Live Protect score for an administrator.
+ * LOW opens every feature. MEDIUM keeps chat and configuration and turns tools off.
+ * HIGH or block locks chat, configuration, tools, and the Policy tab.
+ * A synthetic LOW from a disabled Protect integration does not override the decision.
+ */
+export function applyLiveRiskGates(
+  decision: FeatureDecision,
+  input: DecisionInput,
+  admin: boolean,
+  protectEnabled: boolean,
+): FeatureDecision {
+  if (input.riskLevel === 'MEDIUM') return mediumDecision(decision, admin);
+  if (!admin) return decision;
+  if (input.riskLevel === 'HIGH' || input.riskAction === 'block') return lockedDecision(decision);
+  if (!protectEnabled || decision.source === 'fail_closed' || input.riskLevel === 'UNKNOWN') {
+    return withAdminPolicyTab(decision, input, true);
+  }
+  if (input.riskLevel === 'LOW') {
+    return {
+      ...decision,
+      policyTab: true,
+      pingoneTools: true,
+      mcpWrites: true,
+      tools: true,
+      agentConfig: true,
+      extensionConfig: true,
+      chat: 'allow',
+    };
+  }
+  return withAdminPolicyTab(decision, input, true);
+}
+
+function mediumDecision(decision: FeatureDecision, admin: boolean): FeatureDecision {
+  return {
+    ...decision,
+    policyTab: admin ? true : decision.policyTab,
+    pingoneTools: false,
+    mcpWrites: false,
+    tools: false,
+    agentConfig: true,
+    extensionConfig: true,
+    chat: 'allow',
+  };
+}
+
+function lockedDecision(decision: FeatureDecision): FeatureDecision {
+  return {
+    ...decision,
+    policyTab: false,
+    pingoneTools: false,
+    mcpWrites: false,
+    tools: false,
+    agentConfig: false,
+    extensionConfig: false,
+    chat: 'locked',
+  };
+}
+
 export function sessionRestriction(decision: FeatureDecision, input: DecisionInput, storedCount: number): SessionRestriction | null {
+  if (decision.chat === 'locked') {
+    return {
+      reason: 'risk',
+      message: 'Protect scored this session HIGH. Chat, agent configuration, and extension configuration are locked until the risk drops.',
+    };
+  }
+  if (input.riskLevel === 'MEDIUM') {
+    return { reason: 'risk', message: 'chat only, tools disabled' };
+  }
   if (decision.chat !== 'read_only') return null;
   if (input.riskLevel === 'HIGH' || input.riskAction === 'block' || input.riskAction === 'read_only') {
     const action = input.riskAction === 'read_only' ? 'read-only' : input.riskAction;
@@ -221,13 +319,24 @@ export function sessionRestriction(decision: FeatureDecision, input: DecisionInp
 }
 
 export function evaluatePolicies(policies: AuthorizePolicy[], input: DecisionInput, now: number): FeatureDecision {
-  const flags: FeatureFlags = { policyTab: false, pingoneTools: false, mcpWrites: false, chat: 'read_only' };
+  const flags: FeatureFlags = {
+    policyTab: false,
+    pingoneTools: false,
+    mcpWrites: false,
+    tools: false,
+    agentConfig: true,
+    extensionConfig: true,
+    chat: 'read_only',
+  };
   const ordered = [...policies].sort((left, right) => scaffoldRank(left.id) - scaffoldRank(right.id));
   for (const policy of ordered) {
     if (!policy.enabled || !matches(policy.when, input)) continue;
     if (policy.effect.policyTab !== undefined) flags.policyTab = policy.effect.policyTab;
     if (policy.effect.pingoneTools !== undefined) flags.pingoneTools = policy.effect.pingoneTools;
     if (policy.effect.mcpWrites !== undefined) flags.mcpWrites = policy.effect.mcpWrites;
+    if (policy.effect.tools !== undefined) flags.tools = policy.effect.tools;
+    if (policy.effect.agentConfig !== undefined) flags.agentConfig = policy.effect.agentConfig;
+    if (policy.effect.extensionConfig !== undefined) flags.extensionConfig = policy.effect.extensionConfig;
     if (policy.effect.chat !== undefined) flags.chat = policy.effect.chat;
   }
   return { ...flags, source: 'starter', fetchedAt: now };
@@ -245,11 +354,16 @@ export function featuresFromAuthorize(body: unknown, now: number): FeatureDecisi
     if (code !== FEATURE_STATEMENT) continue;
     const payload = parsePayload((statement as { payload?: unknown }).payload);
     if (!payload) continue;
+    const chat = payload.chat === 'locked' || payload.chat === 'read_only' ? payload.chat : 'allow';
+    const mcpWrites = payload.mcpWrites === true;
     return {
       policyTab: payload.policyTab === true,
       pingoneTools: payload.pingoneTools === true,
-      mcpWrites: payload.mcpWrites === true,
-      chat: payload.chat === 'read_only' ? 'read_only' : 'allow',
+      mcpWrites,
+      tools: payload.tools === undefined ? mcpWrites && chat === 'allow' : payload.tools === true,
+      agentConfig: payload.agentConfig === undefined ? chat !== 'locked' : payload.agentConfig === true,
+      extensionConfig: payload.extensionConfig === undefined ? chat !== 'locked' : payload.extensionConfig === true,
+      chat,
       source: 'authorize',
       fetchedAt: now,
     };

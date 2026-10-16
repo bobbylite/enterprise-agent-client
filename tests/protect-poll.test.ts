@@ -81,7 +81,10 @@ describe('protect polling', () => {
     expect(stepped.features.policyTab).toBe(false);
     expect(stepped.features.pingoneTools).toBe(false);
     expect(stepped.features.mcpWrites).toBe(false);
-    expect(stepped.features.chat).toBe('read_only');
+    expect(stepped.features.chat).toBe('locked');
+    expect(stepped.features.tools).toBe(false);
+    expect(stepped.features.agentConfig).toBe(false);
+    expect(stepped.features.extensionConfig).toBe(false);
     expect(harness.delays).toEqual([]);
   });
 
@@ -210,7 +213,8 @@ describe('protect polling', () => {
     expect(runtime.state().risk?.action).toBe('block');
     expect(runtime.state().features.policyTab).toBe(false);
     expect(runtime.state().features.mcpWrites).toBe(false);
-    expect(runtime.state().features.chat).toBe('read_only');
+    expect(runtime.state().features.chat).toBe('locked');
+    expect(runtime.state().features.tools).toBe(false);
     expect(decisionPosts).toBe(3);
   });
 

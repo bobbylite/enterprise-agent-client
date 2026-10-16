@@ -12,7 +12,7 @@ const FIELDS: { key: keyof InstructionFields; label: string }[] = [
 
 const EMPTY: InstructionFields = { persona: '', communicationStyle: '', autonomy: '', safety: '', untrustedContent: '' };
 
-export function AgentsScreen({ branding }: { branding: Branding }) {
+export function AgentsScreen({ branding, configLocked }: { branding: Branding; configLocked: boolean }) {
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [page, setPage] = useState<AgentPage | null>(null);
   const [creating, setCreating] = useState(false);
@@ -42,6 +42,7 @@ export function AgentsScreen({ branding }: { branding: Branding }) {
         <button
           type="button"
           className="primary"
+          disabled={configLocked}
           onClick={() => {
             setCreating(true);
             setPage(null);
@@ -63,7 +64,13 @@ export function AgentsScreen({ branding }: { branding: Branding }) {
         ))}
       </div>
       <div className="page agent-page">
+        {configLocked ? (
+          <div className="notice access-notice locked-banner">
+            <p>Agent configuration is locked because Protect scored this session HIGH.</p>
+          </div>
+        ) : null}
         {error ? <p className="error">{error}</p> : null}
+        <fieldset className="locked-config" disabled={configLocked}>
         {creating ? (
           <CreateAgent
             onCancel={() => void load()}
@@ -82,6 +89,7 @@ export function AgentsScreen({ branding }: { branding: Branding }) {
         ) : (
           <p>Loading</p>
         )}
+        </fieldset>
       </div>
     </div>
   );

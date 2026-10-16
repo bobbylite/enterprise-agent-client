@@ -33,7 +33,7 @@ const EMPTY: DialogState = {
   enabled: true,
 };
 
-export function McpScreen() {
+export function McpScreen({ configLocked }: { configLocked: boolean }) {
   const [servers, setServers] = useState<McpServerView[]>([]);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const [error, setError] = useState('');
@@ -48,6 +48,12 @@ export function McpScreen() {
 
   return (
     <div className="page">
+      {configLocked ? (
+        <div className="notice access-notice locked-banner">
+          <p>Extension configuration is locked because Protect scored this session HIGH.</p>
+        </div>
+      ) : null}
+      <fieldset className="locked-config" disabled={configLocked}>
       <header className="pane-head extension-page-head">
         <div>
           <h2>Extensions</h2>
@@ -81,6 +87,7 @@ export function McpScreen() {
           onError={setError}
         />
       ) : null}
+      </fieldset>
     </div>
   );
 }
