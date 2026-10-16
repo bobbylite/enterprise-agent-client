@@ -436,10 +436,13 @@ describe('mock runtime', () => {
     const { runtime } = await boot(0, undefined, undefined, secrets, {
       PINGONE_AGENT_CLIENT_SECRET: 'agent-from-env',
       PINGONE_WORKER_CLIENT_SECRET: 'worker-from-env',
+      PINGONE_USER_INTROSPECT_CLIENT_SECRET: 'sso-resource-secret-value',
     });
     const view = await runtime.getSettingsAsync();
     expect(view.keys.agent).toBe(true);
     expect(view.keys.worker).toBe(true);
+    expect(view.keys.userIntrospect).toBe(true);
+    expect(await secrets.get('userIntrospectClientSecret')).toBe('sso-resource-secret-value');
     expect(await secrets.get('agentClientSecret')).toBe('agent-from-env');
     const saved = await runtime.saveSettings({
       provider: view.provider,
@@ -570,6 +573,8 @@ describe('admin gate', () => {
     await runtime.submitCredentials('ada', 'secret', '');
     const result = await runtime.dryRunAuthorizePolicy();
     expect(existsSync(result.path)).toBe(true);
+    expect(result.introspectionNote).toContain('user-introspect-client-id');
+    expect(result.introspectionNote).not.toContain('sso-resource-secret-value');
     const body = JSON.parse(readFileSync(result.path, 'utf8')) as { name?: string; children?: { name?: string; id?: string }[] };
     expect(body.name).toBe('Enterprise Agent Features');
     expect(body.children?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);

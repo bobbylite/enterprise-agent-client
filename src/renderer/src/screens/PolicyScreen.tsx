@@ -7,6 +7,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
   const [audit, setAudit] = useState<AuditView[]>([]);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [introspectionNote, setIntrospectionNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [enforcement, setEnforcement] = useState<{ policy: PolicyView; enabled: boolean } | null>(null);
   const [resetOpen, setResetOpen] = useState(false);
@@ -93,6 +94,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
             void run(async () => {
               const result = await window.agent.scaffoldPolicies(false);
               setPreview(result.preview);
+              setIntrospectionNote(result.introspectionNote ?? '');
               setNotice('Review the starter policies, then confirm to create any that are missing.');
             })
           }
@@ -106,7 +108,9 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
           onClick={() =>
             void run(async () => {
               const result = await window.agent.dryRunAuthorizePolicy();
-              setNotice(`Dry run wrote the policy tree to ${result.path}. Nothing was written to PingOne.`);
+              setNotice(
+                `Dry run wrote the policy tree to ${result.path}. Nothing was written to PingOne.${result.introspectionNote ? `\n${result.introspectionNote}` : ''}`,
+              );
             })
           }
         >
@@ -122,6 +126,7 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
           <p className="muted">
             Confirming creates starter policies that PingOne does not currently have. Ones deleted there are created again. A second confirm does not duplicate the ones still there.
           </p>
+          {introspectionNote ? <p className="muted">{introspectionNote}</p> : null}
           <ul className="tools">
             {preview.map((policy) => (
               <li key={policy.id}>
@@ -144,11 +149,12 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
                   const state = await window.agent.getState();
                   onState(state);
                   const already = state.mode === 'pingone' ? 'Those starter policies are already in PingOne.' : 'Those starter policies were already stored.';
-                  setNotice(
+                  const createdNote =
                     result.created.length === 0
                       ? already
-                      : `Created ${result.created.length} starter ${result.created.length === 1 ? 'policy' : 'policies'}.`,
-                  );
+                      : `Created ${result.created.length} starter ${result.created.length === 1 ? 'policy' : 'policies'}.`;
+                  const credentials = result.introspectionNote ?? introspectionNote;
+                  setNotice(credentials ? `${createdNote}\n${credentials}` : createdNote);
                 })
               }
             >

@@ -102,7 +102,7 @@ button.nav.selected, button.list-item.selected { background: rgba(255, 255, 255,
 .segment button.selected { background: var(--ink); color: var(--paper); }
 .muted { color: #6d645b; font-size: 13px; }
 .error { color: var(--danger); }
-.notice { background: #fff4e8; border-radius: 10px; padding: 10px 12px; }
+.notice { background: #fff4e8; border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; }
 .risk-card { border-radius: 12px; padding: 12px; background: #fde8e6; }
 .risk-card ul { margin: 8px 0; padding-left: 18px; }
 
@@ -130,6 +130,7 @@ button.nav.selected, button.list-item.selected { background: rgba(255, 255, 255,
 .risk-stamp.good span { color: #8dcea3; }
 .risk-stamp.warn span { color: #f0c27a; }
 .risk-stamp.danger span { color: #f0a3a3; }
+.risk-stamp.unknown span { color: #b7b1aa; }
 .workspace { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--paper); }
 .access-notice { margin: 16px 16px 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .access-notice p { margin: 0; }

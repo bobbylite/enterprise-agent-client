@@ -38,8 +38,12 @@ const REQUEST_ATTRIBUTE_SPECS: { name: string; valueType: AttributeValueType }[]
 
 export const REQUEST_ATTRIBUTES = REQUEST_ATTRIBUTE_SPECS;
 
+/** Enterprise agent / token-exchange client. Delegation introspection keeps these. */
 export const CLIENT_ID_DEFINITION = 'introspect-client-id';
 export const CLIENT_SECRET_DEFINITION = 'introspect-client-secret';
+/** Custom resource that issues the SSO access token. User introspection must not reuse the agent client. */
+export const USER_CLIENT_ID_DEFINITION = 'user-introspect-client-id';
+export const USER_CLIENT_SECRET_DEFINITION = 'user-introspect-client-secret';
 
 export const USER_SERVICE = 'EnterpriseAgent User Introspection';
 export const DELEGATION_SERVICE = 'EnterpriseAgent Delegation Introspection';
@@ -122,12 +126,12 @@ function requestSpec(name: string, valueType: AttributeValueType): AttributeSpec
   };
 }
 
-function definitionSpec(name: string, secret: boolean): AttributeSpec {
+function definitionSpec(name: string, secret: boolean, subject: string): AttributeSpec {
   return {
     name,
     description: secret
-      ? 'Paste the custom resource client secret in the PingOne console. Scaffold never writes this secret.'
-      : 'Paste the custom resource client id in the PingOne console if it is not already set.',
+      ? `${subject} client secret. Scaffold can copy it from the keychain into this Definition. It is never written to dry-run output, logs, or the decision trace.`
+      : `${subject} client id.`,
     valueType: typed('STRING'),
     resolvers: [{ type: 'CONSTANT', value: '', valueType: typed('STRING') }],
   };
@@ -153,8 +157,10 @@ export function attributePlan(): AttributeSpec[] {
       resolvers: [{ type: 'CONSTANT', value: '{}', valueType: typed('JSON') }],
     },
     ...REQUEST_ATTRIBUTE_SPECS.map((attribute) => requestSpec(attribute.name, attribute.valueType)),
-    definitionSpec(CLIENT_ID_DEFINITION, false),
-    definitionSpec(CLIENT_SECRET_DEFINITION, true),
+    definitionSpec(USER_CLIENT_ID_DEFINITION, false, 'SSO access-token custom resource'),
+    definitionSpec(USER_CLIENT_SECRET_DEFINITION, true, 'SSO access-token custom resource'),
+    definitionSpec(CLIENT_ID_DEFINITION, false, 'Enterprise agent token-exchange client'),
+    definitionSpec(CLIENT_SECRET_DEFINITION, true, 'Enterprise agent token-exchange client'),
     ...SERVICE_ATTRIBUTES.map((attribute) => serviceSpec(attribute.name, attribute.service, attribute.path)),
   ];
 }
@@ -186,11 +192,14 @@ export function attributeSpec(name: string): AttributeSpec {
   return spec;
 }
 
-export function attributeBody(name: string, links: { parentId?: string; serviceId?: string } = {}): Record<string, unknown> {
+export function attributeBody(
+  name: string,
+  links: { parentId?: string; serviceId?: string; constantValue?: string } = {},
+): Record<string, unknown> {
   const spec = attributeSpec(name);
   const resolvers = spec.resolvers.map((resolver) => {
     const written: Record<string, unknown> = { type: resolver.type, valueType: resolver.valueType };
-    if (resolver.type === 'CONSTANT') written.value = resolver.value ?? '';
+    if (resolver.type === 'CONSTANT') written.value = links.constantValue ?? resolver.value ?? '';
     if (resolver.type === 'SERVICE') {
       if (!links.serviceId) throw new Error(`${name} is missing its service id.`);
       written.value = { id: links.serviceId };
@@ -226,7 +235,8 @@ export function definitionBody(parentId: string, name: string, secret: boolean):
   if (constant?.type !== 'CONSTANT' || constant.value !== '' || spec.valueType.type !== 'STRING') {
     throw new Error(`${name} is not an empty STRING Definition.`);
   }
-  if (secret !== (name === CLIENT_SECRET_DEFINITION)) throw new Error(`${name} secret flag does not match the spec.`);
+  const secretName = name === CLIENT_SECRET_DEFINITION || name === USER_CLIENT_SECRET_DEFINITION;
+  if (secret !== secretName) throw new Error(`${name} secret flag does not match the spec.`);
   return attributeBody(name, { parentId });
 }
 
@@ -509,6 +519,21 @@ export function decisionEndpointUpdate(
 
 export function tagBody(): Record<string, unknown> {
   return { description: 'Enterprise Agent scaffold' };
+}
+
+/** Shown on Scaffold confirm and dry run. The secret value is never included. */
+export function introspectionNote(clientId: string, secretConfigured: boolean): string {
+  const id = clientId.trim() || '(not set)';
+  const secret = secretConfigured
+    ? 'The user client secret is stored in the keychain.'
+    : 'The user client secret is not set. Add it in Settings or PINGONE_USER_INTROSPECT_CLIENT_SECRET. Do not put it in enterprise.json.';
+  return `User SSO introspection uses client ${id} on ${USER_CLIENT_ID_DEFINITION} and ${USER_CLIENT_SECRET_DEFINITION}. ${secret} That client is the custom resource that issues the SSO access token. Delegation introspection keeps ${CLIENT_ID_DEFINITION} and ${CLIENT_SECRET_DEFINITION}, the enterprise agent client used for token exchange.`;
+}
+
+export function redactSecret(text: string, secret: string): string {
+  const value = secret.trim();
+  if (value.length < 4 || !text.includes(value)) return text;
+  return text.split(value).join('[redacted]');
 }
 
 function integerInRange(value: unknown, min: number, max: number): boolean {

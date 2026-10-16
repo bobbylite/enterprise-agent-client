@@ -6,6 +6,8 @@ import { AuthorizeClient } from './remote';
 import {
   CLIENT_ID_DEFINITION,
   CLIENT_SECRET_DEFINITION,
+  USER_CLIENT_ID_DEFINITION,
+  USER_CLIENT_SECRET_DEFINITION,
   DECISION_ENDPOINT,
   DELEGATION_POLICY,
   DELEGATION_SERVICE,
@@ -21,6 +23,7 @@ import {
   delegationRulePlans,
   featurePolicyTree,
   introspectUrl,
+  redactSecret,
   scaffoldPlan,
   serviceBody,
   summarizePolicyChildren,
@@ -55,6 +58,8 @@ export interface ProvisionInput {
   dryRunPath?: string;
   log?: (level: 'debug' | 'error', message: string) => void;
   logPath?: string;
+  /** SSO resource client. The secret is sent only on the Definition write and is redacted from logs. */
+  userIntrospection?: { clientId: string; clientSecret: string };
 }
 
 export interface ProvisionResult {
@@ -70,6 +75,22 @@ interface Resource extends Record<string, unknown> {
 }
 
 export async function provisionAuthorize(input: ProvisionInput): Promise<ProvisionResult> {
+  const secret = input.userIntrospection?.clientSecret?.trim() ?? '';
+  if (secret && input.log) {
+    const log = input.log;
+    input = { ...input, log: (level, message) => log(level, redactSecret(message, secret)) };
+  }
+  try {
+    return await provisionAuthorizeBody(input);
+  } catch (error) {
+    if (secret && error instanceof Error && error.message.includes(secret)) {
+      throw new Error(redactSecret(error.message, secret), { cause: error });
+    }
+    throw error;
+  }
+}
+
+async function provisionAuthorizeBody(input: ProvisionInput): Promise<ProvisionResult> {
   const api = apiBase(input.config);
   const headers = {
     Authorization: `Bearer ${input.accessToken}`,
@@ -99,6 +120,26 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     requestIds.set(attribute.name, saved.id);
   }
 
+  const userClientValue = input.userIntrospection?.clientId.trim() ?? '';
+  const userSecretValue = input.userIntrospection?.clientSecret.trim() ?? '';
+  const userClientId = await ensureResource(
+    input,
+    `${api}/authorizationAttributes`,
+    'attribute',
+    USER_CLIENT_ID_DEFINITION,
+    attributeBody(USER_CLIENT_ID_DEFINITION, { parentId: parent.id, ...(userClientValue ? { constantValue: userClientValue } : {}) }),
+    headers,
+    going,
+  );
+  const userSecret = await ensureResource(
+    input,
+    `${api}/authorizationAttributes`,
+    'attribute',
+    USER_CLIENT_SECRET_DEFINITION,
+    attributeBody(USER_CLIENT_SECRET_DEFINITION, { parentId: parent.id, ...(userSecretValue ? { constantValue: userSecretValue } : {}) }),
+    headers,
+    going,
+  );
   const clientId = await ensureResource(
     input,
     `${api}/authorizationAttributes`,
@@ -117,6 +158,8 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     headers,
     going,
   );
+  assertDefinition(userClientId, parent.id);
+  assertDefinition(userSecret, parent.id);
   assertDefinition(clientId, parent.id);
   assertDefinition(secret, parent.id);
 
@@ -128,7 +171,7 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     `${api}/authorizationServices`,
     'service',
     USER_SERVICE,
-    serviceBody(USER_SERVICE, url, accessId, clientId.id, secret.id),
+    serviceBody(USER_SERVICE, url, accessId, userClientId.id, userSecret.id),
     headers,
     going,
   );
@@ -141,7 +184,7 @@ export async function provisionAuthorize(input: ProvisionInput): Promise<Provisi
     headers,
     going,
   );
-  assertService(userService, accessId, clientId.id, secret.id);
+  assertService(userService, accessId, userClientId.id, userSecret.id);
   assertService(delegationService, txId, clientId.id, secret.id);
 
   const serviceIds = new Map<string, string>([
@@ -191,9 +234,12 @@ async function dryRunFeaturePolicy(input: ProvisionInput, api: string, headers: 
   const body = plannedFeaturePolicy(attributeIds, input.adminGroup, input.delegations);
   const path = input.dryRunPath;
   if (!path) throw new Error('Dry run needs a file path.');
+  const text = `${JSON.stringify(body, null, 2)}\n`;
+  const secret = input.userIntrospection?.clientSecret?.trim() ?? '';
+  if (secret && text.includes(secret)) throw new Error('Dry run included an introspection secret.');
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
-  input.log?.('debug', `Authorize dry run wrote ${path}\n${JSON.stringify(body, null, 2)}`);
+  writeFileSync(path, text);
+  input.log?.('debug', `Authorize dry run wrote ${path}\n${text}`);
   return { decisionEndpointId: '', policies: [], dryRunPath: path };
 }
 
@@ -509,17 +555,33 @@ async function alignFound(
   intended: Record<string, unknown>,
 ): Promise<Resource> {
   if (collection.includes('authorizationServices')) return alignService(input, collection, headers, current, intended);
+  if (collection.includes('authorizationAttributes') && constantNeedsUpdate(current, intended)) {
+    return writeAttribute(input, collection, headers, current, intended, false);
+  }
   if (!collection.includes('authorizationAttributes') || (!resolversMissingValueType(current) && !processorMissingName(current))) return current;
   const version = typeof current.version === 'string' ? current.version : '';
   if (!version) throw new Error(`PingOne attribute ${String(current.name)} is missing a version, so it cannot be repaired.`);
-  const resolvers = intendedResolvers(intended, current);
-  const body: Record<string, unknown> = { ...intended, id: current.id, version, resolvers };
+  return writeAttribute(input, collection, headers, current, { ...intended, resolvers: intendedResolvers(intended, current) }, true);
+}
+
+async function writeAttribute(
+  input: ProvisionInput,
+  collection: string,
+  headers: Record<string, string>,
+  current: Resource,
+  intended: Record<string, unknown>,
+  repair: boolean,
+): Promise<Resource> {
+  const version = typeof current.version === 'string' ? current.version : '';
+  if (!version) throw new Error(`PingOne attribute ${String(current.name)} is missing a version, so it cannot be repaired.`);
+  const body: Record<string, unknown> = { ...intended, id: current.id, version };
   await sendJson(input, `${collection}/${current.id}`, 'PUT', headers, body);
   await input.client.paceAfterManagementPost();
   const read = await readResource(input, `${collection}/${current.id}`, headers);
   if (read.id !== current.id) throw new Error(`PingOne attribute ${String(current.name)} read-back id did not match the repair.`);
-  if (resolversMissingValueType(read)) throw new Error(`PingOne attribute ${String(current.name)} still has a resolver without valueType.`);
-  if (processorMissingName(read)) throw new Error(`PingOne attribute ${String(current.name)} processor.name is still missing.`);
+  if (repair && resolversMissingValueType(read)) throw new Error(`PingOne attribute ${String(current.name)} still has a resolver without valueType.`);
+  if (repair && processorMissingName(read)) throw new Error(`PingOne attribute ${String(current.name)} processor.name is still missing.`);
+  if (!repair && constantNeedsUpdate(read, intended)) throw new Error(`PingOne attribute ${String(current.name)} did not keep the configured value.`);
   return read;
 }
 
@@ -530,7 +592,8 @@ async function alignService(
   current: Resource,
   intended: Record<string, unknown>,
 ): Promise<Resource> {
-  if (!serviceMissingLimits(current)) return current;
+  const authMismatch = serviceAuthMismatch(current, intended);
+  if (!serviceMissingLimits(current) && !authMismatch) return current;
   const version = typeof current.version === 'string' ? current.version : '';
   if (!version) throw new Error(`PingOne service ${String(current.name)} is missing a version, so it cannot be repaired.`);
   const body = { ...intended, id: current.id, version };
@@ -539,7 +602,35 @@ async function alignService(
   const read = await readResource(input, `${collection}/${current.id}`, headers);
   if (read.id !== current.id) throw new Error(`PingOne service ${String(current.name)} read-back id did not match the repair.`);
   if (serviceMissingLimits(read)) throw new Error(`PingOne service ${String(current.name)} is still missing its rate limits.`);
+  if (serviceAuthMismatch(read, intended)) throw new Error(`PingOne service ${String(current.name)} Basic auth does not point at the Definitions.`);
   return read;
+}
+
+function serviceAuthMismatch(current: Resource, intended: Record<string, unknown>): boolean {
+  const left = serviceAuthIds(current);
+  const right = serviceAuthIds(intended);
+  return left.name !== right.name || left.password !== right.password;
+}
+
+function serviceAuthIds(body: Record<string, unknown>): { name: string; password: string } {
+  const settings = body.serviceSettings as {
+    authentication?: { name?: { id?: unknown }; password?: { id?: unknown } };
+  } | undefined;
+  const name = settings?.authentication?.name?.id;
+  const password = settings?.authentication?.password?.id;
+  return { name: typeof name === 'string' ? name : '', password: typeof password === 'string' ? password : '' };
+}
+
+function constantNeedsUpdate(current: Resource, intended: Record<string, unknown>): boolean {
+  const next = constantValue(intended);
+  if (!next) return false;
+  return constantValue(current) !== next;
+}
+
+function constantValue(body: Record<string, unknown>): string {
+  const resolvers = body.resolvers as { type?: string; value?: unknown }[] | undefined;
+  const constant = resolvers?.find((resolver) => resolver.type === 'CONSTANT');
+  return typeof constant?.value === 'string' ? constant.value : '';
 }
 
 function serviceMissingLimits(resource: Resource): boolean {

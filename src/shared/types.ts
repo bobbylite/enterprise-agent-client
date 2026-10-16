@@ -133,10 +133,14 @@ export interface PolicyScaffoldResult {
   preview: PolicyView[];
   created: PolicyView[];
   policies: PolicyView[];
+  /** Which introspection clients Scaffold will use. Never contains a secret. */
+  introspectionNote?: string;
 }
 
 export interface PolicyDryRun {
   path: string;
+  /** Which introspection clients the dry run would use. Never contains a secret. */
+  introspectionNote?: string;
 }
 
 export interface PolicyCacheReset {
@@ -408,6 +412,7 @@ export interface SettingsView {
     generic: boolean;
     worker: boolean;
     agent: boolean;
+    userIntrospect: boolean;
   };
 }
 
@@ -423,7 +428,8 @@ export interface SettingsInput {
   genericApiKey?: string;
   workerClientSecret?: string;
   agentClientSecret?: string;
-  clearKeys?: Array<'openai' | 'anthropic' | 'generic' | 'worker' | 'agent'>;
+  userIntrospectClientSecret?: string;
+  clearKeys?: Array<'openai' | 'anthropic' | 'generic' | 'worker' | 'agent' | 'userIntrospect'>;
 }
 
 export interface ApprovalRequest {

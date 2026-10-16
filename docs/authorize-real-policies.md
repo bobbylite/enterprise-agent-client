@@ -15,12 +15,14 @@ Parent attribute `EnterpriseAgent`. These children use a `REQUEST` resolver and 
 | `EnterpriseAgent.risk-action` | STRING |
 | `EnterpriseAgent.admin-group` | STRING |
 
-Definitions `introspect-client-id` and `introspect-client-secret` are constant attributes. Scaffold writes an empty value. Paste the custom-resource client id and secret in the PingOne console. The app never sends the secret.
+User SSO introspection and delegation introspection use different clients. `user-introspect-client-id` and `user-introspect-client-secret` are the custom resource that issues the SSO access token. `introspect-client-id` and `introspect-client-secret` stay the enterprise agent client used for token exchange. Scaffold creates the user attributes when they are missing and updates `EnterpriseAgent User Introspection` so its BASIC auth points at them. The delegation service keeps the agent attributes. A later run does not delete or recreate a policy tree that already has its children and rules.
+
+`authorize.userIntrospection.clientId` is the SSO resource client id. The secret is `PINGONE_USER_INTROSPECT_CLIENT_SECRET` or the Settings field, stored in the keychain as `userIntrospectClientSecret`. It is not a key in `enterprise.json`. When that secret or client id is set, Scaffold writes it onto the user Definition. An empty value does not wipe a secret already pasted in PingOne. Dry-run output, logs, and the decision trace never include the secret. Scaffold confirmation and dry run show the client id, the attribute names, and whether the secret is stored.
 
 Two top-level HTTP services, with no parent, POST `{authHost}/{environmentId}/as/introspect` as `application/x-www-form-urlencoded`. Authentication is `BASIC` and points at those Definition ids. The body is `token={{<attribute-uuid>}}`. `headers` is an empty array. Timeout is 3000ms. `maximumConcurrentRequests` is 20 and `maximumRequestsPerSecond` is 10. Value type is JSON. `cacheSettings`, a service-level processor, and `channel` are not sent: cache and processor are optional, and `channel` belongs to connector services.
 
-- `EnterpriseAgent User Introspection` uses `access-token`.
-- `EnterpriseAgent Delegation Introspection` uses `tx-token`.
+- `EnterpriseAgent User Introspection` uses `access-token` and the SSO resource Definitions `user-introspect-client-id` and `user-introspect-client-secret`.
+- `EnterpriseAgent Delegation Introspection` uses `tx-token` and the enterprise agent Definitions `introspect-client-id` and `introspect-client-secret`.
 
 Service attributes read `$.active`, `$.groups`, `$.sub`, and for the exchanged token `$.act.sub`, `$.aud`, and `$.scope`. Each processor is named `Extract <attribute>`, for example `Extract introspection-groups`.
 
@@ -30,7 +32,7 @@ If a policy named `Enterprise Agent Features` already exists and a fresh GET sho
 
 The parent read has no expand parameter. It may return each child in full or as `{ type: POLICY, value: { id } }`. Scaffold follows the reference, then checks the child names and the rule payloads. Only after that fresh GET matches does it delete a leftover whose name is exactly `Enterprise Agent User` or `Enterprise Agent Delegation`, and only when that id is not one of the children just kept. A policy with any other name, including an older `Enterprise Agent` parent, is left in place. If the read-back does not match, Scaffold throws and does not delete those leftovers. The error and `~/Library/Logs/enterprise-agent-client/main.log` include the POST body, the raw GET, and each child as type, name, id, and value.id.
 
-Dry run writes that same POST JSON to `authorize-policy-tree.json` in the app's user data folder (`~/Library/Application Support/enterprise-agent-client/` on macOS) and does not create, update, or delete anything in PingOne. Attribute ids that are not in PingOne yet appear as `{{name}}`.
+Dry run writes that same POST JSON to `authorize-policy-tree.json` in the app's user data folder (`~/Library/Application Support/enterprise-agent-client/` on macOS) and does not create, update, or delete anything in PingOne. Attribute ids that are not in PingOne yet appear as `{{name}}`. The Policy tab also shows which introspection client each service will use. That note includes the SSO client id and never the secret.
 
 1. **Enterprise Agent User** (`FIRST_APPLICABLE`). High risk, a `block` action, or an inactive access token denies. A `read_only` action permits a read-only feature payload. Membership of `access.adminGroup` in `$.groups` permits the full payload (`CONTAINS`, because a JSONPath filter that matches nobody throws and would stop the chain). An active token permits the session payload. There is no catch-all deny.
 2. **Enterprise Agent Delegation** (`FIRST_APPLICABLE`). `authorize.delegations` is an allowlist of `humanSub`, `agentSub`, and optional `audience` and `scope`. The last rule permits when `tx-active` is `true` and `tx-act-sub` is not empty. `isApproved` is not used.
@@ -61,12 +63,12 @@ Scaffold tags the latest authorization version and sets `authorizationVersion.id
 
 ## PingOne setup
 
-1. Create a custom resource that is the audience of the SSO access token, with a client secret and token introspection allowed. Use a second resource, or the same one, for the exchanged token.
+1. Create a custom resource that is the audience of the SSO access token, with a client secret and token introspection allowed. That resource's client id and secret are the user introspection credentials. Use the enterprise agent (token exchange) application for the exchanged token. Do not point user introspection at the enterprise agent client: PingOne then returns `active: false` for the SSO token.
 2. Map group membership into the SSO access token `groups` claim, including `Administrator` (or `access.adminGroup`).
 3. Configure RFC 8693 token exchange so the exchanged token includes `act.sub`, plus the audience and scope you want the delegation rules to see.
 4. Give the worker application the Authorize roles for attributes, services, policies, versions, and decision endpoints.
 5. Use Dry run policy tree on the Policy tab and read `authorize-policy-tree.json` before the first write. Then run Scaffold once.
-6. In the PingOne console, paste the resource client id into `introspect-client-id` and the resource client secret into `introspect-client-secret`. Do not put that secret in `enterprise.json` or the git repo.
+6. Put the SSO resource client id in `authorize.userIntrospection.clientId`. Put its secret in `PINGONE_USER_INTROSPECT_CLIENT_SECRET` or Settings. Leave `introspect-client-id` and `introspect-client-secret` for the enterprise agent client. Do not put either secret in `enterprise.json` or the git repo. If you paste values in the PingOne console instead, use the attribute names above.
 7. Optional: set `authorize.delegations` to the humans and agents that may be paired. Leave it empty to rely on the active-delegation rule.
 8. Leave `isApproved` out of every rule until the human-in-the-loop flow in issue #20 is configured. A missing attribute throws and becomes a deny.
 9. Trial licenses share a low configuration rate limit. Scaffold paces management writes and retries `429 REQUEST_LIMITED`. It does not retry `QUOTA_EXCEEDED`.

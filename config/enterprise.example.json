@@ -57,7 +57,10 @@
   "authorize": {
     "decisionEndpointId": "",
     "cacheMs": 30000,
-    "mcpServerId": "pingone"
+    "mcpServerId": "pingone",
+    "userIntrospection": {
+      "clientId": ""
+    }
   },
   "enterpriseInstructions": {
     "persona": "Operate only for the signed-in employee and only inside this organization's policies. The enterprise layer wins when it conflicts with the agent persona or the user's preferences.",

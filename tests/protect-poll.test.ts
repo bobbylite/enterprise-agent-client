@@ -213,6 +213,54 @@ describe('protect polling', () => {
     expect(runtime.state().features.chat).toBe('read_only');
     expect(decisionPosts).toBe(3);
   });
+
+  it('applies a lowercase level at sign-in and a score from the next poll', async () => {
+    const harness = scheduler();
+    let riskPosts = 0;
+    const { runtime } = await boot({
+      schedule: harness.schedule,
+      secrets: await workerSecrets(),
+      patch: (config) => {
+        protectPatch(config);
+        config.protect.reportedIp = '203.0.113.8';
+        config.protect.pollIntervalSeconds = 30;
+      },
+      fetchImpl: async (url, init) => {
+        const target = String(url);
+        const method = init?.method ?? 'GET';
+        if (target.includes('/as/authorize')) {
+          return json(200, {
+            id: 'flow-1',
+            status: 'USERNAME_PASSWORD_REQUIRED',
+            _links: { 'usernamePassword.check': { href: 'https://auth.example/env-1/flows/flow-1' } },
+          });
+        }
+        if (target.includes('/flows/')) {
+          return json(200, {
+            id: 'flow-1',
+            status: 'COMPLETED',
+            authorizeResponse: { code: 'auth-code' },
+            _embedded: { user: { id: 'user-1', username: 'ada' } },
+          });
+        }
+        if (target.includes('/as/token')) return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        if (target.includes('/riskEvaluations') && method === 'POST') {
+          riskPosts += 1;
+          if (riskPosts === 1) return json(200, { id: 'eval-low', result: { level: 'low' }, details: {} });
+          return json(200, { id: 'eval-score', result: { score: 85 }, details: {} });
+        }
+        if (method === 'PUT') return new Response('', { status: 200 });
+        return json(500, { message: target });
+      },
+    });
+    const signedIn = await runtime.submitCredentials('ada', 'secret', '');
+    expect(signedIn.risk?.level).toBe('LOW');
+    expect(signedIn.risk?.action).toBe('allow');
+    await harness.current?.();
+    expect(runtime.state().risk?.level).toBe('HIGH');
+    expect(runtime.state().risk?.action).toBe('block');
+    expect(riskPosts).toBe(2);
+  });
 });
 
 function scheduler() {
