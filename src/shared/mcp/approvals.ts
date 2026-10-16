@@ -1,7 +1,9 @@
-import type { ApprovalChoice, RiskAction } from '../types';
+import type { ApprovalChoice, RiskAction, RiskLevel } from '../types';
 
 export interface ApprovalInput {
   riskAction: RiskAction;
+  /** Live Protect level. MEDIUM denies every tool before the approval prompt. */
+  riskLevel?: RiskLevel;
   readOnlyHint: boolean;
   remembered?: 'always' | 'deny';
 }
@@ -14,6 +16,9 @@ export type ApprovalPreview =
 export function previewApproval(input: ApprovalInput): ApprovalPreview {
   if (input.riskAction === 'block') {
     return { type: 'deny', reason: 'This session is blocked by the risk policy.', automatic: true };
+  }
+  if (input.riskLevel === 'MEDIUM') {
+    return { type: 'deny', reason: 'chat only, tools disabled', automatic: true };
   }
   if (input.riskAction === 'read_only' && !input.readOnlyHint) {
     return {

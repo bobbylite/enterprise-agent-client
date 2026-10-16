@@ -1358,6 +1358,7 @@ export class Runtime {
             this.audit(agentId, action, detail);
           },
           callTool: (tool, args, accessToken) => {
+            if (this.risk?.level === 'MEDIUM') return Promise.reject(new Error('chat only, tools disabled'));
             if (isSkillReferenceTool(tool)) return Promise.resolve(this.readSkillReference(args));
             return this.hub.call(tool.serverId, tool.name, args, accessToken);
           },
@@ -1381,6 +1382,7 @@ export class Runtime {
           participants: participants.map((item) => this.participant(item.agent, item.room)),
           availableTools: this.graphTools(),
           riskAction: this.risk?.action ?? 'allow',
+          riskLevel: this.risk?.level ?? 'UNKNOWN',
           remembered: this.rememberedMap(),
           agentIndex: 0,
           rounds: 0,
@@ -1449,10 +1451,11 @@ export class Runtime {
   }
 
   private gateTool(tool: RuntimeTool, participant: GraphParticipant | undefined): string | null {
+    if (this.risk?.level === 'MEDIUM') return 'chat only, tools disabled';
     const features = this.currentFeatures();
     if (!features.tools) {
       const level = features.chat === 'locked' ? 'HIGH' : (this.risk?.level ?? 'UNKNOWN');
-      if (level === 'MEDIUM' || level === 'HIGH') {
+      if (level === 'HIGH') {
         return `Tool invocation is turned off because Protect scored this session ${level}.`;
       }
       return 'Authorize policy disabled tool invocation for this session.';

@@ -662,19 +662,32 @@ describe('admin gate', () => {
         persona: page.persona,
         user: page.user,
       });
+      const directory = mkdtempSync(join(tmpdir(), 'medium-echo-'));
+      const marker = join(directory, 'called.txt');
+      const script = join(directory, 'echo-mark.mjs');
+      writeFileSync(
+        script,
+        `import { writeFileSync as markCalled } from 'node:fs';\nconst calledMarker = ${JSON.stringify(marker)};\n${readFileSync('examples/echo-mcp-server.mjs', 'utf8').replace(
+          "if (message.method === 'tools/call') {",
+          "if (message.method === 'tools/call') { markCalled(calledMarker, 'called');",
+        )}`,
+      );
       const echo = await runtime.saveMcpServer({
         name: 'Echo',
         transport: 'stdio',
         command: 'node',
-        args: 'examples/echo-mcp-server.mjs',
+        args: script,
         url: '',
         audience: '',
         scope: '',
         enabled: true,
       });
 
-      const medium = await runtime.setMockScenario('new_device');
+      const medium = await runtime.setMockScenario('anomalous_location');
       expect(medium.risk?.level).toBe('MEDIUM');
+      expect(medium.risk?.action).toBe('restrict_tools');
+      expect(medium.risk?.summary).toContain('chat only, tools disabled');
+      expect(medium.restriction?.message).toBe('chat only, tools disabled');
       expect(medium.features).toMatchObject({
         policyTab: true,
         pingoneTools: false,
@@ -697,8 +710,9 @@ describe('admin gate', () => {
       const snapshot = runtime.createConversation();
       events.length = 0;
       await runtime.sendMessage(snapshot.conversation.id, 'echo hello', []);
-      expect(events.some((event) => event.type === 'tool' && event.tool.status === 'done')).toBe(false);
-      expect(events.some((event) => event.type === 'tool' && event.tool.status === 'calling')).toBe(false);
+      expect(events.some((event) => event.type === 'approval-required')).toBe(false);
+      expect(events.some((event) => event.type === 'tool' && (event.tool.status === 'done' || event.tool.status === 'running' || event.tool.status === 'calling'))).toBe(false);
+      expect(existsSync(marker)).toBe(false);
     } finally {
       await runtime.dispose();
     }

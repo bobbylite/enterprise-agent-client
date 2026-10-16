@@ -359,6 +359,41 @@ describe('LangGraph runtime', () => {
     }
   });
 
+  it('does not execute a tool at medium risk even when the action would approve every call', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'graph-medium-'));
+    const checkpointer = openCheckpointer(join(directory, 'turns.sqlite'));
+    const graph = compileAgentGraph(checkpointer);
+    let asked = false;
+    const { deps: bound, calls } = deps({
+      requestApproval: async () => {
+        asked = true;
+        return 'once';
+      },
+    });
+    try {
+      await runAgentGraph({
+        graph,
+        checkpointer,
+        threadId: 'medium-thread',
+        runId: 'medium-run',
+        deps: bound,
+        initial: {
+          conversationId: 'c-medium',
+          participants: [participant({ risk: 'Risk level: MEDIUM.\nPolicy action: restrict_tools.' })],
+          messages: [{ role: 'user', content: 'echo hello' }],
+          availableTools: [echoTool(false)],
+          riskAction: 'restrict_tools',
+          riskLevel: 'MEDIUM',
+        },
+      });
+      expect(asked).toBe(false);
+      expect(calls.token).toEqual([]);
+      expect(calls.tool).toEqual([]);
+    } finally {
+      checkpointer.close();
+    }
+  });
+
   it('does not remember an always choice while tools are restricted', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'graph-restrict-'));
     const checkpointer = openCheckpointer(join(directory, 'turns.sqlite'));

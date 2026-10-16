@@ -4,7 +4,7 @@ import { randomId } from '@shared/ids';
 import { composeInstructions } from '@shared/instructions/compose';
 import { choiceFromUser, previewApproval, type ApprovalDecision } from '@shared/mcp/approvals';
 import { StreamCancelled, isCancellation, type ProviderToolCall } from '@shared/providers/types';
-import type { ApprovalChoice, ApprovalRequest, ChatEvent, InstructionFields, RiskAction, ToolInvocation } from '@shared/types';
+import type { ApprovalChoice, ApprovalRequest, ChatEvent, InstructionFields, RiskAction, RiskLevel, ToolInvocation } from '@shared/types';
 import { streamLangChainTurn, type ModelTurnInput, type ModelTurnMessage } from './chat-model';
 import type { NodeSqliteSaver } from './checkpoint-sqlite';
 import type { RuntimeTool } from './runtime-tool';
@@ -76,6 +76,10 @@ const AgentState = Annotation.Root({
   riskAction: Annotation<RiskAction>({
     reducer: (_left, right) => right,
     default: () => 'allow',
+  }),
+  riskLevel: Annotation<RiskLevel>({
+    reducer: (_left, right) => right,
+    default: () => 'UNKNOWN',
   }),
   remembered: Annotation<Record<string, 'always' | 'deny'>>({
     reducer: (left, right) => ({ ...left, ...right }),
@@ -187,7 +191,8 @@ async function modelNode(state: AgentStateType, config: RunnableConfig): Promise
     risk: participant.risk,
   });
   const system = participant.skills ? `${composed}\n\n${participant.skills}` : composed;
-  const visible = deps.visibleTools?.(state.availableTools, participant) ?? state.availableTools;
+  const filtered = deps.visibleTools?.(state.availableTools, participant) ?? state.availableTools;
+  const visible = state.riskLevel === 'MEDIUM' ? [] : filtered;
   let content = '';
   let reasoning = '';
   let answered = false;
@@ -330,6 +335,7 @@ async function toolsNode(state: AgentStateType, config: RunnableConfig): Promise
   const preferenceKey = `${tool.serverId}\0${tool.name}`;
   const preview = previewApproval({
     riskAction: state.riskAction,
+    riskLevel: state.riskLevel,
     readOnlyHint: tool.readOnlyHint,
     remembered: remembered[preferenceKey],
   });

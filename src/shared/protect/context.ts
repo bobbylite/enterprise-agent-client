@@ -22,6 +22,7 @@ export function renderRiskContext(risk: RiskView, agentName: string): string {
 }
 
 function behaviorLine(risk: RiskView): string {
+  if (risk.level === 'MEDIUM') return 'Behaviour: chat only, tools disabled.';
   switch (risk.action) {
     case 'allow':
       return 'Behaviour: tools may be offered and still require the user approval policy.';

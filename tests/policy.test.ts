@@ -88,6 +88,30 @@ describe('groups and authorize', () => {
       extensionConfig: true,
       chat: 'allow',
     });
+    const permitted = {
+      ...starter,
+      source: 'authorize' as const,
+      policyTab: true,
+      pingoneTools: true,
+      mcpWrites: true,
+      tools: true,
+      chat: 'allow' as const,
+    };
+    const mediumRisk = { ...low, riskLevel: 'MEDIUM' as const, riskAction: 'restrict_tools' as const };
+    expect(applyLiveRiskGates(permitted, mediumRisk, true, true)).toMatchObject({
+      tools: false,
+      pingoneTools: false,
+      mcpWrites: false,
+      chat: 'allow',
+      policyTab: true,
+    });
+    expect(applyLiveRiskGates(permitted, mediumRisk, false, true)).toMatchObject({
+      tools: false,
+      pingoneTools: false,
+      mcpWrites: false,
+      chat: 'allow',
+    });
+    expect(sessionRestriction(applyLiveRiskGates(permitted, mediumRisk, true, true), mediumRisk, 3)?.message).toBe('chat only, tools disabled');
     expect(applyLiveRiskGates(closed, { ...low, riskLevel: 'HIGH' }, true, false)).toMatchObject({
       policyTab: false,
       tools: false,

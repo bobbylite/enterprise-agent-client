@@ -233,22 +233,11 @@ export function applyLiveRiskGates(
   admin: boolean,
   protectEnabled: boolean,
 ): FeatureDecision {
+  if (input.riskLevel === 'MEDIUM') return mediumDecision(decision, admin);
   if (!admin) return decision;
   if (input.riskLevel === 'HIGH' || input.riskAction === 'block') return lockedDecision(decision);
   if (!protectEnabled || decision.source === 'fail_closed' || input.riskLevel === 'UNKNOWN') {
     return withAdminPolicyTab(decision, input, true);
-  }
-  if (input.riskLevel === 'MEDIUM') {
-    return {
-      ...decision,
-      policyTab: true,
-      pingoneTools: false,
-      mcpWrites: false,
-      tools: false,
-      agentConfig: true,
-      extensionConfig: true,
-      chat: 'allow',
-    };
   }
   if (input.riskLevel === 'LOW') {
     return {
@@ -263,6 +252,19 @@ export function applyLiveRiskGates(
     };
   }
   return withAdminPolicyTab(decision, input, true);
+}
+
+function mediumDecision(decision: FeatureDecision, admin: boolean): FeatureDecision {
+  return {
+    ...decision,
+    policyTab: admin ? true : decision.policyTab,
+    pingoneTools: false,
+    mcpWrites: false,
+    tools: false,
+    agentConfig: true,
+    extensionConfig: true,
+    chat: 'allow',
+  };
 }
 
 function lockedDecision(decision: FeatureDecision): FeatureDecision {
@@ -284,6 +286,9 @@ export function sessionRestriction(decision: FeatureDecision, input: DecisionInp
       reason: 'risk',
       message: 'Protect scored this session HIGH. Chat, agent configuration, and extension configuration are locked until the risk drops.',
     };
+  }
+  if (input.riskLevel === 'MEDIUM') {
+    return { reason: 'risk', message: 'chat only, tools disabled' };
   }
   if (decision.chat !== 'read_only') return null;
   if (input.riskLevel === 'HIGH' || input.riskAction === 'block' || input.riskAction === 'read_only') {
