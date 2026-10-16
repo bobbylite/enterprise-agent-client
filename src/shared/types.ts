@@ -87,12 +87,18 @@ export interface FeatureDecision {
   policyTab: boolean;
   pingoneTools: boolean;
   mcpWrites: boolean;
-  chat: 'allow' | 'read_only';
+  /** Every tool invocation, including read-only tools, skills, and PingOne MCP tools. */
+  tools: boolean;
+  /** Agents, instructions, skills, routines, and rooms. */
+  agentConfig: boolean;
+  /** MCP and extension configuration. */
+  extensionConfig: boolean;
+  chat: 'allow' | 'read_only' | 'locked';
   source: 'starter' | 'authorize' | 'fail_closed';
   fetchedAt: number;
 }
 
-/** Why chat is read-only. Absent when chat is allowed. */
+/** Why chat is read-only or locked. Absent when chat is allowed. */
 export type SessionRestrictionReason = 'empty_policies' | 'decision_failure' | 'risk' | 'policy';
 
 export interface SessionRestriction {

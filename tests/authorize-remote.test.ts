@@ -126,16 +126,16 @@ describe('Authorize HTTP', () => {
     await expect(
       syncRemoteScaffold(config(), 'worker-token', starter, client, (policy) => saved.set(policy.id, policy)),
     ).rejects.toThrow('PingOne is rate limiting, try again in 1s');
-    expect(posts).toEqual(['Session can use chat', 'Administrator tools']);
+    expect(posts).toEqual(['Session can use chat', 'Administrator tools', 'Medium risk']);
     expect(saved.get('enterprise-agent:session')?.remoteId).toBe('policy-1');
     expect(saved.get('enterprise-agent:read-only')?.remoteId).toBeNull();
 
     const resumed = await syncRemoteScaffold(config(), 'worker-token', [...saved.values()], client);
     expect(resumed.created.map((policy) => policy.name)).toEqual(['Read-only risk', 'High risk lockdown']);
-    expect(posts).toHaveLength(4);
+    expect(posts).toHaveLength(5);
     const again = await syncRemoteScaffold(config(), 'worker-token', resumed.policies, client);
     expect(again.created).toEqual([]);
-    expect(posts).toHaveLength(4);
+    expect(posts).toHaveLength(5);
     expect(again.policies[0]?.remoteId).toBe('policy-1');
   });
 

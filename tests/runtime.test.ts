@@ -518,7 +518,9 @@ describe('admin gate', () => {
   });
 
   it('scaffolds once, toggles enforcement, and audits both', async () => {
-    const { runtime } = await boot();
+    const { runtime } = await boot(0, (config) => {
+      config.protect.enabled = false;
+    });
     await runtime.setMockAdmin(true);
     await runtime.submitCredentials('ada', 'secret', '');
     const preview = await runtime.scaffoldPolicies(false);
@@ -527,14 +529,15 @@ describe('admin gate', () => {
     expect(preview.preview.map((policy) => policy.id)).toEqual([
       'enterprise-agent:session',
       'enterprise-agent:admin',
+      'enterprise-agent:medium',
       'enterprise-agent:read-only',
       'enterprise-agent:high-risk',
     ]);
     const created = await runtime.scaffoldPolicies(true);
-    expect(created.created).toHaveLength(4);
+    expect(created.created).toHaveLength(5);
     const again = await runtime.scaffoldPolicies(true);
     expect(again.created).toEqual([]);
-    expect(await runtime.listPolicies()).toHaveLength(4);
+    expect(await runtime.listPolicies()).toHaveLength(5);
 
     await runtime.setPolicyEnabled('enterprise-agent:session', false);
     const after = runtime.state();
@@ -548,7 +551,7 @@ describe('admin gate', () => {
 
     const reset = await runtime.resetPolicyCache();
     expect(reset.policies).toEqual([]);
-    expect(reset.cleared).toMatch(/4 local policies/);
+    expect(reset.cleared).toMatch(/5 local policies/);
     expect(reset.cleared).toMatch(/Authorize decision cache/);
     expect(reset.cleared).toMatch(/scaffold still in progress/);
     expect(await runtime.listPolicies()).toEqual([]);
@@ -559,7 +562,7 @@ describe('admin gate', () => {
     expect(afterReset.features.source).toBe('starter');
     expect(afterReset.restriction).toBeNull();
     const restored = await runtime.scaffoldPolicies(true);
-    expect(restored.created).toHaveLength(4);
+    expect(restored.created).toHaveLength(5);
   });
 
   it('writes a dry-run policy tree without calling PingOne', async () => {
@@ -593,11 +596,112 @@ describe('admin gate', () => {
     expect(state.features.policyTab).toBe(false);
     expect(state.features.pingoneTools).toBe(false);
     expect(state.features.mcpWrites).toBe(false);
-    expect(state.features.chat).toBe('read_only');
+    expect(state.features.tools).toBe(false);
+    expect(state.features.agentConfig).toBe(false);
+    expect(state.features.extensionConfig).toBe(false);
+    expect(state.features.chat).toBe('locked');
     expect(state.restriction?.reason).toBe('risk');
+    expect(state.restriction?.message).toMatch(/locked until the risk drops/);
     await expect(runtime.listPolicies()).rejects.toThrow(/Policy tab/);
     const snapshot = runtime.createConversation();
-    await expect(runtime.sendMessage(snapshot.conversation.id, 'hello', [])).rejects.toThrow(/read-only/);
+    await expect(runtime.sendMessage(snapshot.conversation.id, 'hello', [])).rejects.toThrow(/locked/i);
+    const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+    const page = runtime.openAgent(branded!.id);
+    expect(() =>
+      runtime.saveAgent({
+        id: branded!.id,
+        name: page.profile.name,
+        provider: page.profile.provider,
+        model: page.profile.model,
+        persona: page.persona,
+        user: page.user,
+      }),
+    ).toThrow(/Agent configuration is locked/);
+    await expect(
+      runtime.saveMcpServer({
+        name: 'Echo',
+        transport: 'stdio',
+        command: 'node',
+        args: 'examples/echo-mcp-server.mjs',
+        url: '',
+        audience: '',
+        scope: '',
+        enabled: true,
+      }),
+    ).rejects.toThrow(/Extension configuration is locked/);
+  });
+
+  it('opens an administrator at low risk and turns tools off at medium risk', async () => {
+    const { runtime, events } = await boot();
+    try {
+      await runtime.setMockAdmin(false);
+      const employee = await runtime.submitCredentials('ada', 'secret', '');
+      expect(employee.features.policyTab).toBe(false);
+      expect(employee.features.chat).toBe('allow');
+      expect(employee.features.tools).toBe(true);
+      await runtime.logout();
+
+      await runtime.setMockAdmin(true);
+      const low = await runtime.submitCredentials('ada', 'secret', '');
+      expect(low.features).toMatchObject({
+        policyTab: true,
+        pingoneTools: true,
+        mcpWrites: true,
+        tools: true,
+        agentConfig: true,
+        extensionConfig: true,
+        chat: 'allow',
+      });
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      const page = runtime.openAgent(branded!.id);
+      runtime.saveAgent({
+        id: branded!.id,
+        name: page.profile.name,
+        provider: page.profile.provider,
+        model: page.profile.model,
+        persona: page.persona,
+        user: page.user,
+      });
+      const echo = await runtime.saveMcpServer({
+        name: 'Echo',
+        transport: 'stdio',
+        command: 'node',
+        args: 'examples/echo-mcp-server.mjs',
+        url: '',
+        audience: '',
+        scope: '',
+        enabled: true,
+      });
+
+      const medium = await runtime.setMockScenario('new_device');
+      expect(medium.risk?.level).toBe('MEDIUM');
+      expect(medium.features).toMatchObject({
+        policyTab: true,
+        pingoneTools: false,
+        mcpWrites: false,
+        tools: false,
+        agentConfig: true,
+        extensionConfig: true,
+        chat: 'allow',
+      });
+      runtime.saveRoutine({
+        name: 'Still allowed',
+        prompt: 'Write a note',
+        agentId: branded!.id,
+        targetType: 'agent',
+        targetId: branded!.id,
+        cron: '0 9 * * 1-5',
+        enabled: false,
+      });
+      await runtime.connectMcp(echo.id);
+      const snapshot = runtime.createConversation();
+      events.length = 0;
+      await runtime.sendMessage(snapshot.conversation.id, 'echo hello', []);
+      expect(events.some((event) => event.type === 'tool' && event.tool.status === 'done')).toBe(false);
+      expect(events.some((event) => event.type === 'tool' && event.tool.status === 'calling')).toBe(false);
+    } finally {
+      await runtime.dispose();
+    }
   });
 
   it('uses a worker token for the PingOne server and denies the tool until the skill is assigned', async () => {
@@ -943,7 +1047,7 @@ describe('pi.flow runtime', () => {
     expect(state.restriction?.message).toMatch(/decision endpoint/);
     const preview = await runtime.scaffoldPolicies(false);
     expect(preview.created).toEqual([]);
-    expect(preview.preview).toHaveLength(4);
+    expect(preview.preview).toHaveLength(5);
   });
 
   it('applies an Authorize feature statement from the worker decision call', async () => {
@@ -1044,25 +1148,27 @@ describe('pi.flow runtime', () => {
     );
     await runtime.submitCredentials('ada', 'secret', '');
     const [first, overlapping] = await Promise.all([runtime.scaffoldPolicies(true), runtime.scaffoldPolicies(true)]);
-    expect(posts).toHaveLength(4);
-    expect(first.created.length + overlapping.created.length).toBe(4);
+    expect(posts).toHaveLength(5);
+    expect(first.created.length + overlapping.created.length).toBe(5);
     const again = await runtime.scaffoldPolicies(true);
     expect(again.created).toEqual([]);
-    expect(posts).toHaveLength(4);
+    expect(posts).toHaveLength(5);
 
     remote.splice(0, remote.length);
     const recreated = await runtime.scaffoldPolicies(true);
     expect(recreated.created.map((policy) => policy.name).sort()).toEqual([
       'Administrator tools',
       'High risk lockdown',
+      'Medium risk',
       'Read-only risk',
       'Session can use chat',
     ]);
-    expect(posts).toHaveLength(8);
+    expect(posts).toHaveLength(10);
     const listed = await runtime.listPolicies();
     expect(listed.map((policy) => policy.id).filter((id) => !id.includes(':pingone:')).sort()).toEqual([
       'enterprise-agent:admin',
       'enterprise-agent:high-risk',
+      'enterprise-agent:medium',
       'enterprise-agent:read-only',
       'enterprise-agent:session',
     ]);
@@ -1072,7 +1178,7 @@ describe('pi.flow runtime', () => {
     const postsBeforeReset = posts.length;
     const reset = await runtime.resetPolicyCache();
     expect(reset.policies).toEqual([]);
-    expect(reset.cleared).toMatch(/7 local policies/);
+    expect(reset.cleared).toMatch(/8 local policies/);
     expect(reset.cleared).toMatch(/Trust Framework ids/);
     expect(reset.cleared).toMatch(/Authorize decision cache/);
     expect(posts).toHaveLength(postsBeforeReset);
@@ -1090,9 +1196,9 @@ describe('pi.flow runtime', () => {
     await runtime.scaffoldPolicies(false);
     expect(posts).toHaveLength(postsBeforeReset);
     const created = await runtime.scaffoldPolicies(true);
-    expect(created.created).toHaveLength(4);
-    expect(posts).toHaveLength(postsBeforeReset + 4);
-    expect(remote).toHaveLength(4);
+    expect(created.created).toHaveLength(5);
+    expect(posts).toHaveLength(postsBeforeReset + 5);
+    expect(remote).toHaveLength(5);
   });
 
   it('saves an always-current decision endpoint when PingOne lists no authorization version', async () => {

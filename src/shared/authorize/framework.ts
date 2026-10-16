@@ -375,25 +375,102 @@ export interface RulePlan {
   payload: Record<string, boolean | string>;
 }
 
-const LOCKDOWN = { policyTab: false, pingoneTools: false, mcpWrites: false, chat: 'read_only' };
-const READ_ONLY = { policyTab: true, pingoneTools: false, mcpWrites: false, chat: 'read_only' };
-const ADMIN = { policyTab: true, pingoneTools: true, mcpWrites: true, chat: 'allow' };
-const SESSION = { policyTab: false, pingoneTools: false, mcpWrites: true, chat: 'allow' };
+const LOCKED: Record<string, boolean | string> = {
+  policyTab: false,
+  pingoneTools: false,
+  mcpWrites: false,
+  tools: false,
+  agentConfig: false,
+  extensionConfig: false,
+  chat: 'locked',
+};
+const MEDIUM_ADMIN: Record<string, boolean | string> = {
+  policyTab: true,
+  pingoneTools: false,
+  mcpWrites: false,
+  tools: false,
+  agentConfig: true,
+  extensionConfig: true,
+  chat: 'allow',
+};
+const MEDIUM: Record<string, boolean | string> = { ...MEDIUM_ADMIN, policyTab: false };
+const OPEN: Record<string, boolean | string> = {
+  policyTab: true,
+  pingoneTools: true,
+  mcpWrites: true,
+  tools: true,
+  agentConfig: true,
+  extensionConfig: true,
+  chat: 'allow',
+};
+const READ_ONLY: Record<string, boolean | string> = {
+  policyTab: true,
+  pingoneTools: false,
+  mcpWrites: false,
+  tools: false,
+  agentConfig: true,
+  extensionConfig: true,
+  chat: 'read_only',
+};
+const SESSION: Record<string, boolean | string> = {
+  policyTab: false,
+  pingoneTools: false,
+  mcpWrites: true,
+  tools: true,
+  agentConfig: true,
+  extensionConfig: true,
+  chat: 'allow',
+};
 
 export function userRulePlans(adminGroup: string): RulePlan[] {
   return [
     {
-      name: 'High risk or inactive token',
+      name: 'Inactive token',
+      effect: 'DENY',
+      condition: { op: 'eq', attribute: 'introspection-active', value: 'false' },
+      payload: LOCKED,
+    },
+    {
+      name: 'High risk',
       effect: 'DENY',
       condition: {
         op: 'or',
         conditions: [
           { op: 'eq', attribute: 'risk-level', value: 'HIGH' },
           { op: 'eq', attribute: 'risk-action', value: 'block' },
-          { op: 'eq', attribute: 'introspection-active', value: 'false' },
         ],
       },
-      payload: LOCKDOWN,
+      payload: LOCKED,
+    },
+    {
+      name: 'Medium risk administrator',
+      effect: 'PERMIT',
+      condition: {
+        op: 'and',
+        conditions: [
+          { op: 'eq', attribute: 'risk-level', value: 'MEDIUM' },
+          { op: 'contains', attribute: 'introspection-groups', value: adminGroup },
+        ],
+      },
+      payload: MEDIUM_ADMIN,
+    },
+    {
+      name: 'Medium risk',
+      effect: 'PERMIT',
+      condition: { op: 'eq', attribute: 'risk-level', value: 'MEDIUM' },
+      payload: MEDIUM,
+    },
+    {
+      name: 'Low risk administrator',
+      effect: 'PERMIT',
+      condition: {
+        op: 'and',
+        conditions: [
+          { op: 'eq', attribute: 'risk-level', value: 'LOW' },
+          { op: 'contains', attribute: 'introspection-groups', value: adminGroup },
+        ],
+      },
+      payload: OPEN,
     },
     {
       name: 'Read-only risk',
@@ -405,7 +482,7 @@ export function userRulePlans(adminGroup: string): RulePlan[] {
       name: 'Administrator',
       effect: 'PERMIT',
       condition: { op: 'contains', attribute: 'introspection-groups', value: adminGroup },
-      payload: ADMIN,
+      payload: OPEN,
     },
     {
       name: 'Active session',
@@ -740,12 +817,24 @@ export function applyPolicyWrite(
   const incoming = body ?? {};
   if (method === 'PUT') {
     const version = typeof prior?.version === 'string' && prior.version ? prior.version : 'v1';
+    const incomingChildren = Array.isArray(incoming.children) ? incoming.children : [];
+    // A parent PUT that includes a policy child ignores children and keeps the version.
+    // A PUT whose children are all rules replaces those rules and bumps the version.
+    if (incomingChildren.length > 0 && incomingChildren.every((child) => isRuleChild(child))) {
+      return { ...(prior ?? {}), ...incoming, id, version: `${version}-rules`, children: incomingChildren };
+    }
     const children = Array.isArray(prior?.children) ? prior.children : [];
     return { ...(prior ?? {}), ...incoming, id, version, children };
   }
   const created: Record<string, unknown> = { ...(prior ?? {}), ...incoming, id, version: 'v1' };
   created.children = recordedPolicyChildren(incoming.children, knownIds, allocateId, saveChild);
   return created;
+}
+
+function isRuleChild(child: unknown): boolean {
+  if (!child || typeof child !== 'object') return false;
+  const record = child as { type?: unknown; effectSettings?: unknown };
+  return record.type === 'RULE' || Boolean(record.effectSettings);
 }
 
 function ruleWriteError(child: unknown): string | null {

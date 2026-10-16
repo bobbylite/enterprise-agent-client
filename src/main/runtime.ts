@@ -15,6 +15,7 @@ import { beginLoopback, waitForLoopbackCode } from '@shared/auth/loopback';
 import { classifyAccessToken, type TokenSet } from '@shared/auth/tokens';
 import { groupsFromClaims, isAdmin } from '@shared/access/groups';
 import {
+  applyLiveRiskGates,
   decisionCacheKey,
   evaluatePolicies,
   failClosed,
@@ -25,7 +26,6 @@ import {
   reconcilePolicyCache,
   scaffoldPolicies,
   sessionRestriction as explainRestriction,
-  withAdminPolicyTab,
   SCAFFOLD_MARKER,
   type AuthorizePolicy,
   type DecisionInput,
@@ -574,7 +574,7 @@ export class Runtime {
   }
 
   saveAgent(input: AgentInput): AgentPage {
-    this.requireSession();
+    this.requireAgentConfig();
     const existing = input.id ? this.options.db.getAgent(input.id) : null;
     if (input.id && !existing) throw new Error('That agent was not found.');
     const provider = input.provider;
@@ -603,7 +603,7 @@ export class Runtime {
   }
 
   importSkill(input: SkillInput): SkillView {
-    this.requireSession();
+    this.requireAgentConfig();
     const name = input.name.trim();
     if (!name) throw new Error('Give the skill a name.');
     if (!input.instructions.trim()) throw new Error('Write the skill instructions.');
@@ -624,7 +624,7 @@ export class Runtime {
   }
 
   async importSkillFile(): Promise<SkillView> {
-    this.requireSession();
+    this.requireAgentConfig();
     if (!this.options.pickFiles) throw new Error('File picking is not available.');
     const files = await this.options.pickFiles();
     const file = files[0];
@@ -633,7 +633,7 @@ export class Runtime {
   }
 
   setSkillEnabled(id: string, enabled: boolean): SkillView[] {
-    this.requireSession();
+    this.requireAgentConfig();
     const skill = this.options.db.getSkill(id);
     if (!skill || !this.skillVisible(skill)) throw new Error('That skill was not found.');
     if (skill.requiresAdmin) this.requireAdmin();
@@ -642,7 +642,7 @@ export class Runtime {
   }
 
   deleteSkill(id: string): SkillView[] {
-    this.requireSession();
+    this.requireAgentConfig();
     const skill = this.options.db.getSkill(id);
     if (!skill || !this.skillVisible(skill)) throw new Error('That skill was not found.');
     if (skill.builtin) throw new Error('The built-in PingOne skill stays.');
@@ -655,7 +655,7 @@ export class Runtime {
   }
 
   assignSkill(agentId: string, skillId: string, assigned: boolean): AgentPage {
-    this.requireSession();
+    this.requireAgentConfig();
     const agent = this.options.db.getAgent(agentId);
     if (!agent) throw new Error('That agent was not found.');
     const skill = this.options.db.getSkill(skillId);
@@ -769,7 +769,7 @@ export class Runtime {
   }
 
   deleteAgent(id: string): void {
-    this.requireSession();
+    this.requireAgentConfig();
     const agent = this.options.db.getAgent(id);
     if (!agent) throw new Error('That agent was not found.');
     if (agent.nameFromBranding) throw new Error('The branding agent stays. Edit it instead of deleting it.');
@@ -783,7 +783,7 @@ export class Runtime {
   }
 
   saveRoom(input: RoomInput): Room {
-    this.requireSession();
+    this.requireAgentConfig();
     if (!input.name.trim()) throw new Error('Give the room a name.');
     if (input.agentIds.length === 0) throw new Error('Choose at least one agent.');
     const existing = input.id ? this.options.db.getRoom(input.id) : null;
@@ -799,7 +799,7 @@ export class Runtime {
   }
 
   deleteRoom(id: string): void {
-    this.requireSession();
+    this.requireAgentConfig();
     this.options.db.deleteRoom(id);
   }
 
@@ -882,6 +882,7 @@ export class Runtime {
   }
 
   savePersona(fields: InstructionFields): InstructionEditorState {
+    this.requireAgentConfig();
     const agent = this.defaultAgent();
     this.options.db.upsertAgent({ ...agent, instructions: fields });
     this.options.db.setSetting('personaCustomized', '1');
@@ -889,12 +890,14 @@ export class Runtime {
   }
 
   saveUserLayer(fields: InstructionFields): InstructionEditorState {
+    this.requireAgentConfig();
     const agent = this.defaultAgent();
     this.options.db.upsertAgent({ ...agent, userInstructions: fields });
     return this.getInstructions();
   }
 
   resetPersona(): InstructionEditorState {
+    this.requireAgentConfig();
     const agent = this.defaultAgent();
     this.options.db.upsertAgent({ ...agent, instructions: this.options.branding.persona });
     this.options.db.setSetting('personaCustomized', '0');
@@ -908,6 +911,7 @@ export class Runtime {
   }
 
   async saveMcpServer(input: McpServerInput): Promise<McpServerView> {
+    this.requireExtensionConfig();
     if (!input.name.trim()) throw new Error('Give the extension a name.');
     const existing = input.id ? this.options.db.listMcpServers().find((item) => item.id === input.id) : undefined;
     const kind = extensionKind(input);
@@ -937,6 +941,7 @@ export class Runtime {
   }
 
   async deleteMcpServer(id: string): Promise<void> {
+    this.requireExtensionConfig();
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
     await this.hub.disconnect(id);
     if (server) {
@@ -951,6 +956,7 @@ export class Runtime {
   }
 
   async setMcpEnabled(id: string, enabled: boolean): Promise<McpServerView> {
+    this.requireExtensionConfig();
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
     if (!server) throw new Error('That extension was not found.');
     const next = { ...server, enabled };
@@ -969,7 +975,7 @@ export class Runtime {
   }
 
   async connectMcp(id: string): Promise<McpServerView> {
-    this.requireSession();
+    this.requireExtensionConfig();
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
     if (!server) throw new Error('That extension was not found.');
     if (!server.enabled) throw new Error('This extension is disabled.');
@@ -999,6 +1005,7 @@ export class Runtime {
   }
 
   async disconnectMcp(id: string): Promise<McpServerView> {
+    this.requireExtensionConfig();
     await this.hub.disconnect(id);
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
     if (!server) throw new Error('That extension was not found.');
@@ -1007,7 +1014,7 @@ export class Runtime {
   }
 
   async signInMcp(id: string, manual?: McpSignInInput): Promise<McpServerView> {
-    this.requireSession();
+    this.requireExtensionConfig();
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
     if (!server) throw new Error('That extension was not found.');
     if (!this.usesOauth(server)) throw new Error('This extension does not use MCP authorization.');
@@ -1042,6 +1049,7 @@ export class Runtime {
   }
 
   async signOutMcp(id: string): Promise<McpServerView> {
+    this.requireExtensionConfig();
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
     if (!server) throw new Error('That extension was not found.');
     await this.hub.disconnect(id);
@@ -1068,6 +1076,7 @@ export class Runtime {
   }
 
   saveRoutine(input: RoutineInput): Routine {
+    this.requireAgentConfig();
     assertValidCron(input.cron);
     if (!input.name.trim() || !input.prompt.trim()) throw new Error('A routine needs a name and a prompt.');
     const existing = input.id ? this.options.db.getRoutine(input.id) : null;
@@ -1093,11 +1102,13 @@ export class Runtime {
   }
 
   deleteRoutine(id: string): void {
+    this.requireAgentConfig();
     this.options.db.deleteRoutine(id);
   }
 
   async runRoutine(id: string): Promise<RoutineRun> {
     this.requireSession();
+    this.requireWritableChat();
     const routine = this.options.db.getRoutine(id);
     if (!routine) throw new Error('That routine was not found.');
     return this.executeRoutine(routine);
@@ -1213,6 +1224,7 @@ export class Runtime {
 
   async fireDueRoutines(date: Date): Promise<RoutineRun[]> {
     if (!this.session || this.firing) return [];
+    if (this.currentFeatures().chat !== 'allow') return [];
     this.firing = true;
     const runs: RoutineRun[] = [];
     try {
@@ -1438,6 +1450,13 @@ export class Runtime {
 
   private gateTool(tool: RuntimeTool, participant: GraphParticipant | undefined): string | null {
     const features = this.currentFeatures();
+    if (!features.tools) {
+      const level = features.chat === 'locked' ? 'HIGH' : (this.risk?.level ?? 'UNKNOWN');
+      if (level === 'MEDIUM' || level === 'HIGH') {
+        return `Tool invocation is turned off because Protect scored this session ${level}.`;
+      }
+      return 'Authorize policy disabled tool invocation for this session.';
+    }
     if (isSkillReferenceTool(tool) || tool.serverId === this.options.config.authorize.mcpServerId) {
       return skillReferenceDenied({
         serverId: tool.serverId,
@@ -1449,7 +1468,7 @@ export class Runtime {
         skillIds: participant?.skillIds ?? [],
       });
     }
-    if ((!features.mcpWrites || features.chat === 'read_only') && !tool.readOnlyHint) {
+    if ((!features.mcpWrites || features.chat !== 'allow') && !tool.readOnlyHint) {
       return 'Authorize policy disabled MCP writes for this session.';
     }
     return null;
@@ -1543,14 +1562,31 @@ export class Runtime {
   }
 
   private applyFeatures(decision: FeatureDecision, key: string): void {
-    const next = withAdminPolicyTab(decision, this.decisionInput(), this.isAdmin());
+    const next = applyLiveRiskGates(decision, this.decisionInput(), this.isAdmin(), this.options.config.protect.enabled);
     this.features = next;
     this.decisionCache = { key, at: this.now(), decision: next };
   }
 
   private requireWritableChat(): void {
+    if (this.currentFeatures().chat === 'locked') {
+      throw new Error('Chat is locked because Protect scored this session HIGH.');
+    }
     if (this.currentFeatures().chat === 'read_only') {
       throw new Error('Authorize policy made this session read-only.');
+    }
+  }
+
+  private requireAgentConfig(): void {
+    this.requireSession();
+    if (!this.currentFeatures().agentConfig) {
+      throw new Error('Agent configuration is locked because Protect scored this session HIGH.');
+    }
+  }
+
+  private requireExtensionConfig(): void {
+    this.requireSession();
+    if (!this.currentFeatures().extensionConfig) {
+      throw new Error('Extension configuration is locked because Protect scored this session HIGH.');
     }
   }
 

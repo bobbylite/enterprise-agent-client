@@ -6,12 +6,13 @@ import { Transcript } from '../components/Transcript';
 export function ChatScreen({
   branding,
   showReasoning,
-  readOnly,
+  chatMode,
 }: {
   branding: Branding;
   showReasoning: boolean;
-  readOnly: boolean;
+  chatMode: 'allow' | 'read_only' | 'locked';
 }) {
+  const composerLocked = chatMode !== 'allow';
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [snapshot, setSnapshot] = useState<ChatSnapshot | null>(null);
   const [draft, setDraft] = useState('');
@@ -116,7 +117,7 @@ export function ChatScreen({
                 <p>Messages stream here. Try “echo hello” after connecting the local echo tool.</p>
               </div>
             ) : (
-              <Transcript messages={snapshot.messages} showReasoning={showReasoning} />
+              <Transcript messages={snapshot.messages} showReasoning={showReasoning} resetKey={snapshot.conversation.id} />
             )}
             {error ? <p className="error">{error}</p> : null}
             {attachments.length > 0 ? (
@@ -130,19 +131,25 @@ export function ChatScreen({
               className="composer"
               onSubmit={(event) => {
                 event.preventDefault();
-                if (readOnly) return;
+                if (composerLocked) return;
                 void send();
               }}
             >
               <textarea
                 value={draft}
-                placeholder={readOnly ? 'Chat is read-only for this session' : `Message ${branding.agentName}`}
-                disabled={readOnly}
+                placeholder={
+                  chatMode === 'locked'
+                    ? 'Chat is locked because Protect scored this session HIGH.'
+                    : chatMode === 'read_only'
+                      ? 'Chat is read-only for this session'
+                      : `Message ${branding.agentName}`
+                }
+                disabled={composerLocked}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
-                    if (!readOnly) void send();
+                    if (!composerLocked) void send();
                   }
                 }}
               />
@@ -150,7 +157,7 @@ export function ChatScreen({
                 <button
                   type="button"
                   className="ghost"
-                  disabled={readOnly}
+                  disabled={composerLocked}
                   onClick={() => void window.agent.pickAttachments().then((picked) => setAttachments((current) => [...current, ...picked]))}
                 >
                   Attach
@@ -164,7 +171,7 @@ export function ChatScreen({
                     Stop
                   </button>
                 ) : (
-                  <button className="primary" type="submit" disabled={readOnly}>
+                  <button className="primary" type="submit" disabled={composerLocked}>
                     Send
                   </button>
                 )}

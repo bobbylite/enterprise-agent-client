@@ -31,7 +31,9 @@ export function Shell({
   const nav = NAV.filter(([id]) => id !== 'policy' || showPolicy);
   const [view, setView] = useState<(typeof NAV)[number][0]>('chat');
   const riskClass = riskIndicatorClass(state.risk?.level);
-  const readOnly = state.features.chat === 'read_only';
+  const chatMode = state.features.chat;
+  const agentLocked = !state.features.agentConfig;
+  const extensionLocked = !state.features.extensionConfig;
   const canScaffold = Boolean(state.session?.admin && state.features.policyTab);
 
   useEffect(() => {
@@ -74,7 +76,7 @@ export function Shell({
       </aside>
       <section className="workspace">
         {state.restriction ? (
-          <div className="notice access-notice">
+          <div className={`notice access-notice${chatMode === 'locked' ? ' locked-banner' : ''}`}>
             <p>{state.restriction.message}</p>
             {canScaffold ? (
               <button type="button" className="primary" onClick={() => setView('policy')}>
@@ -83,10 +85,12 @@ export function Shell({
             ) : null}
           </div>
         ) : null}
-        {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} readOnly={readOnly} /> : null}
-        {view === 'rooms' ? <RoomsScreen showReasoning={state.showReasoning} readOnly={readOnly} /> : null}
-        {view === 'agents' ? <AgentsScreen branding={branding} /> : null}
-        {view === 'tools' ? <McpScreen /> : null}
+        {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} chatMode={chatMode} /> : null}
+        {view === 'rooms' ? (
+          <RoomsScreen showReasoning={state.showReasoning} chatMode={chatMode} configLocked={agentLocked} />
+        ) : null}
+        {view === 'agents' ? <AgentsScreen branding={branding} configLocked={agentLocked} /> : null}
+        {view === 'tools' ? <McpScreen configLocked={extensionLocked} /> : null}
         {view === 'policy' && showPolicy ? <PolicyScreen onState={onState} /> : null}
         {view === 'settings' ? <SettingsScreen state={state} /> : null}
       </section>

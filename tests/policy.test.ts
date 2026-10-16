@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { groupsFromClaims, isAdmin } from '../src/shared/access/groups';
 import {
+  applyLiveRiskGates,
   evaluatePolicies,
   failClosed,
   featuresFromAuthorize,
@@ -68,6 +69,36 @@ describe('groups and authorize', () => {
     expect(sessionRestriction(closed, { ...low, riskLevel: 'HIGH' }, 0)?.reason).toBe('risk');
     expect(sessionRestriction({ ...closed, source: 'starter' }, low, 0)?.reason).toBe('empty_policies');
     expect(sessionRestriction({ ...closed, chat: 'allow' }, low, 0)).toBeNull();
+    const starter = { ...closed, source: 'starter' as const };
+    expect(applyLiveRiskGates(closed, low, true, false)).toMatchObject({ policyTab: true, chat: 'read_only', tools: false, pingoneTools: false });
+    expect(applyLiveRiskGates(starter, low, true, true)).toMatchObject({
+      policyTab: true,
+      pingoneTools: true,
+      mcpWrites: true,
+      tools: true,
+      agentConfig: true,
+      extensionConfig: true,
+      chat: 'allow',
+    });
+    expect(applyLiveRiskGates(starter, { ...low, riskLevel: 'MEDIUM' }, true, true)).toMatchObject({
+      policyTab: true,
+      pingoneTools: false,
+      tools: false,
+      agentConfig: true,
+      extensionConfig: true,
+      chat: 'allow',
+    });
+    expect(applyLiveRiskGates(closed, { ...low, riskLevel: 'HIGH' }, true, false)).toMatchObject({
+      policyTab: false,
+      tools: false,
+      agentConfig: false,
+      extensionConfig: false,
+      chat: 'locked',
+    });
+    expect(applyLiveRiskGates(starter, low, false, true)).toBe(starter);
+    expect(sessionRestriction(applyLiveRiskGates(starter, { ...low, riskLevel: 'HIGH' }, true, true), { ...low, riskLevel: 'HIGH' }, 1)?.message).toMatch(
+      /locked until the risk drops/,
+    );
   });
 
   it('evaluates starter policies so high risk overrides the admin grant', () => {
@@ -77,17 +108,42 @@ describe('groups and authorize', () => {
     expect(admin.pingoneTools).toBe(true);
     expect(admin.chat).toBe('allow');
     expect(admin.mcpWrites).toBe(true);
-    const locked = evaluatePolicies(policies, { groups: ['Administrator'], riskLevel: 'HIGH', riskAction: 'allow' }, 12);
-    expect(locked).toMatchObject({ policyTab: false, pingoneTools: false, mcpWrites: false, chat: 'read_only', source: 'starter' });
-    const employee = evaluatePolicies(policies, { groups: ['Employees'], riskLevel: 'LOW', riskAction: 'allow' }, 13);
+    const medium = evaluatePolicies(policies, { groups: ['Administrator'], riskLevel: 'MEDIUM', riskAction: 'step_up_mfa' }, 12);
+    expect(medium).toMatchObject({
+      policyTab: true,
+      pingoneTools: false,
+      mcpWrites: false,
+      tools: false,
+      agentConfig: true,
+      extensionConfig: true,
+      chat: 'allow',
+    });
+    const employeeMedium = evaluatePolicies(policies, { groups: ['Employees'], riskLevel: 'MEDIUM', riskAction: 'step_up_mfa' }, 13);
+    expect(employeeMedium.policyTab).toBe(false);
+    expect(employeeMedium.tools).toBe(false);
+    expect(employeeMedium.agentConfig).toBe(true);
+    expect(employeeMedium.chat).toBe('allow');
+    const locked = evaluatePolicies(policies, { groups: ['Administrator'], riskLevel: 'HIGH', riskAction: 'allow' }, 14);
+    expect(locked).toMatchObject({
+      policyTab: false,
+      pingoneTools: false,
+      mcpWrites: false,
+      tools: false,
+      agentConfig: false,
+      extensionConfig: false,
+      chat: 'locked',
+      source: 'starter',
+    });
+    const employee = evaluatePolicies(policies, { groups: ['Employees'], riskLevel: 'LOW', riskAction: 'allow' }, 15);
     expect(employee.policyTab).toBe(false);
     expect(employee.chat).toBe('allow');
+    expect(employee.tools).toBe(true);
   });
 
   it('does not duplicate a scaffold and fails closed on deny', () => {
     const incoming = scaffoldPolicies('Administrator', 10, 'ada');
     const first = mergeScaffold([], incoming);
-    expect(first.created).toHaveLength(4);
+    expect(first.created).toHaveLength(5);
     const second = mergeScaffold(first.policies, incoming);
     expect(second.created).toEqual([]);
     expect(featuresFromAuthorize({ decision: 'DENY' }, 5)).toEqual(failClosed(5));
@@ -134,8 +190,17 @@ describe('groups and authorize', () => {
       [listed(session, 'policy-1'), listed(admin, 'policy-9')],
       starters,
     );
-    expect(partial.dropIds).toEqual(['enterprise-agent:read-only', 'enterprise-agent:high-risk', 'custom-local']);
-    expect(partial.missing.map((policy) => policy.id)).toEqual(['enterprise-agent:read-only', 'enterprise-agent:high-risk']);
+    expect(partial.dropIds).toEqual([
+      'enterprise-agent:medium',
+      'enterprise-agent:read-only',
+      'enterprise-agent:high-risk',
+      'custom-local',
+    ]);
+    expect(partial.missing.map((policy) => policy.id)).toEqual([
+      'enterprise-agent:medium',
+      'enterprise-agent:read-only',
+      'enterprise-agent:high-risk',
+    ]);
     const kept = reconcilePolicyCache(
       [{ ...session, remoteId: 'policy-1' }],
       [{ ...listed(session, 'policy-1'), name: 'Renamed in PingOne' }],
