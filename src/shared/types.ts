@@ -133,6 +133,8 @@ export interface PolicyScaffoldResult {
   preview: PolicyView[];
   created: PolicyView[];
   policies: PolicyView[];
+  /** Set when the decision endpoint was left always-current, or its policy pointer did not stick. */
+  warning?: string;
 }
 
 export interface PolicyDryRun {
