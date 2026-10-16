@@ -133,8 +133,10 @@ export interface PolicyScaffoldResult {
   preview: PolicyView[];
   created: PolicyView[];
   policies: PolicyView[];
-  /** Which introspection clients Scaffold will use. Never contains a secret. */
+  /** Which introspection clients Scaffold will use. The SSO client id is not a secret. */
   introspectionNote?: string;
+  /** Set when the decision endpoint was left always-current, or its policy pointer did not stick. */
+  warning?: string;
 }
 
 export interface PolicyDryRun {
@@ -412,7 +414,6 @@ export interface SettingsView {
     generic: boolean;
     worker: boolean;
     agent: boolean;
-    userIntrospect: boolean;
   };
 }
 
@@ -428,8 +429,7 @@ export interface SettingsInput {
   genericApiKey?: string;
   workerClientSecret?: string;
   agentClientSecret?: string;
-  userIntrospectClientSecret?: string;
-  clearKeys?: Array<'openai' | 'anthropic' | 'generic' | 'worker' | 'agent' | 'userIntrospect'>;
+  clearKeys?: Array<'openai' | 'anthropic' | 'generic' | 'worker' | 'agent'>;
 }
 
 export interface ApprovalRequest {

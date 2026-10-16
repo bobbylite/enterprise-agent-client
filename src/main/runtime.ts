@@ -30,7 +30,7 @@ import {
   type AuthorizePolicy,
   type DecisionInput,
 } from '@shared/authorize/policy';
-import { decisionTokensReady, introspectionNote, redactSecret, type DecisionCall } from '@shared/authorize/framework';
+import { decisionTokensReady, introspectionNote as describeIntrospection, type DecisionCall } from '@shared/authorize/framework';
 import { plannedFeaturePolicy, provisionAuthorize } from '@shared/authorize/provision';
 import { AuthorizeClient, listRemotePolicies, postDecision, setRemotePolicyEnabled, syncRemoteScaffold } from '@shared/authorize/remote';
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
@@ -703,7 +703,7 @@ export class Runtime {
   async scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult> {
     this.requirePolicy();
     const incoming = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '');
-    const note = await this.introspectionNote();
+    const note = this.introspectionNote();
     if (!confirm) {
       const existing = this.options.db.listPolicies();
       return { preview: incoming.map(policyView), created: [], policies: existing.map(policyView), introspectionNote: note };
@@ -720,11 +720,9 @@ export class Runtime {
       const body = plannedFeaturePolicy(new Map(), this.options.config.access.adminGroup, this.options.config.authorize.delegations);
       mkdirSync(directory, { recursive: true });
       const text = `${JSON.stringify(body, null, 2)}\n`;
-      const secret = (await this.userIntrospectionCredentials()).clientSecret;
-      if (secret && text.includes(secret)) throw new Error('Dry run included an introspection secret.');
       writeFileSync(path, text);
-      const note = await this.introspectionNote();
-      this.options.log?.('debug', redactSecret(`Authorize dry run wrote ${path}\n${text}\n${note}`, secret));
+      const note = this.introspectionNote();
+      this.options.log?.('debug', `Authorize dry run wrote ${path}\n${text}\n${note}`);
       return { path, introspectionNote: note };
     }
     const token = await this.workerAccessToken();
@@ -744,10 +742,9 @@ export class Runtime {
       dryRunPath: path,
       log: this.options.log,
       logPath: this.options.logPath,
-      userIntrospection: await this.userIntrospectionCredentials(),
     });
     if (!result.dryRunPath) throw new Error('Dry run did not write the policy tree.');
-    return { path: result.dryRunPath, introspectionNote: await this.introspectionNote() };
+    return { path: result.dryRunPath, introspectionNote: this.introspectionNote() };
   }
 
   async setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]> {
@@ -1126,7 +1123,6 @@ export class Runtime {
         generic: false,
         worker: false,
         agent: false,
-        userIntrospect: false,
       },
     };
   }
@@ -1139,7 +1135,6 @@ export class Runtime {
       generic: Boolean(await this.options.secrets.get('genericApiKey')),
       worker: Boolean(await this.options.secrets.get('workerClientSecret')),
       agent: Boolean(await this.options.secrets.get('agentClientSecret')),
-      userIntrospect: Boolean(await this.options.secrets.get('userIntrospectClientSecret')),
     };
     return view;
   }
@@ -1159,7 +1154,6 @@ export class Runtime {
     await this.maybeSecret('genericApiKey', input.genericApiKey, input.clearKeys?.includes('generic'));
     await this.maybeSecret('workerClientSecret', input.workerClientSecret, input.clearKeys?.includes('worker'));
     await this.maybeSecret('agentClientSecret', input.agentClientSecret, input.clearKeys?.includes('agent'));
-    await this.maybeSecret('userIntrospectClientSecret', input.userIntrospectClientSecret, input.clearKeys?.includes('userIntrospect'));
     return this.getSettingsAsync();
   }
 
@@ -1708,7 +1702,7 @@ export class Runtime {
     const pending = this.options.db.listPolicies().filter((policy) => policy.scaffold && !policy.remoteId);
     const posted = await this.pushScaffold(pending, epoch);
     if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
-    if (this.options.config.tenant.mode === 'pingone') await this.provisionRealPolicies(epoch);
+    const warning = this.options.config.tenant.mode === 'pingone' ? await this.provisionRealPolicies(epoch) : undefined;
     if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
     const created = posted.length > 0 ? posted : merged.created;
     if (created.length > 0) {
@@ -1716,7 +1710,7 @@ export class Runtime {
     }
     this.decisionCache = null;
     await this.refreshFeatures();
-    return { preview, created: created.map(policyView), policies: this.options.db.listPolicies().map(policyView) };
+    return { preview, created: created.map(policyView), policies: this.options.db.listPolicies().map(policyView), warning };
   }
 
   private abandonedScaffold(incoming: AuthorizePolicy[]): PolicyScaffoldResult {
@@ -1727,7 +1721,7 @@ export class Runtime {
     };
   }
 
-  private async provisionRealPolicies(epoch: number): Promise<void> {
+  private async provisionRealPolicies(epoch: number): Promise<string | undefined> {
     if (epoch !== this.policyEpoch) return;
     const token = await this.workerAccessToken();
     const result = await provisionAuthorize({
@@ -1744,16 +1738,16 @@ export class Runtime {
       shouldContinue: () => epoch === this.policyEpoch,
       log: this.options.log,
       logPath: this.options.logPath,
-      userIntrospection: await this.userIntrospectionCredentials(),
     });
-    if (epoch !== this.policyEpoch || !result.decisionEndpointId) return;
+    if (epoch !== this.policyEpoch || !result.decisionEndpointId) return result.warning;
     this.options.db.setSetting('authorize.decisionEndpointId', result.decisionEndpointId);
     this.options.config.authorize.decisionEndpointId = result.decisionEndpointId;
     this.persistDecisionEndpoint(result.decisionEndpointId);
     for (const policy of result.policies) {
-      if (epoch !== this.policyEpoch) return;
+      if (epoch !== this.policyEpoch) return result.warning;
       this.options.db.upsertPolicy(policy);
     }
+    return result.warning;
   }
 
   private persistDecisionEndpoint(id: string): void {
@@ -2596,22 +2590,13 @@ export class Runtime {
   private async hydrateSecrets(): Promise<void> {
     await this.copyEnvSecret('workerClientSecret', 'PINGONE_WORKER_CLIENT_SECRET');
     await this.copyEnvSecret('agentClientSecret', 'PINGONE_AGENT_CLIENT_SECRET');
-    await this.copyEnvSecret('userIntrospectClientSecret', 'PINGONE_USER_INTROSPECT_CLIENT_SECRET');
     await this.copyEnvSecret('openaiApiKey', 'OPENAI_API_KEY');
     await this.copyEnvSecret('anthropicApiKey', 'ANTHROPIC_API_KEY');
     await this.copyEnvSecret('genericApiKey', 'GENERIC_PROVIDER_API_KEY');
   }
 
-  private async userIntrospectionCredentials(): Promise<{ clientId: string; clientSecret: string }> {
-    const configured = this.options.config.authorize.userIntrospection.clientId.trim();
-    const clientId = configured || this.env('PINGONE_USER_INTROSPECT_CLIENT_ID').trim();
-    const clientSecret = (await this.options.secrets.get('userIntrospectClientSecret'))?.trim() ?? '';
-    return { clientId, clientSecret };
-  }
-
-  private async introspectionNote(): Promise<string> {
-    const credentials = await this.userIntrospectionCredentials();
-    return introspectionNote(credentials.clientId, credentials.clientSecret.length > 0);
+  private introspectionNote(): string {
+    return describeIntrospection(this.options.config.tenant.clientId);
   }
 
   private async copyEnvSecret(account: string, envName: string): Promise<void> {

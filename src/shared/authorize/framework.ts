@@ -41,9 +41,8 @@ export const REQUEST_ATTRIBUTES = REQUEST_ATTRIBUTE_SPECS;
 /** Enterprise agent / token-exchange client. Delegation introspection keeps these. */
 export const CLIENT_ID_DEFINITION = 'introspect-client-id';
 export const CLIENT_SECRET_DEFINITION = 'introspect-client-secret';
-/** Custom resource that issues the SSO access token. User introspection must not reuse the agent client. */
+/** SSO login application. User introspection sends this id as client_id and does not authenticate. */
 export const USER_CLIENT_ID_DEFINITION = 'user-introspect-client-id';
-export const USER_CLIENT_SECRET_DEFINITION = 'user-introspect-client-secret';
 
 export const USER_SERVICE = 'EnterpriseAgent User Introspection';
 export const DELEGATION_SERVICE = 'EnterpriseAgent Delegation Introspection';
@@ -127,11 +126,14 @@ function requestSpec(name: string, valueType: AttributeValueType): AttributeSpec
 }
 
 function definitionSpec(name: string, secret: boolean, subject: string): AttributeSpec {
+  const description = secret
+    ? `${subject} client secret. Scaffold can copy it from the keychain into this Definition. It is never written to dry-run output, logs, or the decision trace.`
+    : name === USER_CLIENT_ID_DEFINITION
+      ? 'SSO login application client id. Scaffold copies tenant.clientId onto this Definition. User introspection sends it as client_id and does not use a secret.'
+      : `${subject} client id.`;
   return {
     name,
-    description: secret
-      ? `${subject} client secret. Scaffold can copy it from the keychain into this Definition. It is never written to dry-run output, logs, or the decision trace.`
-      : `${subject} client id.`,
+    description,
     valueType: typed('STRING'),
     resolvers: [{ type: 'CONSTANT', value: '', valueType: typed('STRING') }],
   };
@@ -157,8 +159,7 @@ export function attributePlan(): AttributeSpec[] {
       resolvers: [{ type: 'CONSTANT', value: '{}', valueType: typed('JSON') }],
     },
     ...REQUEST_ATTRIBUTE_SPECS.map((attribute) => requestSpec(attribute.name, attribute.valueType)),
-    definitionSpec(USER_CLIENT_ID_DEFINITION, false, 'SSO access-token custom resource'),
-    definitionSpec(USER_CLIENT_SECRET_DEFINITION, true, 'SSO access-token custom resource'),
+    definitionSpec(USER_CLIENT_ID_DEFINITION, false, 'SSO login application'),
     definitionSpec(CLIENT_ID_DEFINITION, false, 'Enterprise agent token-exchange client'),
     definitionSpec(CLIENT_SECRET_DEFINITION, true, 'Enterprise agent token-exchange client'),
     ...SERVICE_ATTRIBUTES.map((attribute) => serviceSpec(attribute.name, attribute.service, attribute.path)),
@@ -235,8 +236,7 @@ export function definitionBody(parentId: string, name: string, secret: boolean):
   if (constant?.type !== 'CONSTANT' || constant.value !== '' || spec.valueType.type !== 'STRING') {
     throw new Error(`${name} is not an empty STRING Definition.`);
   }
-  const secretName = name === CLIENT_SECRET_DEFINITION || name === USER_CLIENT_SECRET_DEFINITION;
-  if (secret !== secretName) throw new Error(`${name} secret flag does not match the spec.`);
+  if (secret !== (name === CLIENT_SECRET_DEFINITION)) throw new Error(`${name} secret flag does not match the spec.`);
   return attributeBody(name, { parentId });
 }
 
@@ -279,6 +279,33 @@ export function serviceBody(name: string, url: string, tokenAttributeId: string,
   return body;
 }
 
+/** User SSO introspection. PingOne accepts the access token and the SSO application client id with no Authorization header. */
+export function userIntrospectionServiceBody(name: string, url: string, tokenAttributeId: string, clientIdAttributeId: string): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    name,
+    description: 'SSO access-token introspection. No authentication. The form body sends the token and the SSO application client id.',
+    type: 'SERVICE',
+    serviceType: 'HTTP',
+    valueType: { type: 'JSON' },
+    serviceSettings: {
+      type: 'HTTP',
+      url,
+      verb: 'POST',
+      contentType: 'application/x-www-form-urlencoded',
+      body: `token={{${tokenAttributeId}}}&client_id={{${clientIdAttributeId}}}`,
+      headers: [],
+      maximumConcurrentRequests: SERVICE_LIMITS.maximumConcurrentRequests,
+      maximumRequestsPerSecond: SERVICE_LIMITS.maximumRequestsPerSecond,
+      timeoutMilliseconds: SERVICE_LIMITS.timeoutMilliseconds,
+      authentication: { type: 'NONE' },
+      tlsSettings: { tlsValidationType: 'DEFAULT' },
+    },
+  };
+  const error = serviceWriteError(body);
+  if (error) throw new Error(error);
+  return body;
+}
+
 export function serviceWriteError(body: unknown): string | null {
   if (!body || typeof body !== 'object') return 'INVALID_DATA service body is missing.';
   const record = body as {
@@ -312,7 +339,6 @@ export function serviceWriteError(body: unknown): string | null {
   if (typeof settings.url !== 'string' || !settings.url) return 'INVALID_DATA serviceSettings.url is required.';
   if (settings.verb !== 'POST') return 'INVALID_DATA serviceSettings.verb must be POST.';
   if (settings.contentType !== 'application/x-www-form-urlencoded') return 'INVALID_DATA serviceSettings.contentType is required.';
-  if (typeof settings.body !== 'string' || !/^token=\{\{[^}]+\}\}$/.test(settings.body)) return 'INVALID_DATA serviceSettings.body must be token={{attribute-id}}.';
   if (!Array.isArray(settings.headers)) return 'INVALID_DATA serviceSettings.headers must be an array.';
   if (!integerInRange(settings.maximumConcurrentRequests, 1, Number.MAX_SAFE_INTEGER)) {
     return 'INVALID_DATA OUT_OF_RANGE serviceSettings.maximumConcurrentRequests must be between 1 and 9223372036854775807.';
@@ -323,10 +349,8 @@ export function serviceWriteError(body: unknown): string | null {
   if (!integerInRange(settings.timeoutMilliseconds, 0, 3000)) {
     return 'INVALID_DATA OUT_OF_RANGE serviceSettings.timeoutMilliseconds must be between 0 and 3000.';
   }
-  const auth = settings.authentication;
-  if (auth?.type !== 'BASIC' || typeof auth.name?.id !== 'string' || !auth.name.id || typeof auth.password?.id !== 'string' || !auth.password.id) {
-    return 'INVALID_DATA serviceSettings.authentication must be BASIC and point at Definition ids.';
-  }
+  const requestError = introspectionRequestError(settings);
+  if (requestError) return requestError;
   if (settings.tlsSettings?.tlsValidationType !== 'DEFAULT') return 'INVALID_DATA serviceSettings.tlsSettings.tlsValidationType must be DEFAULT.';
   return null;
 }
@@ -506,6 +530,7 @@ export function decisionEndpointBody(): Record<string, unknown> {
 export function decisionEndpointUpdate(
   current: { id: string; name?: unknown; description?: unknown; recordRecentRequests?: unknown },
   versionId?: string,
+  policyId?: string,
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     id: current.id,
@@ -513,6 +538,7 @@ export function decisionEndpointUpdate(
     description: typeof current.description === 'string' ? current.description : 'Enterprise Agent decision endpoint.',
     recordRecentRequests: current.recordRecentRequests !== false,
   };
+  if (policyId) body.policy = { id: policyId };
   if (versionId) body.authorizationVersion = { id: versionId };
   return body;
 }
@@ -521,19 +547,32 @@ export function tagBody(): Record<string, unknown> {
   return { description: 'Enterprise Agent scaffold' };
 }
 
-/** Shown on Scaffold confirm and dry run. The secret value is never included. */
-export function introspectionNote(clientId: string, secretConfigured: boolean): string {
+/** Shown on Scaffold confirm and dry run. The client id is the SSO login application, not a secret. */
+export function introspectionNote(clientId: string): string {
   const id = clientId.trim() || '(not set)';
-  const secret = secretConfigured
-    ? 'The user client secret is stored in the keychain.'
-    : 'The user client secret is not set. Add it in Settings or PINGONE_USER_INTROSPECT_CLIENT_SECRET. Do not put it in enterprise.json.';
-  return `User SSO introspection uses client ${id} on ${USER_CLIENT_ID_DEFINITION} and ${USER_CLIENT_SECRET_DEFINITION}. ${secret} That client is the custom resource that issues the SSO access token. Delegation introspection keeps ${CLIENT_ID_DEFINITION} and ${CLIENT_SECRET_DEFINITION}, the enterprise agent client used for token exchange.`;
+  return `User SSO introspection has no authentication. The form body is token and client_id. client_id is ${id}, the SSO login application from tenant.clientId, stored on ${USER_CLIENT_ID_DEFINITION}. Delegation introspection keeps BASIC auth on ${CLIENT_ID_DEFINITION} and ${CLIENT_SECRET_DEFINITION}, the enterprise agent client used for token exchange.`;
 }
 
-export function redactSecret(text: string, secret: string): string {
-  const value = secret.trim();
-  if (value.length < 4 || !text.includes(value)) return text;
-  return text.split(value).join('[redacted]');
+function introspectionRequestError(settings: {
+  body?: unknown;
+  authentication?: { type?: unknown; name?: unknown; password?: unknown };
+}): string | null {
+  const auth = settings.authentication;
+  const body = settings.body;
+  if (auth?.type === 'NONE') {
+    if (auth.name != null || auth.password != null) return 'INVALID_DATA NONE authentication must not include name or password.';
+    if (typeof body !== 'string' || !/^token=\{\{[^}]+\}\}&client_id=\{\{[^}]+\}\}$/.test(body)) {
+      return 'INVALID_DATA unauthenticated introspection body must be token={{attribute-id}}&client_id={{attribute-id}}.';
+    }
+    return null;
+  }
+  if (auth?.type !== 'BASIC') return 'INVALID_DATA serviceSettings.authentication must be BASIC or NONE.';
+  const basic = auth as { name?: { id?: unknown }; password?: { id?: unknown } };
+  if (typeof basic.name?.id !== 'string' || !basic.name.id || typeof basic.password?.id !== 'string' || !basic.password.id) {
+    return 'INVALID_DATA BASIC authentication must point at Definition ids.';
+  }
+  if (typeof body !== 'string' || !/^token=\{\{[^}]+\}\}$/.test(body)) return 'INVALID_DATA BASIC introspection body must be token={{attribute-id}}.';
+  return null;
 }
 
 function integerInRange(value: unknown, min: number, max: number): boolean {

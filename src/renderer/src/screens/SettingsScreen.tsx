@@ -10,7 +10,6 @@ export function SettingsScreen({ state }: { state: AppState }) {
   const [genericApiKey, setGenericApiKey] = useState('');
   const [workerClientSecret, setWorkerClientSecret] = useState('');
   const [agentClientSecret, setAgentClientSecret] = useState('');
-  const [userIntrospectClientSecret, setUserIntrospectClientSecret] = useState('');
   const [message, setMessage] = useState('');
 
   useEffect(() => {
@@ -40,7 +39,6 @@ export function SettingsScreen({ state }: { state: AppState }) {
               genericApiKey: genericApiKey || undefined,
               workerClientSecret: workerClientSecret || undefined,
               agentClientSecret: agentClientSecret || undefined,
-              userIntrospectClientSecret: userIntrospectClientSecret || undefined,
             })
             .then((saved) => {
               setSettings(saved);
@@ -49,7 +47,6 @@ export function SettingsScreen({ state }: { state: AppState }) {
               setGenericApiKey('');
               setWorkerClientSecret('');
               setAgentClientSecret('');
-              setUserIntrospectClientSecret('');
               setMessage('Saved.');
             })
             .catch((caught: unknown) => setMessage(caught instanceof Error ? caught.message : String(caught)));
@@ -108,16 +105,8 @@ export function SettingsScreen({ state }: { state: AppState }) {
         <Field label={`AI Agent client secret ${settings.keys.agent ? '(stored)' : '(not set)'}`}>
           <input type="password" value={agentClientSecret} placeholder="Token exchange (PINGONE_AGENT_CLIENT_SECRET)" onChange={(event) => setAgentClientSecret(event.target.value)} />
         </Field>
-        <Field label={`User introspection secret ${settings.keys.userIntrospect ? '(stored)' : '(not set)'}`}>
-          <input
-            type="password"
-            value={userIntrospectClientSecret}
-            placeholder="SSO resource (PINGONE_USER_INTROSPECT_CLIENT_SECRET)"
-            onChange={(event) => setUserIntrospectClientSecret(event.target.value)}
-          />
-        </Field>
         <p className="muted">
-          Protect uses the worker secret. Token exchange uses the AI Agent secret. If that secret is empty, exchange falls back to the worker. User SSO introspection uses the custom resource that issues the access token, not the AI Agent client. The client id is authorize.userIntrospection.clientId.
+          Protect uses the worker secret. Token exchange uses the AI Agent secret. If that secret is empty, exchange falls back to the worker. User SSO introspection sends tenant.clientId as client_id and does not use a secret.
         </p>
         {message ? <p className="notice">{message}</p> : null}
         <button className="primary" type="submit">

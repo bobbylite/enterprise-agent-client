@@ -154,7 +154,10 @@ export function PolicyScreen({ onState }: { onState: (state: AppState) => void }
                       ? already
                       : `Created ${result.created.length} starter ${result.created.length === 1 ? 'policy' : 'policies'}.`;
                   const credentials = result.introspectionNote ?? introspectionNote;
-                  setNotice(credentials ? `${createdNote}\n${credentials}` : createdNote);
+                  const parts = [createdNote];
+                  if (credentials) parts.push(credentials);
+                  if (result.warning) parts.push(result.warning);
+                  setNotice(parts.join('\n'));
                 })
               }
             >

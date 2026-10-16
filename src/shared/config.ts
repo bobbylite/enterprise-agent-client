@@ -127,11 +127,6 @@ export const enterpriseConfigSchema = z.object({
       mcpServerId: z.string().min(1).default('pingone'),
       delegationAudience: z.string().default(''),
       alwaysCurrent: z.boolean().default(false),
-      userIntrospection: z
-        .object({
-          clientId: z.string().default(''),
-        })
-        .default({ clientId: '' }),
       delegations: z
         .array(
           z.object({
@@ -150,7 +145,6 @@ export const enterpriseConfigSchema = z.object({
       delegationAudience: '',
       alwaysCurrent: false,
       delegations: [],
-      userIntrospection: { clientId: '' },
     }),
   agents: z.array(
     z.object({

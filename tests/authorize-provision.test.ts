@@ -12,7 +12,6 @@ import {
   groupsComparisonUsesCollection,
   applyPolicyWrite,
   introspectionNote,
-  redactSecret,
   rulesReferenceIsApproved,
   scaffoldPlan,
   serviceWriteError,
@@ -34,7 +33,26 @@ function memoryStore(): TfStore & { rows: Map<string, { remoteId: string; conten
   };
 }
 
-function pingone(options?: { hidePolicyChildren?: boolean }) {
+const VERSION_TAG = 'https://api.pingone.com/v1/environments/env-1/authorizationVersions/ver-new/tag';
+
+function versionList(mode: 'items' | 'empty' | 'legacy'): unknown {
+  if (mode === 'empty') return { _embedded: { items: [] } };
+  if (mode === 'legacy') return { _embedded: { authorizationVersions: [{ id: 'ver-1', createdAt: '2026-08-15T17:00:52.000Z' }] } };
+  return {
+    _embedded: {
+      items: [
+        {
+          id: 'ver-new',
+          createdAt: '2026-08-15T17:00:52.000Z',
+          _links: { tag: { href: VERSION_TAG } },
+        },
+        { id: 'ver-old', createdAt: '2026-08-01T16:08:00.000Z' },
+      ],
+    },
+  };
+}
+
+function pingone(options?: { hidePolicyChildren?: boolean; versions?: 'items' | 'empty' | 'legacy'; dropEndpointPolicy?: boolean }) {
   const resources = new Map<string, Record<string, unknown>>();
   const calls: { method: string; url: string; body?: Record<string, unknown> }[] = [];
   let seq = 0;
@@ -47,19 +65,19 @@ function pingone(options?: { hidePolicyChildren?: boolean }) {
       calls.push({ method, url: target, body });
       const rejected = authorizeWriteError(target, method, body);
       if (rejected) return json({ code: 'INVALID_DATA', message: rejected }, 400);
-      const marker = target.match(/\/(authorizationAttributes|authorizationServices|authorizationPolicies|authorizationVersions|decisionEndpoints)(?:\/([^/?]+))?(?:\/(tag))?$/);
+      const marker = target.match(/\/(authorizationAttributes|authorizationServices|authorizationPolicies|authorizationVersions|decisionEndpoints)(?:\/([^/?]+))?(?:\/(tag))?(?:\?.*)?$/);
       if (!marker) return json({ message: target }, 404);
       const kind = marker[1] ?? '';
       const id = marker[2];
-      if (kind === 'authorizationVersions' && !id && method === 'GET') {
-        return json({ _embedded: { authorizationVersions: [{ id: 'ver-1' }] } });
-      }
-      if (marker[3] === 'tag' && method === 'PUT') return json({ id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+      if (kind === 'authorizationVersions' && !id && method === 'GET') return json(versionList(options?.versions ?? 'items'));
+      if (marker[3] === 'tag' && method === 'PUT') return json({ id: id ?? 'ver-new', tag: { updatedAt: '2026-08-15T17:00:52.000Z' } });
       if (id && method === 'DELETE') {
         resources.delete(id);
         return new Response(null, { status: 204 });
       }
-      if (id === 'ver-1' && method === 'GET') return json({ id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+      if (kind === 'authorizationVersions' && id && method === 'GET') {
+        return json({ id, tag: { updatedAt: '2026-08-15T17:00:52.000Z' } });
+      }
       if (!id) {
         if (method === 'GET') {
           const rows = [...resources.values()].filter((item) => item.kind === kind);
@@ -80,7 +98,10 @@ function pingone(options?: { hidePolicyChildren?: boolean }) {
       }
       if (method === 'GET') {
         const saved = resources.get(id);
-        return saved ? json(shown(saved, options?.hidePolicyChildren === true)) : json({ message: 'missing' }, 404);
+        if (!saved) return json({ message: 'missing' }, 404);
+        const visible = { ...shown(saved, options?.hidePolicyChildren === true) };
+        if (kind === 'decisionEndpoints' && options?.dropEndpointPolicy) delete visible.policy;
+        return json(visible);
       }
       const saved: Record<string, unknown> = { ...(resources.get(id) ?? {}), ...(body ?? {}), id, version: 'v2', kind };
       if (kind === 'decisionEndpoints' && body && !Object.prototype.hasOwnProperty.call(body, 'authorizationVersion')) {
@@ -159,7 +180,7 @@ describe('real Authorize scaffold', () => {
     expect(byName.get('introspect-client-id')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } });
     expect(byName.get('introspect-client-secret')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } });
     expect(byName.get('user-introspect-client-id')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } });
-    expect(byName.get('user-introspect-client-secret')?.resolvers[0]).toMatchObject({ type: 'CONSTANT', value: '', valueType: { type: 'STRING' } });
+    expect(byName.has('user-introspect-client-secret')).toBe(false);
     expect(byName.get('risk-score')?.valueType).toEqual({ type: 'NUMBER' });
     expect(byName.get('risk-score')?.resolvers[0]?.valueType).toEqual({ type: 'NUMBER' });
     expect(plan.services.map((service) => service.valueType)).toEqual([{ type: 'JSON' }, { type: 'JSON' }]);
@@ -185,7 +206,7 @@ describe('real Authorize scaffold', () => {
     expect(posts).toContain('authorizationAttributes:tx-token');
     expect(posts).toContain('authorizationAttributes:risk-score');
     expect(posts).toContain('authorizationAttributes:user-introspect-client-id');
-    expect(posts).toContain('authorizationAttributes:user-introspect-client-secret');
+    expect(posts).not.toContain('authorizationAttributes:user-introspect-client-secret');
     expect(posts).toContain('authorizationAttributes:introspect-client-secret');
     expect(posts).toContain('authorizationServices:EnterpriseAgent User Introspection');
     expect(posts).toContain('authorizationServices:EnterpriseAgent Delegation Introspection');
@@ -225,20 +246,23 @@ describe('real Authorize scaffold', () => {
     const service = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'EnterpriseAgent User Introspection');
     expect(service?.body).not.toHaveProperty('parent');
     const settings = service?.body?.serviceSettings as {
-      authentication: { type: string; name: { id: string }; password: { id: string } };
+      authentication: { type: string; name?: { id: string }; password?: { id: string } };
       body: string;
       url: string;
+      contentType: string;
       timeoutMilliseconds: number;
     };
-    expect(settings.authentication.type).toBe('BASIC');
-    expect(settings.authentication.name.id).toBe(store.get('attribute', 'user-introspect-client-id')?.remoteId);
-    expect(settings.authentication.password.id).toBe(store.get('attribute', 'user-introspect-client-secret')?.remoteId);
-    expect(settings.authentication.name.id).not.toBe(store.get('attribute', 'introspect-client-id')?.remoteId);
+    const userClientAttributeId = store.get('attribute', 'user-introspect-client-id')?.remoteId;
+    expect(settings.authentication).toEqual({ type: 'NONE' });
+    expect(settings.contentType).toBe('application/x-www-form-urlencoded');
+    expect(settings.body).toBe(`token={{${store.get('attribute', 'access-token')?.remoteId}}}&client_id={{${userClientAttributeId}}}`);
     const delegation = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'EnterpriseAgent Delegation Introspection');
-    const delegationAuth = (delegation?.body?.serviceSettings as { authentication: { name: { id: string }; password: { id: string } } }).authentication;
+    const delegationAuth = (delegation?.body?.serviceSettings as { authentication: { type: string; name: { id: string }; password: { id: string } }; body: string }).authentication;
+    const delegationBody = (delegation?.body?.serviceSettings as { body: string }).body;
+    expect(delegationAuth.type).toBe('BASIC');
     expect(delegationAuth.name.id).toBe(store.get('attribute', 'introspect-client-id')?.remoteId);
     expect(delegationAuth.password.id).toBe(store.get('attribute', 'introspect-client-secret')?.remoteId);
-    expect(settings.body).toBe(`token={{${store.get('attribute', 'access-token')?.remoteId}}}`);
+    expect(delegationBody).toBe(`token={{${store.get('attribute', 'tx-token')?.remoteId}}}`);
     expect(settings.url).toBe('https://auth.pingone.com/env-1/as/introspect');
     expect(settings.timeoutMilliseconds).toBe(3000);
     expect(settings).toMatchObject({ maximumConcurrentRequests: 20, maximumRequestsPerSecond: 10, headers: [] });
@@ -277,8 +301,14 @@ describe('real Authorize scaffold', () => {
     expect(JSON.stringify(tree)).not.toContain('isApproved');
     expect(groupsComparisonUsesCollection()).toBe(true);
 
+    const policyId = store.get('policy', 'Enterprise Agent Features')?.remoteId;
     const endpointPut = fake.calls.find((call) => call.method === 'PUT' && call.url.includes('/decisionEndpoints/'));
-    expect(endpointPut?.body?.authorizationVersion).toEqual({ id: 'ver-1' });
+    expect(fake.calls.some((call) => call.method === 'GET' && call.url.includes('/authorizationVersions?limit=25'))).toBe(true);
+    expect(fake.calls.some((call) => call.method === 'PUT' && call.url === VERSION_TAG)).toBe(true);
+    expect(endpointPut?.body?.authorizationVersion).toEqual({ id: 'ver-new' });
+    expect(endpointPut?.body?.policy).toEqual({ id: policyId });
+    expect(first.warning).toBeUndefined();
+    expect(first.decisionEndpointId).toBe(store.get('endpoint', 'Enterprise Agent')?.remoteId);
 
     const writes = fake.calls.filter((call) => call.method === 'POST' || call.method === 'PUT').length;
     fake.resources.set('later-orphan', {
@@ -304,12 +334,12 @@ describe('real Authorize scaffold', () => {
     expect(fake.resources.has('later-orphan')).toBe(true);
   });
 
-  it('points an existing user service at the SSO client and leaves the policy tree alone', async () => {
+  it('updates an existing user service to unauthenticated introspection and leaves policies alone', async () => {
     const store = memoryStore();
     const fake = pingone();
     const enterprise = config();
-    enterprise.authorize.userIntrospection.clientId = 'sso-resource-client';
-    const secret = 'sso-resource-secret-value';
+    const ssoClientId = '6853c008-afce-4560-9329-02ff7c8fd8bc';
+    enterprise.tenant.clientId = ssoClientId;
     const logs: string[] = [];
     await provisionAuthorize({
       config: enterprise,
@@ -319,23 +349,23 @@ describe('real Authorize scaffold', () => {
       adminGroup: 'Administrator',
       delegations: enterprise.authorize.delegations,
       alwaysCurrent: false,
-      userIntrospection: { clientId: 'sso-resource-client', clientSecret: secret },
       log: (_level, message) => logs.push(message),
     });
+    const userClientPost = fake.calls.find((call) => call.method === 'POST' && call.body?.name === 'user-introspect-client-id');
+    expect((userClientPost?.body?.resolvers as { value?: string }[] | undefined)?.[0]?.value).toBe(ssoClientId);
+    expect(fake.calls.some((call) => call.body?.name === 'user-introspect-client-secret')).toBe(false);
     const userServiceId = store.get('service', 'EnterpriseAgent User Introspection')?.remoteId ?? '';
     const delegationServiceId = store.get('service', 'EnterpriseAgent Delegation Introspection')?.remoteId ?? '';
     const agentClientId = store.get('attribute', 'introspect-client-id')?.remoteId ?? '';
     const agentSecretId = store.get('attribute', 'introspect-client-secret')?.remoteId ?? '';
+    const accessId = store.get('attribute', 'access-token')?.remoteId ?? '';
     const userClientAttribute = store.get('attribute', 'user-introspect-client-id')?.remoteId ?? '';
-    const userSecretAttribute = store.get('attribute', 'user-introspect-client-secret')?.remoteId ?? '';
     const userService = fake.resources.get(userServiceId);
-    const settings = userService?.serviceSettings as { authentication: { name: { id: string }; password: { id: string } } };
-    settings.authentication.name.id = agentClientId;
-    settings.authentication.password.id = agentSecretId;
+    const settings = userService?.serviceSettings as { authentication: { type: string; name?: { id: string }; password?: { id: string } }; body: string };
+    settings.authentication = { type: 'BASIC', name: { id: agentClientId }, password: { id: agentSecretId } };
+    settings.body = `token={{${accessId}}}`;
     fake.resources.delete(userClientAttribute);
-    fake.resources.delete(userSecretAttribute);
     store.rows.delete('attribute:user-introspect-client-id');
-    store.rows.delete('attribute:user-introspect-client-secret');
     const mark = fake.calls.length;
     const deletes = fake.calls.filter((call) => call.method === 'DELETE').length;
     await provisionAuthorize({
@@ -346,31 +376,47 @@ describe('real Authorize scaffold', () => {
       adminGroup: 'Administrator',
       delegations: enterprise.authorize.delegations,
       alwaysCurrent: false,
-      userIntrospection: { clientId: 'sso-resource-client', clientSecret: secret },
       log: (_level, message) => logs.push(message),
     });
     const added = fake.calls.slice(mark);
     const posts = added.filter((call) => call.method === 'POST').map((call) => String(call.body?.name));
     expect(posts).toContain('user-introspect-client-id');
-    expect(posts).toContain('user-introspect-client-secret');
+    expect(posts).not.toContain('user-introspect-client-secret');
     expect(posts).not.toContain('Enterprise Agent Features');
+    const createdClient = added.find((call) => call.method === 'POST' && call.body?.name === 'user-introspect-client-id');
+    expect((createdClient?.body?.resolvers as { value?: string }[] | undefined)?.[0]?.value).toBe(ssoClientId);
     const servicePut = added.find((call) => call.method === 'PUT' && call.url.includes(`/authorizationServices/${userServiceId}`));
-    const auth = (servicePut?.body?.serviceSettings as { authentication: { name: { id: string }; password: { id: string } } }).authentication;
-    expect(auth.name.id).toBe(store.get('attribute', 'user-introspect-client-id')?.remoteId);
-    expect(auth.password.id).toBe(store.get('attribute', 'user-introspect-client-secret')?.remoteId);
-    expect(auth.name.id).not.toBe(agentClientId);
+    const putSettings = servicePut?.body?.serviceSettings as { authentication: { type: string; name?: unknown; password?: unknown }; body: string };
+    const nextClientId = store.get('attribute', 'user-introspect-client-id')?.remoteId;
+    expect(putSettings.authentication).toEqual({ type: 'NONE' });
+    expect(putSettings.body).toBe(`token={{${accessId}}}&client_id={{${nextClientId}}}`);
     expect(added.filter((call) => call.method === 'PUT' && call.url.includes(`/authorizationServices/${delegationServiceId}`))).toHaveLength(0);
     expect(added.filter((call) => call.method === 'DELETE')).toHaveLength(0);
     expect(fake.calls.filter((call) => call.method === 'DELETE')).toHaveLength(deletes);
-    const secretPost = added.find((call) => call.method === 'POST' && call.body?.name === 'user-introspect-client-secret');
-    expect(JSON.stringify(secretPost?.body)).toContain(secret);
-    expect(logs.join('\n')).not.toContain(secret);
-    expect(redactSecret(`secret ${secret}`, secret)).toBe('secret [redacted]');
-    const note = introspectionNote('sso-resource-client', true);
-    expect(note).toContain('sso-resource-client');
+    const note = introspectionNote(ssoClientId);
+    expect(note).toContain(ssoClientId);
+    expect(note).toContain('no authentication');
     expect(note).toContain('user-introspect-client-id');
     expect(note).toContain('introspect-client-id');
-    expect(note).not.toContain(secret);
+    expect(note).not.toContain('user-introspect-client-secret');
+    enterprise.tenant.clientId = 'updated-sso-client';
+    const updatedMark = fake.calls.length;
+    await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+      log: (_level, message) => logs.push(message),
+    });
+    const updated = fake.calls.slice(updatedMark);
+    const attributePut = updated.find((call) => call.method === 'PUT' && call.url.includes('/authorizationAttributes/'));
+    expect(JSON.stringify(attributePut?.body)).toContain('updated-sso-client');
+    expect(updated.filter((call) => call.method === 'POST' && String(call.body?.name).includes('Enterprise Agent'))).toHaveLength(0);
+    expect(updated.filter((call) => call.method === 'PUT' && call.url.includes('/authorizationServices/'))).toHaveLength(0);
+    expect(updated.filter((call) => call.method === 'PUT' && call.url.includes('/authorizationPolicies/'))).toHaveLength(0);
     const directory = mkdtempSync(join(tmpdir(), 'authorize-dry-'));
     const path = join(directory, 'authorize-policy-tree.json');
     await provisionAuthorize({
@@ -381,24 +427,75 @@ describe('real Authorize scaffold', () => {
       adminGroup: 'Administrator',
       delegations: enterprise.authorize.delegations,
       alwaysCurrent: false,
-      userIntrospection: { clientId: 'sso-resource-client', clientSecret: secret },
       dryRun: true,
       dryRunPath: path,
       log: (_level, message) => logs.push(message),
     });
     const dryRun = readFileSync(path, 'utf8');
-    expect(dryRun).not.toContain(secret);
     expect(dryRun).toContain('Enterprise Agent Features');
-    expect(logs.join('\n')).not.toContain(secret);
+    expect(dryRun).not.toContain(ssoClientId);
   });
 
-  it('rejects an introspection secret stored in enterprise.json', () => {
-    const raw = JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')) as {
-      authorize: { userIntrospection: { clientId: string; clientSecret?: string } };
-    };
-    raw.authorize.userIntrospection.clientSecret = 'do-not-commit';
+  it('rejects a client secret stored in enterprise.json', () => {
+    const raw = JSON.parse(readFileSync('config/enterprise.example.json', 'utf8')) as { authorize: { clientSecret?: string } };
+    raw.authorize.clientSecret = 'do-not-commit';
     expect(() => parseEnterpriseConfig(raw)).toThrow(/clientSecret/);
   });
+
+  it('leaves the decision endpoint always-current when PingOne returns no authorization version', async () => {
+    const logs: string[] = [];
+    for (const versions of ['empty', 'legacy'] as const) {
+      const store = memoryStore();
+      const fake = pingone({ versions });
+      const enterprise = config();
+      const result = await provisionAuthorize({
+        config: enterprise,
+        accessToken: 'worker-token',
+        client: fake.client,
+        store,
+        adminGroup: 'Administrator',
+        delegations: enterprise.authorize.delegations,
+        alwaysCurrent: false,
+        log: (_level, message) => logs.push(message),
+      });
+      const policyId = store.get('policy', 'Enterprise Agent Features')?.remoteId;
+      const endpointPut = fake.calls.find((call) => call.method === 'PUT' && call.url.includes('/decisionEndpoints/'));
+      expect(result.decisionEndpointId).toBe(store.get('endpoint', 'Enterprise Agent')?.remoteId);
+      expect(result.warning).toMatch(/always-current/);
+      expect(result.warning).toMatch(/Versions response/);
+      expect(endpointPut?.body?.policy).toEqual({ id: policyId });
+      expect(endpointPut?.body).not.toHaveProperty('authorizationVersion');
+      expect(fake.calls.some((call) => call.method === 'PUT' && call.url.includes('/authorizationVersions/'))).toBe(false);
+    }
+    expect(logs.join('\n')).toContain('"items":[]');
+    expect(logs.join('\n')).toContain('authorizationVersions');
+    expect(logs.join('\n')).toContain('ver-1');
+  });
+
+  it('keeps the tagged endpoint when the policy pointer does not stick', async () => {
+    const store = memoryStore();
+    const fake = pingone({ dropEndpointPolicy: true });
+    const enterprise = config();
+    const logs: string[] = [];
+    const result = await provisionAuthorize({
+      config: enterprise,
+      accessToken: 'worker-token',
+      client: fake.client,
+      store,
+      adminGroup: 'Administrator',
+      delegations: enterprise.authorize.delegations,
+      alwaysCurrent: false,
+      log: (_level, message) => logs.push(message),
+    });
+    const policyId = store.get('policy', 'Enterprise Agent Features')?.remoteId;
+    const endpointPut = fake.calls.find((call) => call.method === 'PUT' && call.url.includes('/decisionEndpoints/'));
+    expect(result.decisionEndpointId).toBeTruthy();
+    expect(result.warning).toMatch(new RegExp(`did not keep policy ${policyId}`));
+    expect(endpointPut?.body?.authorizationVersion).toEqual({ id: 'ver-new' });
+    expect(endpointPut?.body?.policy).toEqual({ id: policyId });
+    expect(logs.join('\n')).toMatch(/did not keep policy/);
+  });
+
 
   it('creates the child policies inline and deletes only the exact-name orphans', async () => {
     const store = memoryStore();

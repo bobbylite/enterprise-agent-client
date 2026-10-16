@@ -7,7 +7,6 @@ import {
   CLIENT_ID_DEFINITION,
   CLIENT_SECRET_DEFINITION,
   USER_CLIENT_ID_DEFINITION,
-  USER_CLIENT_SECRET_DEFINITION,
   DECISION_ENDPOINT,
   DELEGATION_POLICY,
   DELEGATION_SERVICE,
@@ -23,9 +22,9 @@ import {
   delegationRulePlans,
   featurePolicyTree,
   introspectUrl,
-  redactSecret,
   scaffoldPlan,
   serviceBody,
+  userIntrospectionServiceBody,
   summarizePolicyChildren,
   tagBody,
   userRulePlans,
@@ -58,14 +57,14 @@ export interface ProvisionInput {
   dryRunPath?: string;
   log?: (level: 'debug' | 'error', message: string) => void;
   logPath?: string;
-  /** SSO resource client. The secret is sent only on the Definition write and is redacted from logs. */
-  userIntrospection?: { clientId: string; clientSecret: string };
 }
 
 export interface ProvisionResult {
   decisionEndpointId: string;
   policies: AuthorizePolicy[];
   dryRunPath?: string;
+  /** Set when the endpoint was left always-current because no authorization version could be tagged. */
+  warning?: string;
 }
 
 interface Resource extends Record<string, unknown> {
@@ -75,22 +74,6 @@ interface Resource extends Record<string, unknown> {
 }
 
 export async function provisionAuthorize(input: ProvisionInput): Promise<ProvisionResult> {
-  const secret = input.userIntrospection?.clientSecret?.trim() ?? '';
-  if (secret && input.log) {
-    const log = input.log;
-    input = { ...input, log: (level, message) => log(level, redactSecret(message, secret)) };
-  }
-  try {
-    return await provisionAuthorizeBody(input);
-  } catch (error) {
-    if (secret && error instanceof Error && error.message.includes(secret)) {
-      throw new Error(redactSecret(error.message, secret), { cause: error });
-    }
-    throw error;
-  }
-}
-
-async function provisionAuthorizeBody(input: ProvisionInput): Promise<ProvisionResult> {
   const api = apiBase(input.config);
   const headers = {
     Authorization: `Bearer ${input.accessToken}`,
@@ -120,23 +103,13 @@ async function provisionAuthorizeBody(input: ProvisionInput): Promise<ProvisionR
     requestIds.set(attribute.name, saved.id);
   }
 
-  const userClientValue = input.userIntrospection?.clientId.trim() ?? '';
-  const userSecretValue = input.userIntrospection?.clientSecret.trim() ?? '';
+  const userClientValue = input.config.tenant.clientId.trim();
   const userClientId = await ensureResource(
     input,
     `${api}/authorizationAttributes`,
     'attribute',
     USER_CLIENT_ID_DEFINITION,
     attributeBody(USER_CLIENT_ID_DEFINITION, { parentId: parent.id, ...(userClientValue ? { constantValue: userClientValue } : {}) }),
-    headers,
-    going,
-  );
-  const userSecret = await ensureResource(
-    input,
-    `${api}/authorizationAttributes`,
-    'attribute',
-    USER_CLIENT_SECRET_DEFINITION,
-    attributeBody(USER_CLIENT_SECRET_DEFINITION, { parentId: parent.id, ...(userSecretValue ? { constantValue: userSecretValue } : {}) }),
     headers,
     going,
   );
@@ -159,7 +132,6 @@ async function provisionAuthorizeBody(input: ProvisionInput): Promise<ProvisionR
     going,
   );
   assertDefinition(userClientId, parent.id);
-  assertDefinition(userSecret, parent.id);
   assertDefinition(clientId, parent.id);
   assertDefinition(secret, parent.id);
 
@@ -171,7 +143,7 @@ async function provisionAuthorizeBody(input: ProvisionInput): Promise<ProvisionR
     `${api}/authorizationServices`,
     'service',
     USER_SERVICE,
-    serviceBody(USER_SERVICE, url, accessId, userClientId.id, userSecret.id),
+    userIntrospectionServiceBody(USER_SERVICE, url, accessId, userClientId.id),
     headers,
     going,
   );
@@ -184,7 +156,7 @@ async function provisionAuthorizeBody(input: ProvisionInput): Promise<ProvisionR
     headers,
     going,
   );
-  assertService(userService, accessId, userClientId.id, userSecret.id);
+  assertUserService(userService, accessId, userClientId.id);
   assertService(delegationService, txId, clientId.id, secret.id);
 
   const serviceIds = new Map<string, string>([
@@ -216,10 +188,11 @@ async function provisionAuthorizeBody(input: ProvisionInput): Promise<ProvisionR
   const root = await postFeatureTree(input, api, headers, attributeIds, userPlans, delegationPlans, going);
   if (!root) return abandoned(input);
 
-  const endpoint = await ensureDecisionEndpoint(input, api, headers, going);
+  const endpoint = await ensureDecisionEndpoint(input, api, headers, going, root.parent.id);
   return {
-    decisionEndpointId: endpoint.id,
+    decisionEndpointId: endpoint.endpoint.id,
     policies: [libraryPolicy(root.parent, ROOT_POLICY), libraryPolicy(root.user, USER_POLICY), libraryPolicy(root.delegation, DELEGATION_POLICY)],
+    warning: endpoint.warning,
   };
 }
 
@@ -235,8 +208,6 @@ async function dryRunFeaturePolicy(input: ProvisionInput, api: string, headers: 
   const path = input.dryRunPath;
   if (!path) throw new Error('Dry run needs a file path.');
   const text = `${JSON.stringify(body, null, 2)}\n`;
-  const secret = input.userIntrospection?.clientSecret?.trim() ?? '';
-  if (secret && text.includes(secret)) throw new Error('Dry run included an introspection secret.');
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, text);
   input.log?.('debug', `Authorize dry run wrote ${path}\n${text}`);
@@ -461,7 +432,13 @@ async function deleteOrphanPolicies(
   }
 }
 
-async function ensureDecisionEndpoint(input: ProvisionInput, api: string, headers: Record<string, string>, going: () => boolean): Promise<Resource> {
+async function ensureDecisionEndpoint(
+  input: ProvisionInput,
+  api: string,
+  headers: Record<string, string>,
+  going: () => boolean,
+  policyId: string,
+): Promise<{ endpoint: Resource; warning?: string }> {
   const endpoint = await ensureResource(
     input,
     `${api}/decisionEndpoints`,
@@ -471,39 +448,117 @@ async function ensureDecisionEndpoint(input: ProvisionInput, api: string, header
     headers,
     going,
   );
-  const currentEndpoint = await readResource(input, `${api}/decisionEndpoints/${endpoint.id}`, headers);
-  const already = (currentEndpoint.authorizationVersion as { id?: string } | undefined)?.id;
-  if (!input.alwaysCurrent && already) return currentEndpoint;
   if (input.alwaysCurrent) {
-    const current = await readResource(input, `${api}/decisionEndpoints/${endpoint.id}`, headers);
-    if (current.authorizationVersion) {
-      const detached = decisionEndpointUpdate(current);
-      const written = await sendJson(input, `${api}/decisionEndpoints/${endpoint.id}`, 'PUT', headers, detached);
-      if (written.authorizationVersion) throw new Error('PingOne kept a fixed authorization version in always-current mode.');
-    }
-    return endpoint;
+    const read = await writeDecisionEndpoint(input, api, headers, endpoint.id, undefined, policyId);
+    return { endpoint: read };
   }
-  const versionId = await latestVersionId(input, api, headers);
-  await sendJson(input, `${api}/authorizationVersions/${versionId}/tag`, 'PUT', headers, tagBody());
-  const tagged = await readResource(input, `${api}/authorizationVersions/${versionId}`, headers);
-  if (!tagged.tag && !tagged.version) throw new Error('PingOne did not return the tagged authorization version.');
+  const listed = await latestAuthorizationVersion(input, api, headers);
+  if (!listed.id) return leaveAlwaysCurrent(input, api, headers, endpoint, policyId, alwaysCurrentWarning(listed.raw));
   const current = await readResource(input, `${api}/decisionEndpoints/${endpoint.id}`, headers);
-  const attached = decisionEndpointUpdate(current, versionId);
-  await sendJson(input, `${api}/decisionEndpoints/${endpoint.id}`, 'PUT', headers, attached);
-  const read = await readResource(input, `${api}/decisionEndpoints/${endpoint.id}`, headers);
-  const attachedId = (read.authorizationVersion as { id?: string } | undefined)?.id;
-  if (attachedId !== versionId) throw new Error('PingOne decision endpoint did not keep the tagged authorization version.');
+  const attached = (current.authorizationVersion as { id?: string } | undefined)?.id;
+  const pointed = (current.policy as { id?: string } | undefined)?.id;
+  if (attached === listed.id && pointed === policyId) return { endpoint: current };
+  try {
+    const tagUrl = listed.tagUrl || `${api}/authorizationVersions/${listed.id}/tag`;
+    await sendJson(input, tagUrl, 'PUT', headers, tagBody());
+    const tagged = await readResource(input, `${api}/authorizationVersions/${listed.id}`, headers);
+    if (!tagged.tag && !tagged.version) throw new Error('PingOne did not return the tagged authorization version.');
+    const read = await writeDecisionEndpoint(input, api, headers, endpoint.id, listed.id, policyId);
+    const attachedId = (read.authorizationVersion as { id?: string } | undefined)?.id;
+    if (attachedId !== listed.id) throw new Error('PingOne decision endpoint did not keep the tagged authorization version.');
+    const kept = (read.policy as { id?: string } | undefined)?.id;
+    if (kept !== policyId) {
+      const warning = `The decision endpoint did not keep policy ${policyId}. It returned ${kept ?? 'no policy id'}.`;
+      input.log?.('error', warning);
+      return { endpoint: read, warning };
+    }
+    return { endpoint: read };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return leaveAlwaysCurrent(input, api, headers, endpoint, policyId, `${message}\n${alwaysCurrentWarning(listed.raw)}`);
+  }
+}
+
+async function leaveAlwaysCurrent(
+  input: ProvisionInput,
+  api: string,
+  headers: Record<string, string>,
+  endpoint: Resource,
+  policyId: string,
+  warning: string,
+): Promise<{ endpoint: Resource; warning: string }> {
+  input.log?.('error', warning);
+  try {
+    const read = await writeDecisionEndpoint(input, api, headers, endpoint.id, undefined, policyId);
+    return { endpoint: read, warning };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    input.log?.('error', message);
+    return { endpoint, warning: `${warning}\n${message}` };
+  }
+}
+
+async function writeDecisionEndpoint(
+  input: ProvisionInput,
+  api: string,
+  headers: Record<string, string>,
+  endpointId: string,
+  versionId: string | undefined,
+  policyId: string,
+): Promise<Resource> {
+  const current = await readResource(input, `${api}/decisionEndpoints/${endpointId}`, headers);
+  const attached = (current.authorizationVersion as { id?: string } | undefined)?.id;
+  const pointed = (current.policy as { id?: string } | undefined)?.id;
+  const versionMatches = versionId ? attached === versionId : !attached;
+  if (versionMatches && pointed === policyId) return current;
+  const body = decisionEndpointUpdate(current, versionId, policyId);
+  await sendJson(input, `${api}/decisionEndpoints/${endpointId}`, 'PUT', headers, body);
+  const read = await readResource(input, `${api}/decisionEndpoints/${endpointId}`, headers);
+  if (versionId) return read;
+  if (read.authorizationVersion) throw new Error('PingOne kept a fixed authorization version in always-current mode.');
   return read;
 }
 
-async function latestVersionId(input: ProvisionInput, api: string, headers: Record<string, string>): Promise<string> {
-  const response = await input.client.request(`${api}/authorizationVersions`, { headers });
-  if (!response.ok) throw new Error(await errorText(response, 'PingOne did not list authorization versions'));
-  const body = (await response.json()) as Record<string, unknown>;
-  const rows = embedded(body, 'authorizationVersions');
-  const latest = rows[rows.length - 1];
-  if (!latest || typeof latest.id !== 'string' || !latest.id) throw new Error('PingOne did not return an authorization version to tag.');
-  return latest.id;
+function alwaysCurrentWarning(raw: string): string {
+  return `PingOne did not return an authorization version to tag. The Enterprise Agent decision endpoint is always-current, which is for development and debugging.\nVersions response: ${raw}`;
+}
+
+async function latestAuthorizationVersion(
+  input: ProvisionInput,
+  api: string,
+  headers: Record<string, string>,
+): Promise<{ id: string; tagUrl?: string; raw: string }> {
+  const response = await input.client.request(`${api}/authorizationVersions?limit=25`, { headers });
+  const raw = await response.text();
+  if (!response.ok) return { id: '', raw };
+  let body: unknown;
+  try {
+    body = JSON.parse(raw) as unknown;
+  } catch {
+    return { id: '', raw };
+  }
+  const latest = newestVersion(versionItems(body));
+  if (!latest?.id) return { id: '', raw };
+  const links = latest._links as { tag?: { href?: unknown } } | undefined;
+  const tagUrl = typeof links?.tag?.href === 'string' ? links.tag.href : undefined;
+  return { id: latest.id, tagUrl, raw };
+}
+
+/** The list example returns `_embedded.items`, newest `createdAt` first. */
+function versionItems(body: unknown): Resource[] {
+  if (!body || typeof body !== 'object') return [];
+  const embeddedBlock = (body as { _embedded?: Record<string, unknown> })._embedded;
+  const items = embeddedBlock?.items;
+  if (!Array.isArray(items)) return [];
+  return items.filter((item): item is Resource => !!item && typeof item === 'object' && typeof (item as Resource).id === 'string');
+}
+
+function newestVersion(rows: Resource[]): Resource | undefined {
+  const dated = rows.filter((row) => typeof row.createdAt === 'string' && row.createdAt);
+  if (dated.length > 0) {
+    return [...dated].sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)))[0];
+  }
+  return rows[0];
 }
 
 async function ensureResource(
@@ -592,8 +647,8 @@ async function alignService(
   current: Resource,
   intended: Record<string, unknown>,
 ): Promise<Resource> {
-  const authMismatch = serviceAuthMismatch(current, intended);
-  if (!serviceMissingLimits(current) && !authMismatch) return current;
+  const requestMismatch = serviceRequestMismatch(current, intended);
+  if (!serviceMissingLimits(current) && !requestMismatch) return current;
   const version = typeof current.version === 'string' ? current.version : '';
   if (!version) throw new Error(`PingOne service ${String(current.name)} is missing a version, so it cannot be repaired.`);
   const body = { ...intended, id: current.id, version };
@@ -602,23 +657,29 @@ async function alignService(
   const read = await readResource(input, `${collection}/${current.id}`, headers);
   if (read.id !== current.id) throw new Error(`PingOne service ${String(current.name)} read-back id did not match the repair.`);
   if (serviceMissingLimits(read)) throw new Error(`PingOne service ${String(current.name)} is still missing its rate limits.`);
-  if (serviceAuthMismatch(read, intended)) throw new Error(`PingOne service ${String(current.name)} Basic auth does not point at the Definitions.`);
+  if (serviceRequestMismatch(read, intended)) throw new Error(`PingOne service ${String(current.name)} did not keep the introspection request.`);
   return read;
 }
 
-function serviceAuthMismatch(current: Resource, intended: Record<string, unknown>): boolean {
-  const left = serviceAuthIds(current);
-  const right = serviceAuthIds(intended);
-  return left.name !== right.name || left.password !== right.password;
+function serviceRequestMismatch(current: Resource, intended: Record<string, unknown>): boolean {
+  const left = serviceRequest(current);
+  const right = serviceRequest(intended);
+  return left.type !== right.type || left.name !== right.name || left.password !== right.password || left.body !== right.body;
 }
 
-function serviceAuthIds(body: Record<string, unknown>): { name: string; password: string } {
+function serviceRequest(body: Record<string, unknown>): { type: string; name: string; password: string; body: string } {
   const settings = body.serviceSettings as {
-    authentication?: { name?: { id?: unknown }; password?: { id?: unknown } };
+    body?: unknown;
+    authentication?: { type?: unknown; name?: { id?: unknown }; password?: { id?: unknown } };
   } | undefined;
   const name = settings?.authentication?.name?.id;
   const password = settings?.authentication?.password?.id;
-  return { name: typeof name === 'string' ? name : '', password: typeof password === 'string' ? password : '' };
+  return {
+    type: typeof settings?.authentication?.type === 'string' ? settings.authentication.type : '',
+    name: typeof name === 'string' ? name : '',
+    password: typeof password === 'string' ? password : '',
+    body: typeof settings?.body === 'string' ? settings.body : '',
+  };
 }
 
 function constantNeedsUpdate(current: Resource, intended: Record<string, unknown>): boolean {
@@ -753,28 +814,43 @@ function assertDefinition(resource: Resource, parentId: string): void {
   assertResolverValueType(resource, 'STRING');
 }
 
+interface ServiceSettings {
+  authentication?: { type?: string; name?: { id?: string }; password?: { id?: string } };
+  body?: string;
+  timeoutMilliseconds?: number;
+  maximumConcurrentRequests?: number;
+  maximumRequestsPerSecond?: number;
+  headers?: unknown;
+  contentType?: string;
+}
+
+function assertUserService(resource: Resource, tokenAttributeId: string, clientIdAttributeId: string): void {
+  const settings = assertServiceShape(resource);
+  if (settings.authentication?.type !== 'NONE') throw new Error(`${String(resource.name)} is not unauthenticated.`);
+  if (settings.authentication.name || settings.authentication.password) throw new Error(`${String(resource.name)} still has authentication credentials.`);
+  const expected = `token={{${tokenAttributeId}}}&client_id={{${clientIdAttributeId}}}`;
+  if (settings.body !== expected) throw new Error(`${String(resource.name)} body is not token and client_id.`);
+}
+
 function assertService(resource: Resource, tokenAttributeId: string, clientId: string, secretId: string): void {
-  if (resource.parent) throw new Error(`${String(resource.name)} is not a top-level service.`);
-  const settings = resource.serviceSettings as {
-    authentication?: { type?: string; name?: { id?: string }; password?: { id?: string } };
-    body?: string;
-    timeoutMilliseconds?: number;
-    maximumConcurrentRequests?: number;
-    maximumRequestsPerSecond?: number;
-    headers?: unknown;
-    contentType?: string;
-  };
-  if (settings?.authentication?.type !== 'BASIC') throw new Error(`${String(resource.name)} is not BASIC auth.`);
+  const settings = assertServiceShape(resource);
+  if (settings.authentication?.type !== 'BASIC') throw new Error(`${String(resource.name)} is not BASIC auth.`);
   if (settings.authentication.name?.id !== clientId || settings.authentication.password?.id !== secretId) {
     throw new Error(`${String(resource.name)} Basic auth does not point at the Definitions.`);
   }
   if (settings.body !== `token={{${tokenAttributeId}}}`) throw new Error(`${String(resource.name)} body does not use the token attribute id.`);
-  if (settings.timeoutMilliseconds !== 3000) throw new Error(`${String(resource.name)} timeout is not 3000ms.`);
+}
+
+function assertServiceShape(resource: Resource): ServiceSettings {
+  if (resource.parent) throw new Error(`${String(resource.name)} is not a top-level service.`);
+  const settings = resource.serviceSettings as ServiceSettings;
+  if (settings?.timeoutMilliseconds !== 3000) throw new Error(`${String(resource.name)} timeout is not 3000ms.`);
   if (settings.maximumConcurrentRequests !== 20) throw new Error(`${String(resource.name)} maximumConcurrentRequests is not 20.`);
   if (settings.maximumRequestsPerSecond !== 10) throw new Error(`${String(resource.name)} maximumRequestsPerSecond is not 10.`);
   if (!Array.isArray(settings.headers)) throw new Error(`${String(resource.name)} headers were not saved.`);
   if (settings.contentType !== 'application/x-www-form-urlencoded') throw new Error(`${String(resource.name)} content type is wrong.`);
   if ((resource.valueType as { type?: string } | undefined)?.type !== 'JSON') throw new Error(`${String(resource.name)} is not JSON.`);
+  return settings;
 }
 
 function assertServiceAttribute(resource: Resource, serviceId: string, path: string, parentId: string): void {

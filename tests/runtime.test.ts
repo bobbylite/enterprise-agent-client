@@ -436,13 +436,10 @@ describe('mock runtime', () => {
     const { runtime } = await boot(0, undefined, undefined, secrets, {
       PINGONE_AGENT_CLIENT_SECRET: 'agent-from-env',
       PINGONE_WORKER_CLIENT_SECRET: 'worker-from-env',
-      PINGONE_USER_INTROSPECT_CLIENT_SECRET: 'sso-resource-secret-value',
     });
     const view = await runtime.getSettingsAsync();
     expect(view.keys.agent).toBe(true);
     expect(view.keys.worker).toBe(true);
-    expect(view.keys.userIntrospect).toBe(true);
-    expect(await secrets.get('userIntrospectClientSecret')).toBe('sso-resource-secret-value');
     expect(await secrets.get('agentClientSecret')).toBe('agent-from-env');
     const saved = await runtime.saveSettings({
       provider: view.provider,
@@ -574,7 +571,8 @@ describe('admin gate', () => {
     const result = await runtime.dryRunAuthorizePolicy();
     expect(existsSync(result.path)).toBe(true);
     expect(result.introspectionNote).toContain('user-introspect-client-id');
-    expect(result.introspectionNote).not.toContain('sso-resource-secret-value');
+    expect(result.introspectionNote).toContain('no authentication');
+    expect(result.introspectionNote).not.toContain('user-introspect-client-secret');
     const body = JSON.parse(readFileSync(result.path, 'utf8')) as { name?: string; children?: { name?: string; id?: string }[] };
     expect(body.name).toBe('Enterprise Agent Features');
     expect(body.children?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
@@ -1097,6 +1095,48 @@ describe('pi.flow runtime', () => {
     expect(remote).toHaveLength(4);
   });
 
+  it('saves an always-current decision endpoint when PingOne lists no authorization version', async () => {
+    authorizeVersions = 'empty';
+    try {
+      const secrets = new MemorySecretStore();
+      await secrets.set('workerClientSecret', 'worker-secret');
+      const { runtime, db } = await boot(
+        0,
+        (config) => {
+          pingone(config);
+          config.protect.enabled = false;
+        },
+        async (url, init) => {
+          const target = String(url);
+          const method = init?.method ?? 'GET';
+          const bodyText = String(init?.body ?? '');
+          const side = authorizeSide(target, method, bodyText);
+          if (side) return side;
+          if (target.includes('/authorizationPolicies') && method === 'GET') return json(200, { _embedded: { authorizationPolicies: [] } });
+          if (target.includes('/authorizationPolicies') && method === 'POST') {
+            const body = JSON.parse(bodyText) as { name: string; description: string };
+            return json(201, { id: `policy-${body.name}`, name: body.name, description: body.description, enabled: true });
+          }
+          if (target.includes('/as/token') && bodyText.includes('client_credentials')) {
+            return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+          }
+          return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+        },
+        secrets,
+        { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+      );
+      await runtime.submitCredentials('ada', 'secret', '');
+      const created = await runtime.scaffoldPolicies(true);
+      expect(created.warning).toMatch(/always-current/);
+      expect(created.warning).toMatch(/Versions response/);
+      const saved = db.getSetting('authorize.decisionEndpointId');
+      expect(saved).toBeTruthy();
+      expect(runtime.state().mode).toBe('pingone');
+    } finally {
+      authorizeVersions = 'items';
+    }
+  });
+
   it('stops creating policies when the local cache is reset during a scaffold', async () => {
     const remote: { id: string; name: string; description: string; enabled: boolean }[] = [];
     let posted = 0;
@@ -1438,6 +1478,7 @@ function flowFetch(accessToken: string): typeof fetch {
 
 const authorizeResources = new Map<string, Record<string, unknown>>();
 let authorizeSeq = 0;
+let authorizeVersions: 'items' | 'empty' = 'items';
 
 function authorizeSide(target: string, method: string, bodyText: string): Response | null {
   const managed = /authorizationAttributes|authorizationServices|authorizationVersions|decisionEndpoints|authorizationPolicies/.test(target);
@@ -1460,9 +1501,25 @@ function authorizeSide(target: string, method: string, bodyText: string): Respon
     return null;
   }
   if (collection === 'authorizationVersions' && !idMatch && method === 'GET') {
-    return json(200, { _embedded: { authorizationVersions: [{ id: 'ver-1' }] } });
+    if (authorizeVersions === 'empty') return json(200, { _embedded: { items: [] } });
+    const collectionUrl = target.split('?')[0] ?? target;
+    return json(200, {
+      _embedded: {
+        items: [
+          {
+            id: 'ver-new',
+            createdAt: '2026-08-15T17:00:52.000Z',
+            _links: { tag: { href: `${collectionUrl}/ver-new/tag` } },
+          },
+          { id: 'ver-old', createdAt: '2026-08-01T16:08:00.000Z' },
+        ],
+      },
+    });
   }
-  if (target.endsWith('/tag') && method === 'PUT') return json(200, { id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+  if (target.includes('/authorizationVersions/') && target.split('?')[0]?.endsWith('/tag') && method === 'PUT') {
+    const versionId = target.match(/authorizationVersions\/([^/?]+)\/tag/)?.[1] ?? 'ver-new';
+    return json(200, { id: versionId, tag: { updatedAt: '2026-08-15T17:00:52.000Z' } });
+  }
   if (!idMatch && method === 'GET') {
     const rows = [...authorizeResources.values()].filter((item) => item.collection === collection);
     return json(200, { _embedded: { [collection]: rows } });
@@ -1481,8 +1538,10 @@ function authorizeSide(target: string, method: string, bodyText: string): Respon
     authorizeResources.set(id, saved);
     return json(201, saved);
   }
-  const id = idMatch?.[2] === 'tag' ? 'ver-1' : (idMatch?.[2] ?? '');
-  if (id === 'ver-1' && method === 'GET') return json(200, { id: 'ver-1', tag: { updatedAt: '2026-01-01T00:00:00.000Z' } });
+  const id = idMatch?.[2] ?? '';
+  if (collection === 'authorizationVersions' && id && method === 'GET') {
+    return json(200, { id, tag: { updatedAt: '2026-08-15T17:00:52.000Z' } });
+  }
   if (method === 'DELETE') {
     authorizeResources.delete(id);
     return new Response(null, { status: 204 });
