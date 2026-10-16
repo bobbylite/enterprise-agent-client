@@ -7,7 +7,7 @@
     "environmentId": "",
     "clientId": "",
     "redirectUri": "http://127.0.0.1:53147/callback",
-    "scopes": ["openid", "profile", "email"],
+    "scopes": ["openid", "profile", "email", "user:groups"],
     "login": {
       "preferred": "pi.flow",
       "allowSystemBrowserFallback": true,
