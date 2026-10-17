@@ -89,11 +89,25 @@ export function Transcript({
           </article>
         ))}
       </div>
-      {showJump ? (
-        <button type="button" className="jump-latest" onClick={jump}>
-          Jump to latest
-        </button>
-      ) : null}
+      <button
+        type="button"
+        className={showJump ? 'jump-latest is-visible' : 'jump-latest'}
+        onClick={jump}
+        tabIndex={showJump ? 0 : -1}
+        aria-hidden={showJump ? undefined : true}
+      >
+        <svg className="jump-latest-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <path
+            d="M8 2.75v8.5M4.25 8.25 8 12.25l3.75-4"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+        Jump to latest
+      </button>
     </div>
   );
 }

@@ -154,7 +154,58 @@ fieldset.locked-config:disabled { opacity: 0.72; }
 .pane-head p { color: #6d645b; margin-top: 4px; }
 .transcript-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .transcript { flex: 1; overflow: auto; padding: 18px 28px; display: flex; flex-direction: column; gap: 12px; }
-.jump-latest { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 1; }
+button.jump-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  border: 0;
+  border-radius: 999px;
+  padding: 8px 14px 8px 12px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  box-shadow: 0 8px 22px color-mix(in srgb, var(--ink) 22%, transparent);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(8px);
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease,
+    visibility 0s linear 180ms,
+    background 160ms ease;
+}
+button.jump-latest.is-visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease,
+    visibility 0s linear 0s,
+    background 160ms ease;
+}
+button.jump-latest:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 86%, var(--ink));
+}
+button.jump-latest:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.jump-latest-icon { display: block; flex: none; }
+@media (prefers-reduced-motion: reduce) {
+  button.jump-latest,
+  button.jump-latest.is-visible { transition: none; }
+}
 .bubble { max-width: 760px; border: 1px solid var(--line); background: white; border-radius: 16px; padding: 12px 14px; }
 .bubble.user { margin-left: auto; background: #fff8f4; border-color: #f0d2c6; }
 .bubble header { font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 6px; color: #6d645b; }
