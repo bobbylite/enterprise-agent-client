@@ -79,6 +79,91 @@ export interface SessionView {
   userId: string;
   username: string;
   expiresAt: number;
+  groups: string[];
+  admin: boolean;
+}
+
+export interface FeatureDecision {
+  policyTab: boolean;
+  pingoneTools: boolean;
+  mcpWrites: boolean;
+  /** Every tool invocation, including read-only tools, skills, and PingOne MCP tools. */
+  tools: boolean;
+  /** Agents, instructions, skills, routines, and rooms. */
+  agentConfig: boolean;
+  /** MCP and extension configuration. */
+  extensionConfig: boolean;
+  chat: 'allow' | 'read_only' | 'locked';
+  source: 'starter' | 'authorize' | 'fail_closed';
+  fetchedAt: number;
+}
+
+/** Why chat is read-only or locked. Absent when chat is allowed. */
+export type SessionRestrictionReason = 'empty_policies' | 'decision_failure' | 'risk' | 'policy';
+
+export interface SessionRestriction {
+  reason: SessionRestrictionReason;
+  message: string;
+}
+
+export interface SkillView {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  requiredGroups: string[];
+  requiresAdmin: boolean;
+  builtin: boolean;
+  enabled: boolean;
+  assigned: boolean;
+}
+
+export interface SkillInput {
+  name: string;
+  description: string;
+  instructions: string;
+  requiredGroups: string[];
+}
+
+export interface PolicyView {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  updatedAt: number | null;
+  updatedBy: string | null;
+  scaffold: boolean;
+}
+
+export interface PolicyScaffoldResult {
+  preview: PolicyView[];
+  created: PolicyView[];
+  policies: PolicyView[];
+  /** Which introspection clients Scaffold will use. The SSO client id is not a secret. */
+  introspectionNote?: string;
+  /** Set when the decision endpoint was left always-current, or its policy pointer did not stick. */
+  warning?: string;
+}
+
+export interface PolicyDryRun {
+  path: string;
+  /** Which introspection clients the dry run would use. Never contains a secret. */
+  introspectionNote?: string;
+}
+
+export interface PolicyCacheReset {
+  policies: PolicyView[];
+  cleared: string;
+}
+
+export interface AuditView {
+  id: string;
+  at: number;
+  userId: string;
+  username: string;
+  agentId: string | null;
+  action: string;
+  detail: string;
 }
 
 export interface AppState {
@@ -92,6 +177,11 @@ export interface AppState {
   mockScenario: MockScenario;
   login: LoginView;
   showReasoning: boolean;
+  adminGroup: string;
+  mockAdmin: boolean;
+  features: FeatureDecision;
+  /** Set when chat is read-only, with the reason an admin can act on. */
+  restriction: SessionRestriction | null;
 }
 
 export type ProviderId = 'mock' | 'openai' | 'anthropic' | 'generic';
@@ -162,8 +252,9 @@ export interface AgentPage {
   user: InstructionFields;
   enterpriseLocked: true;
   routines: Routine[];
-  /** Assigned skill ids. Empty until skill assignment is added. */
+  /** Assigned skill ids. */
   skillIds: string[];
+  skills: SkillView[];
 }
 
 export interface AgentInput {
@@ -224,19 +315,58 @@ export interface RoutineRun {
   error: string | null;
 }
 
+export type McpExtensionType = 'stdio' | 'streamable_http' | 'sse' | 'builtin';
+
+export type McpAuthStepKind =
+  | 'unauthorized'
+  | 'protected-resource'
+  | 'authorization-server'
+  | 'registration'
+  | 'authorize'
+  | 'token'
+  | 'refresh'
+  | 'step-up';
+
+export interface McpAuthStep {
+  kind: McpAuthStepKind;
+  title: string;
+  detail: string;
+  ok: boolean;
+}
+
+export interface McpHeader {
+  name: string;
+  value: string;
+}
+
+export interface McpEnvInput {
+  name: string;
+  value: string;
+}
+
 export interface McpServerView {
   id: string;
   name: string;
-  transport: 'stdio' | 'http' | 'sse';
+  transport: 'stdio' | 'http' | 'sse' | 'builtin';
+  type: McpExtensionType;
+  description: string;
   command: string;
   args: string[];
   url: string;
+  headers: McpHeader[];
+  envKeys: string[];
+  timeout: number;
   audience: string;
   scope: string;
   enabled: boolean;
   status: 'disconnected' | 'connected' | 'error';
   error?: string;
   tools: McpToolView[];
+  authKind: 'open' | 'oauth' | 'exchange' | 'worker';
+  needsSignIn: boolean;
+  signedIn: boolean;
+  needsClient: boolean;
+  oauthSteps: McpAuthStep[];
 }
 
 export interface McpToolView {
@@ -248,13 +378,24 @@ export interface McpToolView {
 export interface McpServerInput {
   id?: string;
   name: string;
-  transport: 'stdio' | 'http' | 'sse';
+  transport?: 'stdio' | 'http' | 'sse' | 'builtin';
+  type?: McpExtensionType;
+  description?: string;
   command: string;
   args: string;
   url: string;
-  audience: string;
-  scope: string;
+  headers?: McpHeader[];
+  env?: McpEnvInput[];
+  timeout?: number;
+  /** Omit to keep a config-seeded audience. An empty string clears it. */
+  audience?: string;
+  scope?: string;
   enabled: boolean;
+}
+
+export interface McpSignInInput {
+  clientId?: string;
+  clientSecret?: string;
 }
 
 export interface InstructionEditorState {
@@ -350,12 +491,16 @@ export interface InspectedToken {
 export interface AgentBridge {
   getBranding(): Promise<Branding>;
   getState(): Promise<AppState>;
+  onAppState(listener: (state: AppState) => void): () => void;
+  onCollectSignals(listener: () => void): () => void;
+  provideSignals(signals: string): Promise<void>;
   submitCredentials(username: string, password: string, signals: string): Promise<AppState>;
   submitOtp(otp: string, signals: string): Promise<AppState>;
   selectDevice(deviceId: string, signals: string): Promise<AppState>;
   startSystemBrowserLogin(signals: string): Promise<AppState>;
   cancelLogin(): Promise<AppState>;
   setMockScenario(scenario: MockScenario): Promise<AppState>;
+  setMockAdmin(admin: boolean): Promise<AppState>;
   logout(): Promise<AppState>;
   listConversations(): Promise<Conversation[]>;
   createConversation(): Promise<ChatSnapshot>;
@@ -381,8 +526,11 @@ export interface AgentBridge {
   listMcpServers(): Promise<McpServerView[]>;
   saveMcpServer(input: McpServerInput): Promise<McpServerView>;
   deleteMcpServer(id: string): Promise<void>;
+  setMcpEnabled(id: string, enabled: boolean): Promise<McpServerView>;
   connectMcp(id: string): Promise<McpServerView>;
   disconnectMcp(id: string): Promise<McpServerView>;
+  signInMcp(id: string, input?: McpSignInInput): Promise<McpServerView>;
+  signOutMcp(id: string): Promise<McpServerView>;
   respondApproval(id: string, choice: ApprovalChoice): Promise<void>;
   listRoutines(): Promise<Routine[]>;
   saveRoutine(input: RoutineInput): Promise<Routine>;
@@ -394,5 +542,18 @@ export interface AgentBridge {
   listTokens(): Promise<InspectedToken[]>;
   revealToken(id: string): Promise<string>;
   reexchangeToken(id: string): Promise<InspectedToken>;
+  listSkills(): Promise<SkillView[]>;
+  importSkill(input: SkillInput): Promise<SkillView>;
+  importSkillFile(): Promise<SkillView>;
+  setSkillEnabled(id: string, enabled: boolean): Promise<SkillView[]>;
+  deleteSkill(id: string): Promise<SkillView[]>;
+  assignSkill(agentId: string, skillId: string, assigned: boolean): Promise<AgentPage>;
+  listPolicies(): Promise<PolicyView[]>;
+  refreshPolicies(): Promise<PolicyView[]>;
+  scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult>;
+  dryRunAuthorizePolicy(): Promise<PolicyDryRun>;
+  resetPolicyCache(): Promise<PolicyCacheReset>;
+  setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]>;
+  listAudit(): Promise<AuditView[]>;
   onChatEvent(listener: (event: ChatEvent) => void): () => void;
 }

@@ -11,12 +11,54 @@ import {
   type FlowSnapshot,
 } from '@shared/auth/pi-flow';
 import { createPkce, type PkcePair } from '@shared/auth/pkce';
-import { waitForLoopbackCode } from '@shared/auth/loopback';
+import { beginLoopback, waitForLoopbackCode } from '@shared/auth/loopback';
 import { classifyAccessToken, type TokenSet } from '@shared/auth/tokens';
+import { groupsFromClaims, isAdmin } from '@shared/access/groups';
+import {
+  applyLiveRiskGates,
+  decisionCacheKey,
+  evaluatePolicies,
+  failClosed,
+  featuresFromAuthorize,
+  mergeScaffold,
+  parseScaffoldMarker,
+  policiesForEvaluation,
+  reconcilePolicyCache,
+  scaffoldPolicies,
+  sessionRestriction as explainRestriction,
+  SCAFFOLD_MARKER,
+  type AuthorizePolicy,
+  type DecisionInput,
+} from '@shared/authorize/policy';
+import { decisionTokensReady, introspectionNote as describeIntrospection, type DecisionCall } from '@shared/authorize/framework';
+import { plannedFeaturePolicy, provisionAuthorize } from '@shared/authorize/provision';
+import { AuthorizeClient, listRemotePolicies, postDecision, setRemotePolicyEnabled, syncRemoteScaffold } from '@shared/authorize/remote';
 import { decodeJwtPayload, encodeJsonSegment, randomId } from '@shared/ids';
+import { PINGONE_SKILL_ID, pingoneSkillInstructions, type SkillDraft } from '@shared/skills/markdown';
 import { toolKey } from '@shared/mcp/approvals';
-import { buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
+import { splitCommandLine } from '@shared/mcp/command';
+import {
+  mcpEnvAccount,
+  mcpOauthTokenAccount,
+  refreshStoredMcpToken,
+  runMcpAuthorization,
+  McpOauthError,
+} from '@shared/mcp/oauth';
+import {
+  isSkillReferenceTool,
+  loadSkillBundle,
+  pingoneAuthorizeSkillLayer,
+  readSkillReferenceFile,
+  resolveSkillBundle,
+  skillReferenceDenied,
+  skillReferenceToolFields,
+  SKILL_REFERENCE_SERVER_ID,
+  SKILL_REFERENCE_TOOL,
+  type SkillBundle,
+} from './skill-bundle';
+import { RiskEvaluationError, buildRiskEvent, createRiskEvaluation, resolvePublicIp, updateRiskEvaluation } from '@shared/protect/evaluate';
 import { mockRiskPayload } from '@shared/protect/mock';
+import { classifyProtectPollFailure, nextProtectDelayMs } from '@shared/protect/poll';
 import { decideRisk, summarizeRisk, unscoredRisk } from '@shared/protect/policy';
 import { extractRiskReasons, riskLevel } from '@shared/protect/reasons';
 import { renderRiskContext } from '@shared/protect/context';
@@ -33,6 +75,14 @@ import type {
   AgentPage,
   AgentProfile,
   AppState,
+  AuditView,
+  FeatureDecision,
+  PolicyCacheReset,
+  PolicyDryRun,
+  PolicyScaffoldResult,
+  PolicyView,
+  SkillInput,
+  SkillView,
   ApprovalChoice,
   ApprovalRequest,
   Attachment,
@@ -42,8 +92,10 @@ import type {
   InstructionEditorState,
   InstructionFields,
   LoginView,
+  McpAuthStep,
   McpServerInput,
   McpServerView,
+  McpSignInInput,
   MockScenario,
   ProviderId,
   RiskView,
@@ -58,8 +110,11 @@ import type {
   InspectedToken,
 } from '@shared/types';
 import { compileAgentGraph, runAgentGraph, type AgentGraph, type GraphParticipant } from './agent-graph';
+import { loadEnterprise } from './load-config';
+import type { RuntimeTool } from './runtime-tool';
 import { openCheckpointer, type NodeSqliteSaver } from './checkpoint-sqlite';
-import { Repository, type AgentRow, type McpServerRow } from './db';
+import { Repository, type AgentRow, type McpServerRow, type SkillRow } from './db';
+import { skillFromUpload } from './skill-files';
 import { McpHub } from './mcp';
 
 interface StoredSession {
@@ -70,6 +125,7 @@ interface StoredSession {
   tokenType: string;
   userId: string;
   username: string;
+  groups: string[];
 }
 
 interface PendingLogin {
@@ -99,10 +155,18 @@ export interface RuntimeOptions {
   pickFiles?: () => Promise<PickedFile[]>;
   now?: () => number;
   emit?: (event: ChatEvent) => void;
+  onState?: (state: AppState) => void;
+  collectSignals?: () => Promise<string>;
+  protectActive?: () => boolean;
+  schedule?: (delayMs: number, run: () => Promise<void>) => () => void;
+  configPath?: string;
   mockDelayMs?: number;
   version?: string;
   dev?: boolean;
   checkpointPath?: string;
+  userDataDir?: string;
+  logPath?: string;
+  log?: (level: 'debug' | 'error', message: string) => void;
 }
 
 const SCENARIOS: MockScenario[] = ['low', 'new_device', 'anomalous_location', 'impossible_travel', 'bot'];
@@ -114,6 +178,10 @@ export class Runtime {
   private login: LoginView = { phase: 'idle' };
   private stepUpRequired = false;
   private scenario: MockScenario = 'low';
+  private mockAdmin = false;
+  private features: FeatureDecision = failClosed(0);
+  private decisionCache: { key: string; at: number; decision: FeatureDecision } | null = null;
+  private policyEpoch = 0;
   private pkce: PkcePair | null = null;
   private flow: FlowSnapshot | null = null;
   private mfaSatisfied = false;
@@ -124,13 +192,24 @@ export class Runtime {
   private workerToken: TokenSet | null = null;
   private agentActorToken: TokenSet | null = null;
   private readonly exchangeErrors = new Map<string, string>();
+  private readonly oauthSteps = new Map<string, McpAuthStep[]>();
+  private readonly oauthSignedIn = new Set<string>();
+  private readonly needsClient = new Set<string>();
+  private readonly pendingScopes = new Map<string, string>();
   private readonly approvals = new Map<string, (choice: ApprovalChoice) => void>();
   private readonly pi: PiFlowClient;
   private readonly cache: AudienceTokenCache;
   private readonly hub: McpHub;
   private readonly checkpointer: NodeSqliteSaver;
   private readonly agentGraph: AgentGraph;
+  private readonly authorize: AuthorizeClient;
+  private readonly pingoneBundle: SkillBundle | null;
   private firing = false;
+  private protectCancel: (() => void) | null = null;
+  private protectPollTask: Promise<void> | null = null;
+  private protectQueued = false;
+  private protectGeneration = 0;
+  private protectRetryAfterSeconds: number | null = null;
   private activeTurn: AbortController | null = null;
   private activeConversationId = '';
   private cancelledConversations = new Set<string>();
@@ -144,9 +223,33 @@ export class Runtime {
       now: options.now,
     });
     this.cache = new AudienceTokenCache(options.secrets, 60_000, options.now);
-    this.hub = new McpHub({ name: options.branding.appName, version: options.version ?? '0.1.0' });
+    this.hub = new McpHub(
+      { name: options.branding.appName, version: options.version ?? '0.1.0' },
+      {
+        platform: process.platform,
+        home: options.env?.HOME ?? process.env.HOME,
+        onInsufficientScope: (serverId, scope) => {
+          if (scope) this.pendingScopes.set(serverId, scope);
+          const steps = this.oauthSteps.get(serverId) ?? [];
+          this.oauthSteps.set(serverId, [
+            ...steps,
+            {
+              kind: 'step-up',
+              title: 'Insufficient scope',
+              detail: scope
+                ? `The server returned 403 insufficient_scope for ${scope}. Sign in again to request it.`
+                : 'The server returned 403 insufficient_scope. Sign in again to request a broader scope.',
+              ok: false,
+            },
+          ]);
+        },
+      },
+    );
     this.checkpointer = openCheckpointer(options.checkpointPath ?? join(options.attachmentsDir, 'langgraph.sqlite'));
     this.agentGraph = compileAgentGraph(this.checkpointer);
+    this.authorize = new AuthorizeClient({ fetchImpl: options.fetchImpl, now: options.now });
+    const bundleRoot = resolveSkillBundle(options.appRoot);
+    this.pingoneBundle = bundleRoot ? loadSkillBundle(bundleRoot) : null;
   }
 
   static async create(options: RuntimeOptions): Promise<Runtime> {
@@ -156,6 +259,7 @@ export class Runtime {
   }
 
   async dispose(): Promise<void> {
+    this.stopProtectPoll();
     this.browserAbort?.abort();
     await this.hub.disconnectAll();
     this.checkpointer.close();
@@ -167,6 +271,18 @@ export class Runtime {
 
   setEmitter(emit: (event: ChatEvent) => void): void {
     this.options.emit = emit;
+  }
+
+  setStatePublisher(onState: (state: AppState) => void): void {
+    this.options.onState = onState;
+  }
+
+  setSignalCollector(collectSignals: () => Promise<string>): void {
+    this.options.collectSignals = collectSignals;
+  }
+
+  setProtectActive(protectActive: () => boolean): void {
+    this.options.protectActive = protectActive;
   }
 
   private emit(event: ChatEvent): void {
@@ -182,6 +298,8 @@ export class Runtime {
     this.seed();
     this.migrateAgentOwnership();
     this.syncBrandedAgents();
+    this.ensureBuiltinSkill();
+    this.mockAdmin = this.options.db.getSetting('mockAdmin') === '1';
     const storedScenario = this.options.db.getSetting('mockScenario');
     if (storedScenario && SCENARIOS.includes(storedScenario as MockScenario)) {
       this.scenario = storedScenario as MockScenario;
@@ -201,6 +319,10 @@ export class Runtime {
       mockScenario: this.scenario,
       login: this.login,
       showReasoning: this.options.config.provider.showReasoning,
+      adminGroup: this.options.config.access.adminGroup,
+      mockAdmin: this.mockAdmin,
+      features: this.currentFeatures(),
+      restriction: this.sessionRestriction(),
     };
   }
 
@@ -323,12 +445,25 @@ export class Runtime {
     }
     this.scenario = scenario;
     this.options.db.setSetting('mockScenario', scenario);
+    if (this.session) await this.runProtectPoll(true);
+    return this.state();
+  }
+
+  async setMockAdmin(admin: boolean): Promise<AppState> {
+    if (this.options.config.tenant.mode !== 'mock') {
+      throw new Error('The administrator sign-in switch is only available in mock mode.');
+    }
+    this.mockAdmin = admin;
+    this.options.db.setSetting('mockAdmin', admin ? '1' : '0');
     return this.state();
   }
 
   async logout(): Promise<AppState> {
+    this.stopProtectPoll();
     this.session = null;
     this.risk = null;
+    this.features = failClosed(this.now());
+    this.decisionCache = null;
     this.stepUpRequired = false;
     this.pendingLogin = null;
     this.flow = null;
@@ -370,6 +505,7 @@ export class Runtime {
 
   async sendMessage(conversationId: string, text: string, attachmentIds: string[]): Promise<void> {
     const conversation = this.openConversation(conversationId).conversation;
+    this.requireWritableChat();
     const body = text.trim();
     if (!body && attachmentIds.length === 0) throw new Error('Write a message or attach a file.');
     const messageId = randomId();
@@ -438,7 +574,7 @@ export class Runtime {
   }
 
   saveAgent(input: AgentInput): AgentPage {
-    this.requireSession();
+    this.requireAgentConfig();
     const existing = input.id ? this.options.db.getAgent(input.id) : null;
     if (input.id && !existing) throw new Error('That agent was not found.');
     const provider = input.provider;
@@ -461,8 +597,179 @@ export class Runtime {
     return this.agentPage(agent);
   }
 
-  deleteAgent(id: string): void {
+  listSkills(): SkillView[] {
     this.requireSession();
+    return this.options.db.listSkills().filter((skill) => this.skillVisible(skill)).map((skill) => this.skillView(skill, []));
+  }
+
+  importSkill(input: SkillInput): SkillView {
+    this.requireAgentConfig();
+    const name = input.name.trim();
+    if (!name) throw new Error('Give the skill a name.');
+    if (!input.instructions.trim()) throw new Error('Write the skill instructions.');
+    const skill: SkillRow = {
+      id: randomId(),
+      name,
+      description: input.description.trim(),
+      instructions: input.instructions.trim(),
+      files: [],
+      requiredGroups: input.requiredGroups.map((group) => group.trim()).filter(Boolean),
+      requiresAdmin: false,
+      builtin: false,
+      enabled: true,
+      createdAt: this.now(),
+    };
+    this.options.db.upsertSkill(skill);
+    return this.skillView(skill, []);
+  }
+
+  async importSkillFile(): Promise<SkillView> {
+    this.requireAgentConfig();
+    if (!this.options.pickFiles) throw new Error('File picking is not available.');
+    const files = await this.options.pickFiles();
+    const file = files[0];
+    if (!file) throw new Error('Choose a SKILL.md file or a zip that contains one.');
+    return this.storeSkillDraft(skillFromUpload(file.name, file.bytes));
+  }
+
+  setSkillEnabled(id: string, enabled: boolean): SkillView[] {
+    this.requireAgentConfig();
+    const skill = this.options.db.getSkill(id);
+    if (!skill || !this.skillVisible(skill)) throw new Error('That skill was not found.');
+    if (skill.requiresAdmin) this.requireAdmin();
+    this.options.db.upsertSkill({ ...skill, enabled });
+    return this.listSkills();
+  }
+
+  deleteSkill(id: string): SkillView[] {
+    this.requireAgentConfig();
+    const skill = this.options.db.getSkill(id);
+    if (!skill || !this.skillVisible(skill)) throw new Error('That skill was not found.');
+    if (skill.builtin) throw new Error('The built-in PingOne skill stays.');
+    this.options.db.deleteSkill(id);
+    for (const agent of this.options.db.listAgents()) {
+      if (!agent.skillIds.includes(id)) continue;
+      this.options.db.upsertAgent({ ...agent, skillIds: agent.skillIds.filter((skillId) => skillId !== id) });
+    }
+    return this.listSkills();
+  }
+
+  assignSkill(agentId: string, skillId: string, assigned: boolean): AgentPage {
+    this.requireAgentConfig();
+    const agent = this.options.db.getAgent(agentId);
+    if (!agent) throw new Error('That agent was not found.');
+    const skill = this.options.db.getSkill(skillId);
+    if (!skill || !this.skillVisible(skill)) throw new Error('That skill was not found.');
+    if (skill.requiresAdmin) this.requireAdmin();
+    if (assigned && !this.skillUsable(skill)) {
+      throw new Error(`This sign-in does not meet the groups required by ${skill.name}.`);
+    }
+    const skillIds = assigned
+      ? [...new Set([...agent.skillIds, skillId])]
+      : agent.skillIds.filter((id) => id !== skillId);
+    const saved = { ...agent, skillIds };
+    this.options.db.upsertAgent(saved);
+    return this.agentPage(saved);
+  }
+
+  async listPolicies(): Promise<PolicyView[]> {
+    this.requirePolicy();
+    return this.options.db.listPolicies().map(policyView);
+  }
+
+  async refreshPolicies(): Promise<PolicyView[]> {
+    this.requirePolicy();
+    if (this.options.config.tenant.mode === 'pingone') {
+      await this.authorize.run(() => this.pullRemotePolicies());
+    }
+    this.decisionCache = null;
+    await this.refreshFeatures();
+    return this.listPolicies();
+  }
+
+  async resetPolicyCache(): Promise<PolicyCacheReset> {
+    this.requirePolicy();
+    this.policyEpoch += 1;
+    this.decisionCache = null;
+    const removed = this.options.db.listPolicies();
+    for (const policy of removed) this.options.db.deletePolicy(policy.id);
+    this.options.db.clearTfObjects();
+    const cleared = policyResetDetail(removed.map((policy) => policy.name));
+    this.audit(null, 'policy:reset-cache', cleared);
+    await this.refreshFeatures();
+    return { policies: [], cleared };
+  }
+
+  async scaffoldPolicies(confirm: boolean): Promise<PolicyScaffoldResult> {
+    this.requirePolicy();
+    const incoming = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '');
+    const note = this.introspectionNote();
+    if (!confirm) {
+      const existing = this.options.db.listPolicies();
+      return { preview: incoming.map(policyView), created: [], policies: existing.map(policyView), introspectionNote: note };
+    }
+    const result = await this.authorize.run(() => this.confirmScaffold(incoming));
+    return { ...result, introspectionNote: note };
+  }
+
+  async dryRunAuthorizePolicy(): Promise<PolicyDryRun> {
+    this.requirePolicy();
+    const directory = this.options.userDataDir ?? this.options.attachmentsDir;
+    const path = join(directory, 'authorize-policy-tree.json');
+    if (this.options.config.tenant.mode !== 'pingone') {
+      const body = plannedFeaturePolicy(new Map(), this.options.config.access.adminGroup, this.options.config.authorize.delegations);
+      mkdirSync(directory, { recursive: true });
+      const text = `${JSON.stringify(body, null, 2)}\n`;
+      writeFileSync(path, text);
+      const note = this.introspectionNote();
+      this.options.log?.('debug', `Authorize dry run wrote ${path}\n${text}\n${note}`);
+      return { path, introspectionNote: note };
+    }
+    const token = await this.workerAccessToken();
+    const result = await provisionAuthorize({
+      config: this.options.config,
+      accessToken: token,
+      client: this.authorize,
+      store: {
+        get: (kind, name) => this.options.db.getTfObject(kind, name),
+        put: (kind, name, remoteId, contentHash) => this.options.db.upsertTfObject(kind, name, remoteId, contentHash),
+      },
+      adminGroup: this.options.config.access.adminGroup,
+      delegations: this.options.config.authorize.delegations,
+      alwaysCurrent: this.options.config.authorize.alwaysCurrent,
+      shouldContinue: () => true,
+      dryRun: true,
+      dryRunPath: path,
+      log: this.options.log,
+      logPath: this.options.logPath,
+    });
+    if (!result.dryRunPath) throw new Error('Dry run did not write the policy tree.');
+    return { path: result.dryRunPath, introspectionNote: this.introspectionNote() };
+  }
+
+  async setPolicyEnabled(id: string, enabled: boolean): Promise<PolicyView[]> {
+    this.requirePolicy();
+    const policy = this.options.db.listPolicies().find((item) => item.id === id);
+    if (!policy) throw new Error('That policy was not found.');
+    const next = { ...policy, enabled, updatedAt: this.now(), updatedBy: this.session?.username ?? null };
+    if (this.options.config.tenant.mode === 'pingone' && next.remoteId) {
+      const token = await this.workerAccessToken();
+      await setRemotePolicyEnabled(this.options.config, token, next.remoteId, enabled, this.authorize);
+    }
+    this.options.db.upsertPolicy(next);
+    this.audit(null, 'policy:enforcement', `${next.name} ${enabled ? 'enabled' : 'disabled'}`);
+    this.decisionCache = null;
+    await this.refreshFeatures();
+    return this.options.db.listPolicies().map(policyView);
+  }
+
+  listAudit(): AuditView[] {
+    this.requireAdmin();
+    return this.options.db.listAudit();
+  }
+
+  deleteAgent(id: string): void {
+    this.requireAgentConfig();
     const agent = this.options.db.getAgent(id);
     if (!agent) throw new Error('That agent was not found.');
     if (agent.nameFromBranding) throw new Error('The branding agent stays. Edit it instead of deleting it.');
@@ -476,7 +783,7 @@ export class Runtime {
   }
 
   saveRoom(input: RoomInput): Room {
-    this.requireSession();
+    this.requireAgentConfig();
     if (!input.name.trim()) throw new Error('Give the room a name.');
     if (input.agentIds.length === 0) throw new Error('Choose at least one agent.');
     const existing = input.id ? this.options.db.getRoom(input.id) : null;
@@ -492,7 +799,7 @@ export class Runtime {
   }
 
   deleteRoom(id: string): void {
-    this.requireSession();
+    this.requireAgentConfig();
     this.options.db.deleteRoom(id);
   }
 
@@ -519,6 +826,7 @@ export class Runtime {
 
   async sendRoomMessage(roomId: string, text: string): Promise<void> {
     const snapshot = this.openRoom(roomId);
+    this.requireWritableChat();
     const body = text.trim();
     if (!body) throw new Error('Write a message.');
     const room = this.options.db.getRoom(roomId);
@@ -574,6 +882,7 @@ export class Runtime {
   }
 
   savePersona(fields: InstructionFields): InstructionEditorState {
+    this.requireAgentConfig();
     const agent = this.defaultAgent();
     this.options.db.upsertAgent({ ...agent, instructions: fields });
     this.options.db.setSetting('personaCustomized', '1');
@@ -581,54 +890,97 @@ export class Runtime {
   }
 
   saveUserLayer(fields: InstructionFields): InstructionEditorState {
+    this.requireAgentConfig();
     const agent = this.defaultAgent();
     this.options.db.upsertAgent({ ...agent, userInstructions: fields });
     return this.getInstructions();
   }
 
   resetPersona(): InstructionEditorState {
+    this.requireAgentConfig();
     const agent = this.defaultAgent();
     this.options.db.upsertAgent({ ...agent, instructions: this.options.branding.persona });
     this.options.db.setSetting('personaCustomized', '0');
     return this.getInstructions();
   }
 
-  listMcpServers(): McpServerView[] {
-    return this.options.db.listMcpServers().map((server) => this.serverView(server));
+  async listMcpServers(): Promise<McpServerView[]> {
+    const rows = this.options.db.listMcpServers();
+    await Promise.all(rows.map((server) => this.rememberOauth(server)));
+    return rows.map((server) => this.serverView(server));
   }
 
   async saveMcpServer(input: McpServerInput): Promise<McpServerView> {
-    if (!input.name.trim()) throw new Error('Give the server a name.');
+    this.requireExtensionConfig();
+    if (!input.name.trim()) throw new Error('Give the extension a name.');
+    const existing = input.id ? this.options.db.listMcpServers().find((item) => item.id === input.id) : undefined;
+    const kind = extensionKind(input);
+    const commandLine = input.args.trim() ? null : splitCommandLine(input.command);
     const row: McpServerRow = {
       id: input.id || randomId(),
       name: input.name.trim(),
-      transport: input.transport,
-      command: input.command.trim(),
-      args: parseArgs(input.args),
+      transport: kind,
+      description: input.description?.trim() ?? existing?.description ?? '',
+      command: commandLine ? commandLine.command : input.command.trim(),
+      args: commandLine ? commandLine.args : parseArgs(input.args),
       url: input.url.trim(),
-      audience: input.audience.trim(),
-      scope: input.scope.trim(),
+      headers: input.headers ? headerRecord(input.headers) : (existing?.headers ?? {}),
+      envKeys: existing?.envKeys ?? [],
+      timeout: input.timeout ?? existing?.timeout ?? 300,
+      audience: input.audience !== undefined ? input.audience.trim() : (existing?.audience ?? ''),
+      scope: input.scope !== undefined ? input.scope.trim() : (existing?.scope ?? ''),
       enabled: input.enabled,
     };
-    if (row.transport === 'stdio' && !row.command) throw new Error('A stdio server needs a command.');
-    if (row.transport !== 'stdio' && !row.url) throw new Error('An HTTP server needs a URL.');
+    if (input.env) row.envKeys = await this.storeExtensionEnv(row.id, input.env, existing?.envKeys ?? []);
+    if (row.transport === 'stdio' && !row.command) throw new Error('A stdio extension needs a command.');
+    if (row.transport !== 'stdio' && row.transport !== 'builtin' && !row.url) throw new Error('An HTTP extension needs a URL.');
+    if (!Number.isInteger(row.timeout) || row.timeout < 1) throw new Error('Timeout must be a positive number of seconds.');
     this.options.db.upsertMcpServer(row);
+    await this.rememberOauth(row);
     return this.serverView(row);
   }
 
   async deleteMcpServer(id: string): Promise<void> {
+    this.requireExtensionConfig();
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
     await this.hub.disconnect(id);
+    if (server) {
+      for (const key of server.envKeys) await this.options.secrets.delete(mcpEnvAccount(id, key));
+    }
+    await this.options.secrets.delete(mcpOauthTokenAccount(id));
+    this.oauthSignedIn.delete(id);
+    this.oauthSteps.delete(id);
+    this.needsClient.delete(id);
+    this.pendingScopes.delete(id);
     this.options.db.deleteMcpServer(id);
   }
 
-  async connectMcp(id: string): Promise<McpServerView> {
-    this.requireSession();
+  async setMcpEnabled(id: string, enabled: boolean): Promise<McpServerView> {
+    this.requireExtensionConfig();
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
-    if (!server) throw new Error('That server was not found.');
-    let accessToken: string | undefined;
-    if (server.audience) {
-      accessToken = await this.tokenForAudience(server.audience, server.scope);
+    if (!server) throw new Error('That extension was not found.');
+    const next = { ...server, enabled };
+    this.options.db.upsertMcpServer(next);
+    if (!enabled) {
+      await this.hub.disconnect(id);
+      await this.rememberOauth(next);
+      return this.serverView(next);
     }
+    const token = this.usesOauth(next) ? await this.currentOauthAccessToken(next.id) : undefined;
+    if (this.session && !this.stepUpRequired && next.transport !== 'builtin' && !(this.usesOauth(next) && !token)) {
+      return this.connectMcp(id);
+    }
+    await this.rememberOauth(next);
+    return this.serverView(next);
+  }
+
+  async connectMcp(id: string): Promise<McpServerView> {
+    this.requireExtensionConfig();
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
+    if (!server) throw new Error('That extension was not found.');
+    if (!server.enabled) throw new Error('This extension is disabled.');
+    if (server.transport === 'builtin') throw new Error('Built-in extensions are not launched by this client.');
+    const accessToken = await this.accessTokenForServer(server);
     await this.hub.connect({
       id: server.id,
       name: server.name,
@@ -637,15 +989,75 @@ export class Runtime {
       args: server.args,
       url: server.url,
       cwd: this.options.appRoot,
+      env: await this.extensionEnv(server),
+      headers: server.headers,
+      timeoutMs: server.timeout * 1000,
       accessToken,
+      fetchImpl: this.options.fetchImpl,
+      allowUnauthorized: this.usesOauth(server) && !accessToken,
+      refreshAccessToken: this.usesOauth(server) ? async () => this.currentOauthAccessToken(server.id) : undefined,
     });
+    await this.rememberOauth(server);
+    if (this.usesOauth(server) && !accessToken && this.hub.status(server.id) !== 'connected') {
+      throw new Error('This extension needs sign-in.');
+    }
     return this.serverView(server);
   }
 
   async disconnectMcp(id: string): Promise<McpServerView> {
+    this.requireExtensionConfig();
     await this.hub.disconnect(id);
     const server = this.options.db.listMcpServers().find((item) => item.id === id);
-    if (!server) throw new Error('That server was not found.');
+    if (!server) throw new Error('That extension was not found.');
+    await this.rememberOauth(server);
+    return this.serverView(server);
+  }
+
+  async signInMcp(id: string, manual?: McpSignInInput): Promise<McpServerView> {
+    this.requireExtensionConfig();
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
+    if (!server) throw new Error('That extension was not found.');
+    if (!this.usesOauth(server)) throw new Error('This extension does not use MCP authorization.');
+    if (!this.options.openExternal) throw new Error('System browser sign-in is not available.');
+    const openExternal = this.options.openExternal;
+    try {
+      const outcome = await runMcpAuthorization({
+        extensionId: server.id,
+        serverUrl: server.url,
+        secrets: this.options.secrets,
+        fetchImpl: this.options.fetchImpl,
+        now: () => this.now(),
+        manualClient: manual?.clientId ? { clientId: manual.clientId, clientSecret: manual.clientSecret } : undefined,
+        stepUpScope: this.pendingScopes.get(server.id),
+        openBrowser: (url) => openExternal(url),
+        beginLoopback: (state, port, signal) => beginLoopback({ expectedState: state, port, signal }),
+      });
+      this.oauthSteps.set(server.id, outcome.steps);
+      this.needsClient.delete(server.id);
+      this.pendingScopes.delete(server.id);
+      this.oauthSignedIn.add(server.id);
+      if (server.enabled) return this.connectMcp(server.id);
+      return this.serverView(server);
+    } catch (error) {
+      if (error instanceof McpOauthError) {
+        this.oauthSteps.set(server.id, error.steps);
+        if (error.needsClient) this.needsClient.add(server.id);
+      }
+      await this.rememberOauth(server);
+      throw error;
+    }
+  }
+
+  async signOutMcp(id: string): Promise<McpServerView> {
+    this.requireExtensionConfig();
+    const server = this.options.db.listMcpServers().find((item) => item.id === id);
+    if (!server) throw new Error('That extension was not found.');
+    await this.hub.disconnect(id);
+    await this.options.secrets.delete(mcpOauthTokenAccount(id));
+    this.oauthSignedIn.delete(id);
+    this.oauthSteps.delete(id);
+    this.needsClient.delete(id);
+    this.pendingScopes.delete(id);
     return this.serverView(server);
   }
 
@@ -664,6 +1076,7 @@ export class Runtime {
   }
 
   saveRoutine(input: RoutineInput): Routine {
+    this.requireAgentConfig();
     assertValidCron(input.cron);
     if (!input.name.trim() || !input.prompt.trim()) throw new Error('A routine needs a name and a prompt.');
     const existing = input.id ? this.options.db.getRoutine(input.id) : null;
@@ -689,11 +1102,13 @@ export class Runtime {
   }
 
   deleteRoutine(id: string): void {
+    this.requireAgentConfig();
     this.options.db.deleteRoutine(id);
   }
 
   async runRoutine(id: string): Promise<RoutineRun> {
     this.requireSession();
+    this.requireWritableChat();
     const routine = this.options.db.getRoutine(id);
     if (!routine) throw new Error('That routine was not found.');
     return this.executeRoutine(routine);
@@ -809,6 +1224,7 @@ export class Runtime {
 
   async fireDueRoutines(date: Date): Promise<RoutineRun[]> {
     if (!this.session || this.firing) return [];
+    if (this.currentFeatures().chat !== 'allow') return [];
     this.firing = true;
     const runs: RoutineRun[] = [];
     try {
@@ -934,7 +1350,18 @@ export class Runtime {
           requestApproval: (request) => this.askApproval(request),
           rememberAlways: (serverId, toolName) => this.options.db.setToolPreference(serverId, toolName, 'always'),
           tokenForServer: (serverId) => this.tokenForServer(serverId),
-          callTool: (tool, args, accessToken) => this.hub.call(tool.serverId, tool.name, args, accessToken),
+          visibleTools: (tools, participant) => tools.filter((tool) => this.gateTool(tool, participant) === null),
+          gateTool: (tool, participant) => this.gateTool(tool, participant),
+          recordAdminAction: (agentId, action, detail) => {
+            const prefix = `tool:${this.options.config.authorize.mcpServerId}/`;
+            if (!action.startsWith(prefix)) return;
+            this.audit(agentId, action, detail);
+          },
+          callTool: (tool, args, accessToken) => {
+            if (this.risk?.level === 'MEDIUM') return Promise.reject(new Error('chat only, tools disabled'));
+            if (isSkillReferenceTool(tool)) return Promise.resolve(this.readSkillReference(args));
+            return this.hub.call(tool.serverId, tool.name, args, accessToken);
+          },
           persistMessage: (message) => {
             this.options.db.insertMessage({
               id: message.id,
@@ -953,8 +1380,9 @@ export class Runtime {
         initial: {
           messages: this.providerHistory(conversationId),
           participants: participants.map((item) => this.participant(item.agent, item.room)),
-          availableTools: this.hub.allTools(),
+          availableTools: this.graphTools(),
           riskAction: this.risk?.action ?? 'allow',
+          riskLevel: this.risk?.level ?? 'UNKNOWN',
           remembered: this.rememberedMap(),
           agentIndex: 0,
           rounds: 0,
@@ -986,12 +1414,14 @@ export class Runtime {
       user: agent.userInstructions ?? emptyFields(),
       room,
       risk,
+      skillIds: this.usableSkills(agent).map((skill) => skill.id),
+      skills: this.skillPrompt(agent),
     };
   }
 
   private rememberedMap(): Record<string, 'always' | 'deny'> {
     const remembered: Record<string, 'always' | 'deny'> = {};
-    for (const tool of this.hub.allTools()) {
+    for (const tool of this.graphTools()) {
       const preference = this.options.db.getToolPreference(tool.serverId, tool.name);
       if (preference) remembered[`${tool.serverId}\0${tool.name}`] = preference;
     }
@@ -1000,8 +1430,459 @@ export class Runtime {
 
   private async tokenForServer(serverId: string): Promise<string> {
     const server = this.options.db.listMcpServers().find((item) => item.id === serverId);
-    if (!server?.audience) return '';
-    return this.tokenForAudience(server.audience, server.scope);
+    if (!server) return '';
+    return (await this.accessTokenForServer(server)) ?? '';
+  }
+
+  private async accessTokenForServer(server: McpServerRow): Promise<string | undefined> {
+    if (server.id === this.options.config.authorize.mcpServerId) {
+      this.requireAdmin();
+      if (!this.currentFeatures().pingoneTools) {
+        throw new Error('Authorize turned PingOne tools off for this session.');
+      }
+      if (this.options.config.tenant.mode === 'mock') {
+        return this.mockToken('worker', 'worker', 'authorize').accessToken;
+      }
+      return this.workerAccessToken();
+    }
+    if (server.audience.trim()) return this.tokenForAudience(server.audience, server.scope);
+    if (server.transport === 'http' || server.transport === 'sse') return this.currentOauthAccessToken(server.id);
+    return undefined;
+  }
+
+  private gateTool(tool: RuntimeTool, participant: GraphParticipant | undefined): string | null {
+    if (this.risk?.level === 'MEDIUM') return 'chat only, tools disabled';
+    const features = this.currentFeatures();
+    if (!features.tools) {
+      const level = features.chat === 'locked' ? 'HIGH' : (this.risk?.level ?? 'UNKNOWN');
+      if (level === 'HIGH') {
+        return `Tool invocation is turned off because Protect scored this session ${level}.`;
+      }
+      return 'Authorize policy disabled tool invocation for this session.';
+    }
+    if (isSkillReferenceTool(tool) || tool.serverId === this.options.config.authorize.mcpServerId) {
+      return skillReferenceDenied({
+        serverId: tool.serverId,
+        name: tool.name,
+        mcpServerId: this.options.config.authorize.mcpServerId,
+        admin: this.isAdmin(),
+        adminGroup: this.options.config.access.adminGroup,
+        pingoneTools: features.pingoneTools,
+        skillIds: participant?.skillIds ?? [],
+      });
+    }
+    if ((!features.mcpWrites || features.chat !== 'allow') && !tool.readOnlyHint) {
+      return 'Authorize policy disabled MCP writes for this session.';
+    }
+    return null;
+  }
+
+  private graphTools(): RuntimeTool[] {
+    return [this.skillReferenceTool(), ...this.hub.allTools()];
+  }
+
+  private skillReferenceTool(): RuntimeTool {
+    const fields = skillReferenceToolFields(this.pingoneBundle?.files ?? []);
+    return {
+      key: toolKey(SKILL_REFERENCE_SERVER_ID, SKILL_REFERENCE_TOOL),
+      serverId: SKILL_REFERENCE_SERVER_ID,
+      serverName: 'PingOne skill',
+      name: SKILL_REFERENCE_TOOL,
+      description: fields.description,
+      inputSchema: fields.inputSchema,
+      readOnlyHint: true,
+      ...(fields.strict ? { strict: true } : {}),
+    };
+  }
+
+  private readSkillReference(args: unknown): string {
+    if (process.env.AGENT_DEBUG === '1') console.error(`[agent] read_skill_reference args ${JSON.stringify(args)}`);
+    if (!this.pingoneBundle) throw new Error('The PingOne Authorize skill bundle is not installed.');
+    const name = args && typeof args === 'object' && 'name' in args && typeof args.name === 'string' ? args.name : '';
+    return readSkillReferenceFile(this.pingoneBundle.root, name);
+  }
+
+  private isAdmin(): boolean {
+    return isAdmin(this.session?.groups ?? [], this.options.config.access.adminGroup);
+  }
+
+  private requireAdmin(): void {
+    this.requireSession();
+    if (!this.isAdmin()) {
+      throw new Error(`That action is limited to the ${this.options.config.access.adminGroup} group.`);
+    }
+  }
+
+  private requirePolicy(): void {
+    this.requireAdmin();
+    if (!this.currentFeatures().policyTab) {
+      throw new Error('Authorize policy hid the Policy tab for this session.');
+    }
+  }
+
+  private mockGroupNames(): string[] {
+    return this.mockAdmin ? [this.options.config.access.adminGroup] : ['Employees'];
+  }
+
+  private groupsForTokens(tokens: { accessToken: string; idToken?: string }): string[] {
+    const claim = this.options.config.access.groupsClaim;
+    const fromAccess = groupsFromClaims(decodeJwtPayload(tokens.accessToken), claim);
+    if (fromAccess.length > 0) return fromAccess;
+    if (tokens.idToken) return groupsFromClaims(decodeJwtPayload(tokens.idToken), claim);
+    return [];
+  }
+
+  private currentFeatures(): FeatureDecision {
+    if (!this.session || this.stepUpRequired) return failClosed(this.now());
+    return this.features;
+  }
+
+  private decisionInput(): DecisionInput {
+    return {
+      groups: this.session?.groups ?? [],
+      riskLevel: this.risk?.level ?? 'UNKNOWN',
+      riskAction: this.risk?.action ?? 'allow',
+    };
+  }
+
+  private decisionEndpointId(): string {
+    if (this.options.config.tenant.mode !== 'pingone') return '';
+    const saved = this.options.db.getSetting('authorize.decisionEndpointId')?.trim() ?? '';
+    return saved || this.options.config.authorize.decisionEndpointId.trim();
+  }
+
+  private policiesForDecision(): AuthorizePolicy[] {
+    return policiesForEvaluation(
+      this.options.db.listPolicies(),
+      scaffoldPolicies(this.options.config.access.adminGroup, this.now(), 'starter'),
+      this.decisionEndpointId(),
+    );
+  }
+
+  private sessionRestriction() {
+    if (!this.session || this.stepUpRequired) return null;
+    return explainRestriction(this.currentFeatures(), this.decisionInput(), this.options.db.listPolicies().length);
+  }
+
+  private applyFeatures(decision: FeatureDecision, key: string): void {
+    const next = applyLiveRiskGates(decision, this.decisionInput(), this.isAdmin(), this.options.config.protect.enabled);
+    this.features = next;
+    this.decisionCache = { key, at: this.now(), decision: next };
+  }
+
+  private requireWritableChat(): void {
+    if (this.currentFeatures().chat === 'locked') {
+      throw new Error('Chat is locked because Protect scored this session HIGH.');
+    }
+    if (this.currentFeatures().chat === 'read_only') {
+      throw new Error('Authorize policy made this session read-only.');
+    }
+  }
+
+  private requireAgentConfig(): void {
+    this.requireSession();
+    if (!this.currentFeatures().agentConfig) {
+      throw new Error('Agent configuration is locked because Protect scored this session HIGH.');
+    }
+  }
+
+  private requireExtensionConfig(): void {
+    this.requireSession();
+    if (!this.currentFeatures().extensionConfig) {
+      throw new Error('Extension configuration is locked because Protect scored this session HIGH.');
+    }
+  }
+
+  private ensureBuiltinSkill(): void {
+    const existing = this.options.db.getSkill(PINGONE_SKILL_ID);
+    this.options.db.upsertSkill({
+      id: PINGONE_SKILL_ID,
+      name: 'PingOne',
+      description: 'Administer PingOne Authorize through the PingOne MCP server.',
+      instructions: pingoneSkillInstructions(this.options.config.access.adminGroup),
+      files: existing?.files ?? [],
+      requiredGroups: [],
+      requiresAdmin: true,
+      builtin: true,
+      enabled: existing?.enabled ?? true,
+      createdAt: existing?.createdAt ?? this.now(),
+    });
+  }
+
+  private skillMatchesSession(skill: SkillRow): boolean {
+    if (skill.requiresAdmin) return this.isAdmin();
+    if (skill.requiredGroups.length === 0) return true;
+    const groups = this.session?.groups ?? [];
+    return skill.requiredGroups.some((group) => groups.includes(group));
+  }
+
+  private skillVisible(skill: SkillRow): boolean {
+    return this.skillMatchesSession(skill);
+  }
+
+  private skillUsable(skill: SkillRow): boolean {
+    return skill.enabled && this.skillMatchesSession(skill);
+  }
+
+  private skillView(skill: SkillRow, assignedIds: string[]): SkillView {
+    return {
+      id: skill.id,
+      name: skill.name,
+      description: skill.description,
+      instructions: skill.instructions,
+      requiredGroups: skill.requiredGroups,
+      requiresAdmin: skill.requiresAdmin,
+      builtin: skill.builtin,
+      enabled: skill.enabled,
+      assigned: assignedIds.includes(skill.id),
+    };
+  }
+
+  private storeSkillDraft(draft: SkillDraft): SkillView {
+    const size = draft.instructions.length + draft.files.reduce((sum, file) => sum + file.path.length + file.text.length, 0);
+    if (size > 200_000) throw new Error('That skill is larger than 200 KB.');
+    if (!draft.name.trim()) throw new Error('Give the skill a name.');
+    if (!draft.instructions.trim()) throw new Error('The skill needs instructions.');
+    const skill: SkillRow = {
+      id: randomId(),
+      name: draft.name.trim(),
+      description: draft.description.trim(),
+      instructions: draft.instructions.trim(),
+      files: draft.files,
+      requiredGroups: draft.requiredGroups,
+      requiresAdmin: false,
+      builtin: false,
+      enabled: true,
+      createdAt: this.now(),
+    };
+    this.options.db.upsertSkill(skill);
+    return this.skillView(skill, []);
+  }
+
+  private usableSkills(agent: AgentRow): SkillRow[] {
+    return agent.skillIds.flatMap((id) => {
+      const skill = this.options.db.getSkill(id);
+      return skill && this.skillUsable(skill) ? [skill] : [];
+    });
+  }
+
+  private skillPrompt(agent: AgentRow): string {
+    return this.usableSkills(agent)
+      .map((skill) => {
+        const head = `Skill: ${skill.name}\n${skill.description}\n${skill.instructions}`;
+        if (skill.id === PINGONE_SKILL_ID) {
+          return this.pingoneBundle ? `${head}\n\n${pingoneAuthorizeSkillLayer(this.pingoneBundle)}` : head;
+        }
+        const files = skill.files.map((file) => `\n\nFile ${file.path}:\n${file.text}`).join('');
+        return `${head}${files}`;
+      })
+      .join('\n\n');
+  }
+
+  private audit(agentId: string | null, action: string, detail: string): void {
+    this.options.db.insertAudit({
+      id: randomId(),
+      at: this.now(),
+      userId: this.session?.userId ?? '',
+      username: this.session?.username ?? '',
+      agentId,
+      action,
+      detail,
+    });
+  }
+
+  private async pullRemotePolicies(): Promise<void> {
+    const token = await this.workerAccessToken();
+    const remote = await listRemotePolicies(this.options.config, token, this.authorize);
+    const starters = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), this.session?.username ?? '');
+    const { dropIds } = reconcilePolicyCache(this.options.db.listPolicies(), remote, starters);
+    for (const id of dropIds) this.options.db.deletePolicy(id);
+    const local = this.options.db.listPolicies();
+    for (const item of remote) {
+      const marker = parseScaffoldMarker(item.description);
+      const match = local.find((policy) => policy.remoteId === item.id || policy.id === marker?.id || policy.name === item.name);
+      if (match) {
+        this.options.db.upsertPolicy({
+          ...match,
+          enabled: item.enabled,
+          remoteId: item.id,
+          updatedAt: item.updatedAt ?? match.updatedAt,
+          when: Object.keys(match.when).length > 0 ? match.when : (marker?.when ?? match.when),
+          effect: Object.keys(match.effect).length > 0 ? match.effect : (marker?.effect ?? match.effect),
+        });
+        continue;
+      }
+      this.options.db.upsertPolicy({
+        id: marker?.id ?? item.id,
+        name: item.name,
+        description: item.description,
+        enabled: item.enabled,
+        updatedAt: item.updatedAt,
+        updatedBy: null,
+        scaffold: Boolean(marker) || item.description.includes(SCAFFOLD_MARKER),
+        remoteId: item.id,
+        when: marker?.when ?? {},
+        effect: marker?.effect ?? {},
+      });
+    }
+  }
+
+  private async confirmScaffold(incoming: AuthorizePolicy[]): Promise<PolicyScaffoldResult> {
+    const epoch = this.policyEpoch;
+    if (this.options.config.tenant.mode === 'pingone') await this.pullRemotePolicies();
+    if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
+    const existing = this.options.db.listPolicies();
+    const merged = mergeScaffold(existing, incoming);
+    const preview = incoming.map(policyView);
+    for (const policy of merged.created) {
+      if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
+      this.options.db.upsertPolicy(policy);
+    }
+    const pending = this.options.db.listPolicies().filter((policy) => policy.scaffold && !policy.remoteId);
+    const posted = await this.pushScaffold(pending, epoch);
+    if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
+    const warning = this.options.config.tenant.mode === 'pingone' ? await this.provisionRealPolicies(epoch) : undefined;
+    if (epoch !== this.policyEpoch) return this.abandonedScaffold(incoming);
+    const created = posted.length > 0 ? posted : merged.created;
+    if (created.length > 0) {
+      this.audit(null, 'policy:scaffold', created.map((policy) => policy.name).join(', '));
+    }
+    this.decisionCache = null;
+    await this.refreshFeatures();
+    return { preview, created: created.map(policyView), policies: this.options.db.listPolicies().map(policyView), warning };
+  }
+
+  private abandonedScaffold(incoming: AuthorizePolicy[]): PolicyScaffoldResult {
+    return {
+      preview: incoming.map(policyView),
+      created: [],
+      policies: this.options.db.listPolicies().map(policyView),
+    };
+  }
+
+  private async provisionRealPolicies(epoch: number): Promise<string | undefined> {
+    if (epoch !== this.policyEpoch) return;
+    const token = await this.workerAccessToken();
+    const result = await provisionAuthorize({
+      config: this.options.config,
+      accessToken: token,
+      client: this.authorize,
+      store: {
+        get: (kind, name) => this.options.db.getTfObject(kind, name),
+        put: (kind, name, remoteId, contentHash) => this.options.db.upsertTfObject(kind, name, remoteId, contentHash),
+      },
+      adminGroup: this.options.config.access.adminGroup,
+      delegations: this.options.config.authorize.delegations,
+      alwaysCurrent: this.options.config.authorize.alwaysCurrent,
+      shouldContinue: () => epoch === this.policyEpoch,
+      log: this.options.log,
+      logPath: this.options.logPath,
+    });
+    if (epoch !== this.policyEpoch || !result.decisionEndpointId) return result.warning;
+    this.options.db.setSetting('authorize.decisionEndpointId', result.decisionEndpointId);
+    this.options.config.authorize.decisionEndpointId = result.decisionEndpointId;
+    this.persistDecisionEndpoint(result.decisionEndpointId);
+    for (const policy of result.policies) {
+      if (epoch !== this.policyEpoch) return result.warning;
+      this.options.db.upsertPolicy(policy);
+    }
+    return result.warning;
+  }
+
+  private persistDecisionEndpoint(id: string): void {
+    const path = this.options.configPath;
+    if (!path) return;
+    try {
+      const raw = JSON.parse(readFileSync(path, 'utf8')) as { authorize?: Record<string, unknown> };
+      raw.authorize = { ...(raw.authorize ?? {}), decisionEndpointId: id };
+      writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
+    } catch {
+      // The settings row and the running config already hold the id.
+    }
+  }
+
+  private async decisionCall(input: DecisionInput): Promise<DecisionCall | null> {
+    if (!this.session) return null;
+    const accessToken = (await this.subjectToken().catch(() => '')).trim();
+    const txToken = (await this.delegationToken()).trim();
+    if (!decisionTokensReady(accessToken, txToken)) return null;
+    return {
+      ...input,
+      userId: this.session.userId,
+      username: this.session.username,
+      accessToken,
+      txToken,
+      adminGroup: this.options.config.access.adminGroup,
+      parentName: 'EnterpriseAgent',
+    };
+  }
+
+  private async delegationToken(): Promise<string> {
+    const configured = this.options.config.authorize.delegationAudience.trim();
+    const match = this.options.config.tokenExchange.audiences.find((item) => item.audience === configured);
+    const audience = match?.audience || this.options.config.tokenExchange.audiences[0]?.audience || '';
+    if (!audience) return '';
+    const scope = match?.scope || this.options.config.tokenExchange.audiences.find((item) => item.audience === audience)?.scope || '';
+    try {
+      return await this.tokenForAudience(audience, scope);
+    } catch {
+      return '';
+    }
+  }
+
+  private async pushScaffold(pending: AuthorizePolicy[], epoch: number): Promise<AuthorizePolicy[]> {
+    if (pending.length === 0 || this.options.config.tenant.mode !== 'pingone') return [];
+    if (epoch !== this.policyEpoch) return [];
+    const token = await this.workerAccessToken();
+    const synced = await syncRemoteScaffold(
+      this.options.config,
+      token,
+      pending,
+      this.authorize,
+      (policy) => {
+        if (epoch !== this.policyEpoch) return;
+        this.options.db.upsertPolicy(policy);
+      },
+      () => epoch === this.policyEpoch,
+    );
+    return epoch === this.policyEpoch ? synced.created : [];
+  }
+
+  private async refreshFeatures(): Promise<void> {
+    if (!this.session) {
+      this.features = failClosed(this.now());
+      this.decisionCache = null;
+      return;
+    }
+    const input = this.decisionInput();
+    const key = decisionCacheKey(input);
+    const cached = this.decisionCache;
+    if (cached && cached.key === key && this.now() - cached.at < this.options.config.authorize.cacheMs) {
+      this.features = cached.decision;
+      return;
+    }
+    const stored = this.options.db.listPolicies();
+    const starters = scaffoldPolicies(this.options.config.access.adminGroup, this.now(), 'starter');
+    const endpoint = this.decisionEndpointId();
+    const local = evaluatePolicies(this.policiesForDecision(), input, this.now());
+    if (!endpoint) {
+      this.applyFeatures(local, key);
+      return;
+    }
+    const call = await this.decisionCall(input);
+    if (!call) {
+      this.applyFeatures(failClosed(this.now()), key);
+      return;
+    }
+    try {
+      const token = await this.workerAccessToken();
+      const body = await postDecision(this.options.config, token, call, this.authorize);
+      const remote = featuresFromAuthorize(body, this.now());
+      const fallback = stored.length === 0 ? evaluatePolicies(starters, input, this.now()) : local;
+      this.applyFeatures(remote ?? fallback, key);
+    } catch {
+      this.applyFeatures(failClosed(this.now()), key);
+    }
   }
 
   private askApproval(request: ApprovalRequest): Promise<ApprovalChoice> {
@@ -1174,6 +2055,154 @@ export class Runtime {
     return this.state();
   }
 
+  reloadProtectSettings(): void {
+    this.syncProtectSettingsFromDisk();
+    if (!this.session) {
+      this.stopProtectPoll();
+      return;
+    }
+    this.scheduleProtectPoll();
+  }
+
+  nudgeProtectPoll(): void {
+    if (!this.session || this.shouldPauseProtect()) return;
+    void this.runProtectPoll(false);
+  }
+
+  private syncProtectSettingsFromDisk(): void {
+    const path = this.options.configPath;
+    if (!path) return;
+    try {
+      const next = loadEnterprise(path);
+      this.options.config.protect.pollIntervalSeconds = next.protect.pollIntervalSeconds;
+      this.options.config.protect.pauseWhenHidden = next.protect.pauseWhenHidden;
+    } catch {
+      // Keep the interval already in memory when the file cannot be read.
+    }
+  }
+
+  private protectIntervalSeconds(): number {
+    return this.options.config.protect.pollIntervalSeconds;
+  }
+
+  private shouldPauseProtect(): boolean {
+    if (!this.options.config.protect.enabled || !this.options.config.protect.pauseWhenHidden) return false;
+    if (!this.options.protectActive) return false;
+    return !this.options.protectActive();
+  }
+
+  private scheduleProtectPoll(): void {
+    this.protectCancel?.();
+    this.protectCancel = null;
+    this.syncProtectSettingsFromDisk();
+    const delay = nextProtectDelayMs(this.protectIntervalSeconds(), this.protectRetryAfterSeconds);
+    this.protectRetryAfterSeconds = null;
+    if (delay == null || !this.session || !this.options.config.protect.enabled) return;
+    const schedule = this.options.schedule ?? defaultProtectSchedule;
+    this.protectCancel = schedule(delay, () => this.runProtectPoll(false));
+  }
+
+  private stopProtectPoll(): void {
+    this.protectGeneration += 1;
+    this.protectQueued = false;
+    this.protectRetryAfterSeconds = null;
+    this.protectCancel?.();
+    this.protectCancel = null;
+  }
+
+  private async runProtectPoll(force: boolean): Promise<void> {
+    if (this.protectPollTask) {
+      this.protectQueued = true;
+      while (this.protectPollTask) await this.protectPollTask;
+      return;
+    }
+    const generation = this.protectGeneration;
+    const task = this.executeProtectPoll(generation, force);
+    this.protectPollTask = task;
+    try {
+      await task;
+    } finally {
+      if (this.protectPollTask === task) this.protectPollTask = null;
+    }
+    if (generation !== this.protectGeneration || !this.session) return;
+    if (this.protectQueued) {
+      this.protectQueued = false;
+      await this.runProtectPoll(false);
+      return;
+    }
+    this.scheduleProtectPoll();
+  }
+
+  private async executeProtectPoll(generation: number, force: boolean): Promise<void> {
+    if (!this.session || !this.options.config.protect.enabled) return;
+    if (!force && nextProtectDelayMs(this.protectIntervalSeconds()) == null) return;
+    if (!(await this.ensureSessionForPoll())) return;
+    if (generation !== this.protectGeneration || !this.session) return;
+    if (!force && this.shouldPauseProtect()) return;
+    const signals = await this.freshSignals();
+    if (generation !== this.protectGeneration || !this.session) return;
+    try {
+      const next = await this.evaluateRisk(this.session.userId, this.session.username, signals);
+      if (generation !== this.protectGeneration || !this.session) return;
+      await this.applyPolledRisk(next);
+    } catch (error) {
+      if (generation !== this.protectGeneration || !this.session) return;
+      const kind = classifyProtectPollFailure(error);
+      if (kind === 'rate-limit') {
+        this.protectRetryAfterSeconds = error instanceof RiskEvaluationError ? error.retryAfterSeconds : null;
+        return;
+      }
+      if (kind === 'transient' && this.risk) return;
+      await this.applyPolledRisk(unscoredRisk(this.options.config.protect.policy, this.now(), Boolean(signals)));
+    }
+  }
+
+  private async ensureSessionForPoll(): Promise<boolean> {
+    if (!this.session) return false;
+    const freshness = classifyAccessToken(this.session, this.now());
+    if (freshness === 'valid') return true;
+    if (freshness === 'refresh') {
+      try {
+        await this.refreshSessionToken();
+        return Boolean(this.session);
+      } catch {
+        this.stopProtectPoll();
+        return false;
+      }
+    }
+    this.stopProtectPoll();
+    return false;
+  }
+
+  private async freshSignals(): Promise<string> {
+    const collect = this.options.collectSignals;
+    if (!collect) return this.pendingSignals;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const next = await Promise.race([
+        collect(),
+        new Promise<string>((resolve) => {
+          timer = setTimeout(() => resolve(''), 4_000);
+        }),
+      ]);
+      if (next) this.pendingSignals = next;
+    } catch {
+      // A signals failure keeps the payload from sign-in.
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return this.pendingSignals;
+  }
+
+  private async applyPolledRisk(next: RiskView): Promise<void> {
+    const levelChanged = this.risk?.level !== next.level;
+    this.risk = next;
+    this.options.db.setSetting('risk', JSON.stringify(next));
+    if (levelChanged) this.decisionCache = null;
+    await this.refreshFeatures();
+    this.options.onState?.(this.state());
+  }
+
   private async evaluateRisk(userId: string, username: string, signals: string): Promise<RiskView> {
     const evaluatedAt = this.now();
     if (!this.options.config.protect.enabled) {
@@ -1246,14 +2275,17 @@ export class Runtime {
       tokenType: tokens.tokenType,
       userId,
       username,
+      groups: this.groupsForTokens(tokens),
     };
     await this.options.secrets.set('session', JSON.stringify(this.session));
+    await this.refreshFeatures();
     this.login = { phase: 'idle' };
     this.stepUpRequired = false;
     this.pendingLogin = null;
     this.flow = null;
     this.stepUpRestarted = false;
     await this.exchangeAudiences();
+    this.scheduleProtectPoll();
   }
 
   private async exchangeAudiences(): Promise<void> {
@@ -1446,6 +2478,7 @@ export class Runtime {
       jti: randomId(),
       mock: true,
     };
+    if (audience === 'user') claims[this.options.config.access.groupsClaim] = this.mockGroupNames();
     if (includeAct) claims.act = { sub: this.agentClientId() };
     const accessToken = `${encodeJsonSegment({ alg: 'none', typ: 'mock' })}.${encodeJsonSegment(claims)}.mock`;
     return { accessToken, expiresAt, tokenType: 'Bearer', scope: tokenScope };
@@ -1579,7 +2612,7 @@ export class Runtime {
         return;
       }
     }
-    this.session = stored;
+    this.session = { ...stored, groups: stored.groups ?? this.groupsForTokens(stored) };
     const riskRaw = this.options.db.getSetting('risk');
     if (riskRaw) {
       try {
@@ -1588,7 +2621,9 @@ export class Runtime {
         this.risk = null;
       }
     }
+    await this.refreshFeatures();
     await this.exchangeAudiences();
+    this.scheduleProtectPoll();
   }
 
   private async hydrateSecrets(): Promise<void> {
@@ -1597,6 +2632,10 @@ export class Runtime {
     await this.copyEnvSecret('openaiApiKey', 'OPENAI_API_KEY');
     await this.copyEnvSecret('anthropicApiKey', 'ANTHROPIC_API_KEY');
     await this.copyEnvSecret('genericApiKey', 'GENERIC_PROVIDER_API_KEY');
+  }
+
+  private introspectionNote(): string {
+    return describeIntrospection(this.options.config.tenant.clientId);
   }
 
   private async copyEnvSecret(account: string, envName: string): Promise<void> {
@@ -1649,12 +2688,16 @@ export class Runtime {
         id: server.id,
         name: server.name,
         transport: server.transport,
-        command: server.command ?? '',
-        args: server.args ?? [],
-        url: server.url ?? '',
-        audience: server.audience ?? '',
-        scope: server.scope ?? '',
-        enabled: true,
+        description: server.description,
+        command: server.command,
+        args: server.args,
+        url: server.url,
+        headers: server.headers,
+        envKeys: server.envKeys,
+        timeout: server.timeout,
+        audience: server.audience,
+        scope: server.scope,
+        enabled: server.enabled,
       });
     }
     const brandedId = config.agents.find((agent) => agent.nameFromBranding)?.id ?? config.agents[0]?.id ?? 'default';
@@ -1717,6 +2760,10 @@ export class Runtime {
       enterpriseLocked: true,
       routines: this.listRoutines(agent.id),
       skillIds: agent.skillIds,
+      skills: this.options.db
+        .listSkills()
+        .filter((skill) => this.skillVisible(skill))
+        .map((skill) => this.skillView(skill, agent.skillIds)),
     };
   }
 
@@ -1758,22 +2805,138 @@ export class Runtime {
       userId: this.session.userId,
       username: this.session.username,
       expiresAt: this.session.expiresAt,
+      groups: this.session.groups ?? [],
+      admin: this.isAdmin(),
     };
   }
 
   private serverView(server: McpServerRow): McpServerView {
-    const tools = this.hub.tools(server.id);
+    const pingone = server.id === this.options.config.authorize.mcpServerId;
+    const tools = pingone && (!this.isAdmin() || !this.currentFeatures().pingoneTools) ? [] : this.hub.tools(server.id);
+    const authKind = pingone ? 'worker' : server.audience.trim() ? 'exchange' : this.usesOauth(server) ? 'oauth' : 'open';
+    const signedIn = this.oauthSignedIn.has(server.id);
     return {
-      ...server,
+      id: server.id,
+      name: server.name,
+      transport: server.transport,
+      type: server.transport === 'http' ? 'streamable_http' : server.transport,
+      description: server.description,
+      command: server.command,
+      args: server.args,
+      url: server.url,
+      headers: Object.entries(server.headers).map(([name, value]) => ({ name, value })),
+      envKeys: server.envKeys,
+      timeout: server.timeout,
+      audience: server.audience,
+      scope: server.scope,
+      enabled: server.enabled,
       status: this.hub.status(server.id),
-      error: this.hub.error(server.id) ?? this.exchangeErrors.get(server.audience),
+      error: this.hub.error(server.id) ?? (server.audience ? this.exchangeErrors.get(server.audience) : undefined),
       tools: tools.map((tool) => ({
         name: tool.name,
         description: tool.description,
         readOnlyHint: tool.readOnlyHint,
       })),
+      authKind,
+      needsSignIn: authKind === 'oauth' && server.enabled && !signedIn,
+      signedIn,
+      needsClient: this.needsClient.has(server.id),
+      oauthSteps: this.oauthSteps.get(server.id) ?? [],
     };
   }
+
+  private usesOauth(server: McpServerRow): boolean {
+    if (server.id === this.options.config.authorize.mcpServerId) return false;
+    if (server.audience.trim()) return false;
+    return server.transport === 'http' || server.transport === 'sse';
+  }
+
+  private async rememberOauth(server: McpServerRow): Promise<void> {
+    if (!this.usesOauth(server)) {
+      this.oauthSignedIn.delete(server.id);
+      return;
+    }
+    const raw = await this.options.secrets.get(mcpOauthTokenAccount(server.id));
+    if (raw) this.oauthSignedIn.add(server.id);
+    else this.oauthSignedIn.delete(server.id);
+  }
+
+  private async currentOauthAccessToken(extensionId: string): Promise<string | undefined> {
+    try {
+      const tokens = await refreshStoredMcpToken({
+        extensionId,
+        secrets: this.options.secrets,
+        fetchImpl: this.options.fetchImpl,
+        now: () => this.now(),
+      });
+      if (tokens) {
+        this.oauthSignedIn.add(extensionId);
+        return tokens.accessToken;
+      }
+      this.oauthSignedIn.delete(extensionId);
+      return undefined;
+    } catch {
+      this.oauthSignedIn.delete(extensionId);
+      return undefined;
+    }
+  }
+
+  private async extensionEnv(server: McpServerRow): Promise<Record<string, string>> {
+    const env: Record<string, string> = {};
+    for (const key of server.envKeys) {
+      const value = await this.options.secrets.get(mcpEnvAccount(server.id, key));
+      if (value !== null) env[key] = value;
+    }
+    return env;
+  }
+
+  private async storeExtensionEnv(
+    id: string,
+    entries: Array<{ name: string; value: string }>,
+    previous: string[],
+  ): Promise<string[]> {
+    const names: string[] = [];
+    for (const entry of entries) {
+      const name = entry.name.trim();
+      if (!name || names.includes(name)) continue;
+      names.push(name);
+      if (entry.value) await this.options.secrets.set(mcpEnvAccount(id, name), entry.value);
+    }
+    for (const old of previous) {
+      if (!names.includes(old)) await this.options.secrets.delete(mcpEnvAccount(id, old));
+    }
+    return names;
+  }
+}
+
+function extensionKind(input: McpServerInput): McpServerRow['transport'] {
+  const type = input.type ?? (input.transport === 'http' ? 'streamable_http' : input.transport) ?? 'stdio';
+  if (type === 'streamable_http') return 'http';
+  if (type === 'sse' || type === 'stdio' || type === 'builtin') return type;
+  if (input.transport === 'http' || input.transport === 'sse' || input.transport === 'builtin') return input.transport;
+  return 'stdio';
+}
+
+function headerRecord(headers: Array<{ name: string; value: string }>): Record<string, string> {
+  const record: Record<string, string> = {};
+  for (const header of headers) {
+    const name = header.name.trim();
+    if (!name) continue;
+    record[name] = header.value;
+  }
+  return record;
+}
+
+function policyView(policy: AuthorizePolicy): PolicyView {
+  return {
+    id: policy.id,
+    name: policy.name,
+    description: policy.description,
+    enabled: policy.enabled,
+    updatedAt: policy.updatedAt,
+    updatedBy: policy.updatedBy,
+    scaffold: policy.scaffold,
+  };
 }
 
 function emptyFields(): InstructionFields {
@@ -1796,4 +2959,19 @@ function storedTemperature(stored: string | null, configured: number | undefined
 
 function stringClaim(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+function policyResetDetail(names: string[]): string {
+  const count = names.length;
+  const noun = count === 1 ? 'policy' : 'policies';
+  const listed = count === 0 ? '' : ` (${names.join(', ')})`;
+  return `Cleared ${count} local ${noun}${listed}, the Authorize decision cache, saved Trust Framework ids, and any scaffold still in progress. Nothing in PingOne was deleted.`;
+}
+
+function defaultProtectSchedule(delayMs: number, run: () => Promise<void>): () => void {
+  const timer = setTimeout(() => {
+    void run();
+  }, delayMs);
+  timer.unref();
+  return () => clearTimeout(timer);
 }

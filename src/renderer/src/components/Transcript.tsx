@@ -1,40 +1,113 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { nextStickState } from '@shared/chat/stick';
 import type { ChatMessage, ToolInvocation } from '@shared/types';
 import { Markdown } from './Markdown';
 
-export function Transcript({ messages, showReasoning }: { messages: ChatMessage[]; showReasoning: boolean }) {
+export function Transcript({
+  messages,
+  showReasoning,
+  resetKey,
+}: {
+  messages: ChatMessage[];
+  showReasoning: boolean;
+  resetKey?: string;
+}) {
+  const scroller = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+  const lastScrollTop = useRef(0);
+  const [showJump, setShowJump] = useState(false);
+
+  function scrollToBottom(): void {
+    const node = scroller.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+    lastScrollTop.current = node.scrollTop;
+  }
+
+  useLayoutEffect(() => {
+    pinned.current = true;
+    setShowJump(false);
+    scrollToBottom();
+  }, [resetKey]);
+
+  useLayoutEffect(() => {
+    const next = nextStickState({ pinned: pinned.current, scrollTop: lastScrollTop.current }, { type: 'content' });
+    pinned.current = next.pinned;
+    setShowJump(next.showJump);
+    if (next.scroll) scrollToBottom();
+  }, [messages]);
+
+  function onScroll(): void {
+    const node = scroller.current;
+    if (!node) return;
+    const next = nextStickState(
+      { pinned: pinned.current, scrollTop: lastScrollTop.current },
+      { type: 'scroll', scrollTop: node.scrollTop, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight },
+    );
+    lastScrollTop.current = next.scrollTop;
+    pinned.current = next.pinned;
+    setShowJump(next.showJump);
+  }
+
+  function jump(): void {
+    pinned.current = true;
+    setShowJump(false);
+    scrollToBottom();
+  }
+
   return (
-    <div className="transcript">
-      {messages.map((message) => (
-        <article key={message.id} className={`bubble ${message.role}`}>
-          <header>{message.authorName || message.role}</header>
-          {showReasoning ? <ThinkingPanel message={message} /> : null}
-          {message.content ? <Markdown text={message.content} /> : null}
-          {message.phase === 'cancelled' ? <p className="muted">Stopped. The partial answer is kept.</p> : null}
-          {message.attachments.length > 0 ? (
-            <ul className="chips">
-              {message.attachments.map((attachment) => (
-                <li key={attachment.id}>
-                  {attachment.name}
-                  <span>{Math.ceil(attachment.size / 1024)} KB</span>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-          {message.tools.map((tool) => (
-            <div key={tool.id} className={`tool-card ${tool.status}`}>
-              <header>
-                <strong>{toolStatusLabel(tool)}</strong>
-                <span>{tool.serverName}</span>
-              </header>
-              {tool.status === 'done' || tool.status === 'denied' || tool.status === 'error' ? (
-                <pre>{JSON.stringify(tool.args, null, 2)}</pre>
-              ) : null}
-              {tool.result ? <p>{tool.result}</p> : null}
-            </div>
-          ))}
-        </article>
-      ))}
+    <div className="transcript-wrap">
+      <div className="transcript" ref={scroller} onScroll={onScroll}>
+        {messages.map((message) => (
+          <article key={message.id} className={`bubble ${message.role}`}>
+            <header>{message.authorName || message.role}</header>
+            {showReasoning ? <ThinkingPanel message={message} /> : null}
+            {message.content ? <Markdown text={message.content} /> : null}
+            {message.phase === 'cancelled' ? <p className="muted">Stopped. The partial answer is kept.</p> : null}
+            {message.attachments.length > 0 ? (
+              <ul className="chips">
+                {message.attachments.map((attachment) => (
+                  <li key={attachment.id}>
+                    {attachment.name}
+                    <span>{Math.ceil(attachment.size / 1024)} KB</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {message.tools.map((tool) => (
+              <div key={tool.id} className={`tool-card ${tool.status}`}>
+                <header>
+                  <strong>{toolStatusLabel(tool)}</strong>
+                  <span>{tool.serverName}</span>
+                </header>
+                {tool.status === 'done' || tool.status === 'denied' || tool.status === 'error' ? (
+                  <pre>{JSON.stringify(tool.args, null, 2)}</pre>
+                ) : null}
+                {tool.result ? <p>{tool.result}</p> : null}
+              </div>
+            ))}
+          </article>
+        ))}
+      </div>
+      <button
+        type="button"
+        className={showJump ? 'jump-latest is-visible' : 'jump-latest'}
+        onClick={jump}
+        tabIndex={showJump ? 0 : -1}
+        aria-hidden={showJump ? undefined : true}
+      >
+        <svg className="jump-latest-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <path
+            d="M8 2.75v8.5M4.25 8.25 8 12.25l3.75-4"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+        Jump to latest
+      </button>
     </div>
   );
 }

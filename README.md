@@ -4,16 +4,18 @@ A white-label desktop AI agent. The product name, agent name, logo, colors, and 
 
 The sample theme in `branding/default.json` names the app and the agent **Pingy**. That name is an example only. Replace the branding file to ship the client under another name.
 
+A first-time tester can follow [QUICKSTART.md](QUICKSTART.md). In VS Code, **First-time tester: install & launch** checks Node.js, installs dependencies, creates local config only when it is missing, and starts mock mode.
+
 ## What this repository contains
 
-This is the foundation: a runnable Electron app with PingOne sign-in (including a mock mode), token exchange, PingOne Protect risk policy, an MCP client with tool approvals, single-agent chat, and the data model plus screens for instruction layers, group rooms, routines, and cron. Later work is listed under [Follow-up issues](#follow-up-issues).
+This is the foundation: a runnable Electron app with PingOne sign-in (including a mock mode), token exchange, PingOne Protect risk policy, an MCP client with tool approvals, single-agent chat, and the data model plus screens for instruction layers, group rooms, routines, cron, per-agent skills, and a group-gated Policy tab for PingOne Authorize. Later work is listed under [Follow-up issues](#follow-up-issues).
 
 ## Stack
 
 | Piece | Choice |
 | --- | --- |
 | Shell | Electron 44, React 19, TypeScript, Vite via electron-vite |
-| MCP | `@modelcontextprotocol/client` 2.x (stdio, Streamable HTTP, SSE fallback) |
+| MCP | `@modelcontextprotocol/client` 2.x (stdio, Streamable HTTP, SSE fallback, MCP OAuth) |
 | Agent runtime | LangGraph.js in the Electron main process. No Python runtime. |
 | Models | LangChain chat models for OpenAI (including GPT-5 reasoning), Anthropic (extended thinking), the generic HTTP provider, and mock mode |
 | Local data | `node:sqlite` (`DatabaseSync`) in the user-data directory, including the LangGraph thread checkpointer |
@@ -81,16 +83,16 @@ flowchart TB
   Cron --> Runtime
 ```
 
-A turn is one LangGraph. The model node calls a LangChain chat model and streams tokens, reasoning, and phase changes. The tool node is the only place a tool can run: it applies the Protect action (block, read-only, restrict, or the remembered choice), pauses with `interrupt` for allow once / always / deny, and only then exchanges a token (user subject plus agent actor) and passes that token into the MCP call. Enterprise, persona, user, room, and risk instructions are fields on the graph state. The model node composes them, with the locked enterprise layer first. Group rooms are the same graph with a turn-taking step across each member, and each member keeps its own instructions. Routines and cron start that graph. Threads are checkpointed in SQLite (`langgraph.sqlite` next to attachments) so an approval can resume on a new graph instance. The checkpointer uses `node:sqlite` rather than `better-sqlite3`, which does not load in Electron.
+A turn is one LangGraph. The model node calls a LangChain chat model and streams tokens, reasoning, and phase changes. The tool node is the only place a tool can run: it applies the Protect action (block, read-only, restrict, or the remembered choice), pauses with `interrupt` for allow once / always / deny, and only then obtains a token and passes it into the MCP call. An HTTP extension with an audience in `enterprise.json` still uses token exchange (user subject plus agent actor). The PingOne MCP server, whose id matches `authorize.mcpServerId`, uses the worker client-credentials token instead, and the tool node denies it unless the signed-in user is in the admin group, Authorize allows PingOne tools, and that agent has the PingOne skill. HTTP extensions with no audience use MCP authorization (protected resource metadata, authorization-server metadata, dynamic client registration or a client ID metadata document, then authorization code with PKCE). Enterprise, persona, user, room, risk, and assigned skill instructions are fields on the graph state. The model node composes them, with the locked enterprise layer first. Group rooms are the same graph with a turn-taking step across each member, and each member keeps its own instructions. Routines and cron start that graph. Threads are checkpointed in SQLite (`langgraph.sqlite` next to attachments) so an approval can resume on a new graph instance. The checkpointer uses `node:sqlite` rather than `better-sqlite3`, which does not load in Electron.
 
 Sign-in, in order:
 
 1. The login screen collects a username and password and, in real PingOne mode, Protect Signals data.
 2. Preferred login is redirectionless **pi.flow** (`response_mode=pi.flow`) with authorization code and PKCE (S256). The system browser plus a `127.0.0.1` loopback redirect is a configurable fallback.
-3. Protect runs a risk evaluation before the session is stored. Policy maps the level and reason codes to one action: allow, step-up MFA, restrict tools, read-only, or block. The most restrictive matching action wins.
+3. Protect runs a risk evaluation before the session is stored. Policy maps the level and reason codes to one action: allow, step-up MFA, restrict tools, read-only, or block. The most restrictive matching action wins. After sign-in, Protect is polled again on `protect.pollIntervalSeconds` (default 30; `0` turns polling off). Each result updates the risk indicator, the Protect action on the next turn, and the Authorize decision when the level changes.
 4. A blocked result never stores a session. Step-up restarts the flow with `acr_values` when that value is configured. Mock mode accepts any 6-digit one-time code for the new-device scenario.
 5. The user token is stored in the keychain. If a refresh token exists, expiry refreshes it. Otherwise the user signs in again.
-6. The AI Agent application mints its own access token with client credentials. That token is cached until it expires. Each configured audience is then exchanged (RFC 8693) on the same AI Agent client: the user's access token is the `subject_token`, and the agent token is the `actor_token`. MCP connections receive the exchanged token: HTTP and SSE via the client auth provider, stdio via `MCP_ACCESS_TOKEN`.
+6. The AI Agent application mints its own access token with client credentials. That token is cached until it expires. Each configured audience is then exchanged (RFC 8693) on the same AI Agent client: the user's access token is the `subject_token`, and the agent token is the `actor_token`. Exchange runs only for an MCP server that has an audience. HTTP and SSE receive that token through the client auth provider, and stdio receives it as `MCP_ACCESS_TOKEN`. An HTTP extension with no audience does not exchange a token; its card stays on Needs sign-in until MCP authorization completes.
 
 The agent is risk-aware. The composed system prompt is enterprise policy, then persona, then the user layer, then optional room instructions, then the current risk context (level, reasons, and the behaviour the policy requires).
 
@@ -104,6 +106,8 @@ npm run dev
 ```
 
 Mock mode is the committed example, so `npm run dev` signs in locally and does not call PingOne. Any non-empty password is accepted. On the login screen, choose a risk scenario: low, new device, anomalous location, impossible travel, or bot.
+
+The same first run is the VS Code configuration **First-time tester: install & launch**. It never overwrites an existing `.env` or `config/enterprise.json`. **Dev** debugs the main and renderer processes, **Debug main process** debugs the main process only, and the **Run tests** task runs `npm test`. The steps, environment variables, and PingOne checklist are in [QUICKSTART.md](QUICKSTART.md).
 
 ### If dev reports "Electron uninstall"
 
@@ -132,9 +136,10 @@ In `config/enterprise.json` set `tenant.mode` to `pingone` and fill the hosts, e
 | Purpose | Client id | Secret |
 | --- | --- | --- |
 | PingOne Protect | `PINGONE_WORKER_CLIENT_ID` | `PINGONE_WORKER_CLIENT_SECRET` |
-| RFC 8693 token exchange | `tokenExchange.clientId` | `PINGONE_AGENT_CLIENT_SECRET` |
+| RFC 8693 token exchange, and delegation introspection | `tokenExchange.clientId` | `PINGONE_AGENT_CLIENT_SECRET` |
+| User SSO token introspection | `tenant.clientId` (the SSO login application) | none |
 
-Both secrets are copied into the OS keychain on launch when that account is empty (`workerClientSecret` and `agentClientSecret`). Settings can store either secret as well. If `tokenExchange.clientId` or `PINGONE_AGENT_CLIENT_SECRET` is unset, token exchange falls back to the worker id and secret, so a deployment that still uses one confidential application keeps working. When both are set, exchange uses the AI Agent application and Protect stays on the worker. Config parsing rejects secret-looking keys so a client secret cannot be committed inside JSON.
+User introspection POSTs `token` and `client_id` to `{authHost}/{environmentId}/as/introspect` with no Authorization header. `client_id` is the SSO login application the app already has in `tenant.clientId`. Scaffold stores that id on the Definition `user-introspect-client-id`. Delegation introspection keeps BASIC auth on the enterprise agent client. The two secrets are copied into the OS keychain on launch when that account is empty (`workerClientSecret` and `agentClientSecret`). Settings can store either of them as well. If `tokenExchange.clientId` or `PINGONE_AGENT_CLIENT_SECRET` is unset, token exchange falls back to the worker id and secret, so a deployment that still uses one confidential application keeps working. When both are set, exchange uses the AI Agent application and Protect stays on the worker. Config parsing rejects secret-looking keys so a client secret cannot be committed inside JSON.
 
 `BRANDING_PATH` overrides the branding file. `ENTERPRISE_CONFIG` overrides the enterprise file. The defaults are `branding/default.json` and, when present, `config/enterprise.json`, otherwise the example.
 
@@ -179,7 +184,9 @@ A missing `appName` throws. The app does not substitute a built-in name.
 
 ## Enterprise config
 
-`config/enterprise.example.json` holds the tenant, token-exchange audiences, Protect policy, locked enterprise instructions, the starting agents, rooms, MCP servers, routines, and provider defaults. After the first run, agents, their instructions, and their routines are edited in the Agents view. The branding agent (the sample theme's `agentName`) is created on first launch. Existing global instruction layers and routines are moved onto that agent. Each agent page has Instructions, Routines, Cron, and Skills tabs. Skills is a placeholder: every agent stores a skill id list that starts empty. Enterprise policy stays read-only on every agent. Group rooms choose from the same agent list.
+`config/enterprise.example.json` holds the tenant, token-exchange audiences, Protect policy, access and Authorize settings, locked enterprise instructions, the starting agents, rooms, MCP servers, routines, and provider defaults. `mcpServers` accepts the existing `transport` / `command` / `url` / `audience` shape and a Goose-style shape (`type` of `stdio`, `streamable_http`, or legacy `sse`, plus `cmd`, `uri`, `headers`, `env_keys`, `timeout`, `enabled`, and `description`). An `envs` object of values is refused. Environment values from the add dialog are stored with `safeStorage` under `mcp-env:<id>:<NAME>` and are not written to `enterprise.json`. Audience and scope stay on the row when the dialog omits them, so a server that already exchanges a token keeps doing that. The Extensions screen does not ask for an audience. After the first run, agents, their instructions, their routines, and their skills are edited in the Agents view. The branding agent (the sample theme's `agentName`) is created on first launch. Existing global instruction layers and routines are moved onto that agent. Each agent page has Instructions, Routines, Cron, and Skills tabs. Skills can be written in the form or uploaded as `SKILL.md` or a zip that contains one. The built-in PingOne skill is admin-only. Enterprise policy stays read-only on every agent. Group rooms choose from the same agent list.
+
+`access.adminGroup` defaults to `Administrator`. `access.groupsClaim` defaults to `groups`. `authorize.decisionEndpointId` is empty until a PingOne decision endpoint is ready. `authorize.cacheMs` defaults to 30000. `authorize.mcpServerId` defaults to `pingone`.
 
 Risk actions, from least to most restrictive: `allow`, `step_up_mfa`, `restrict_tools`, `read_only`, `block`. A reason override replaces the level default when it is more restrictive. `restrict_tools` hides "always allow". `read_only` denies tools that are not marked `readOnlyHint`. `block` denies every tool and does not create a session. Step-up gates entry; after MFA the session stays active and step-up does not also restrict tools.
 
@@ -187,7 +194,7 @@ Provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GENERIC_PROVIDER_API_KEY`
 
 The chat provider in this version is the global settings choice. Per-agent provider values are stored and are not yet what `speak()` uses.
 
-`provider.temperature` is optional. It is sent only when the config or the settings field contains a number. Leave it out to use the model default. Reasoning models (`gpt-5*` and the o-series, such as `o3` and `o4-mini`) never receive `temperature` or `top_p`. Those requests use `max_completion_tokens` and, when set, `provider.reasoningEffort` (`minimal`, `low`, `medium`, or `high`). If the API rejects an unsupported sampling parameter, the client retries that request once without it.
+`provider.temperature` is optional. It is sent only when the config or the settings field contains a number. Leave it out to use the model default. Reasoning models (`gpt-5*` and the o-series, such as `o3` and `o4-mini`) never receive `temperature` or `top_p`. Those requests use `max_completion_tokens`. With `provider.showReasoning` on (the default), they also request `reasoning.summary` `auto` and send reasoning effort `medium` unless `provider.reasoningEffort` is set to `minimal`, `low`, `medium`, or `high`. If the API rejects an unsupported sampling parameter, the client retries that request once without it.
 
 ### GPT-5
 
@@ -244,16 +251,18 @@ pi.flow actions are `POST`ed to the `_links` href for that action. When the stat
 
 `COMPLETED` (and `COMPLETED_ACCEPTED` when it carries a code) is read from `authorizeResponse.code` or from the resume URL. The code is exchanged at `{authHost}/{envId}/as/token` with `grant_type=authorization_code`, the PKCE verifier, and no client secret.
 
-### 2. Worker application (Protect only)
+### 2. Worker application (Protect, Authorize, and the PingOne MCP server)
 
 | Setting | Value |
 | --- | --- |
 | Application type | Worker |
 | Grant types | Client Credentials |
 | Token endpoint authentication | `CLIENT_SECRET_BASIC` |
-| Role | A custom role that can create and update risk evaluations. Do not grant Environment Admin. |
+| Roles | A custom role that can create and update risk evaluations. For Authorize and the PingOne MCP server, add the least-privilege roles that can read, create, and update authorization policies, read decision endpoints, and evaluate a decision (`authz:authorize:decisionendpoint`). Do not grant Environment Admin. |
 
-Store the client id in `PINGONE_WORKER_CLIENT_ID` and the secret in `PINGONE_WORKER_CLIENT_SECRET` (or paste the secret in Settings). Client credentials mint the worker token used as the bearer on Protect. This application does not need the Token Exchange grant. Sending its credentials to the token endpoint returns `Unsupported grant type`.
+Store the client id in `PINGONE_WORKER_CLIENT_ID` and the secret in `PINGONE_WORKER_CLIENT_SECRET` (or paste the secret in Settings). Client credentials mint the worker token used as the bearer on Protect, on PingOne Authorize policy and decision calls, and on the PingOne MCP server. Those calls do not use token exchange. The token request authenticates with HTTP Basic (`client_secret_basic`): `Authorization: Basic` plus a body of `grant_type=client_credentials` only. Putting `client_id` or `client_secret` in that body returns `Unsupported authentication method` on a worker app that requires Basic. This application does not need the Token Exchange grant. Sending its credentials to the token endpoint returns `Unsupported grant type`.
+
+Other MCP servers exchange a token on the AI Agent application only when an audience is configured. Add the PingOne MCP server in Extensions with the id in `authorize.mcpServerId` (default `pingone`). Leave its audience empty so the app attaches the worker token. Do not put the worker secret in `enterprise.json`. HTTP extensions with no audience use MCP OAuth instead, and that flow has no fields on the add dialog.
 
 ### 3. AI Agent application (token exchange)
 
@@ -284,7 +293,7 @@ PINGONE_AGENT_CLIENT_SECRET=<AI Agent application secret>
 
 ### 4. Custom resources (audiences)
 
-For each MCP server or downstream API that should receive an exchanged token:
+For each MCP server or downstream API that should receive an exchanged token. Extensions added in the dialog do not need an audience; leave this section for servers that must keep token exchange:
 
 - Create a custom resource. The audience URL must not contain `pingone` or `pingidentity`.
 - Grant the **AI Agent** application that resource and the scopes the server expects. The Protect worker does not need these grants.
@@ -333,17 +342,74 @@ IP handling: the example config sets `protect.resolvePublicIp` to `true`. The ma
 
 Map levels and reason codes in `protect.policy`. Levels are `LOW`, `MEDIUM`, `HIGH`, and `UNKNOWN` (default `restrict_tools` when the key is omitted). Reason codes the policy understands: `NEW_DEVICE`, `ANOMALOUS_LOCATION`, `IMPOSSIBLE_TRAVEL`, `BOT`, `ANONYMOUS_NETWORK`. Unknown predictor output is still shown to the user and the agent.
 
-The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-security policy allows the regional PingOne app, auth, and API hosts plus `api.ipify.org`.
+The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-security policy allows the regional PingOne app, auth, and API hosts plus `api.ipify.org`. Each poll asks the window for a fresh Signals payload and keeps the sign-in payload when the window cannot collect one.
+
+`protect.pollIntervalSeconds` is how often a signed-in session is scored again. The default is 30. `0` scores only at sign-in. The process re-reads this value, and `protect.pauseWhenHidden`, from `enterprise.json` when the file changes, so an edit applies without a restart. Polls never overlap. A `429` with `REQUEST_LIMITED` keeps the last level and waits until both the interval and the `Retry-After` header have elapsed. Other transient failures (network errors and HTTP 5xx) also keep the last level. If Protect still cannot score the session, the `UNKNOWN` action applies, which is the existing fail-closed result. Polling stops on sign-out, quit, and access-token expiry. `protect.pauseWhenHidden` skips a poll while the window is hidden or the machine is suspended, and runs one when it becomes active again. Mock mode does not call PingOne: each poll, and a scenario change on the sign-in screen, re-applies the selected scenario so the indicator and the Authorize gates move with it. The sidebar color follows the level from the latest poll: green for `LOW`, amber for `MEDIUM`, red for `HIGH`, and gray for unknown. `low` and a 0–100 score map onto those levels. Keep the interval at 30 seconds or more. A shorter interval multiplies risk-evaluation calls by the number of signed-in clients and is what trips Protect `REQUEST_LIMITED`.
+
+### 7. Groups claim and the Policy tab
+
+Create a group whose name matches `access.adminGroup` (default `Administrator`) and add the people who may administer Authorize. Map that group membership into the signed-in user's access token under `access.groupsClaim` (default `groups`). The value can be a JSON array of names or a comma-separated string. If the access token omits the claim, the client reads the same claim from the ID token. Membership is an exact string match. The main process enforces it; hiding the Policy tab is not the only check.
+
+In mock mode, the sign-in screen has a checkbox, Sign in as Administrator. It puts the configured admin group on the mock access token. It does not contact PingOne.
+
+Only members of the admin group see the Policy tab. They keep it unless Protect risk is `HIGH` or the action is `block`, including when the decision fails closed or no policy grants the tab. PingOne tools and MCP writes still follow the decision. The tab lists policies, shows who last changed enforcement and when, and asks for confirmation before a toggle. When `tenant.mode` is `pingone`, PingOne is the source of truth. Refresh lists `authorizationPolicies`, matches starter policies by the `enterprise-agent-scaffold` marker, and drops local rows whose policies are gone. It does not create policies. Only Confirm scaffold creates the starter policies that are missing, and only after that confirmation. Confirming again does not duplicate the ones still in PingOne. Reset local policy cache clears this computer's `authorize_policies` rows, saved Trust Framework ids, the in-memory Authorize decision cache, and any scaffold still posting. It does not delete policies in PingOne. The notice and the audit row say what was cleared. Every scaffold, cache reset, enforcement change, and successful PingOne MCP tool call is written to the admin audit log with the user and, for a tool call, the agent.
+
+When no policies are stored locally and `authorize.decisionEndpointId` is empty, the app evaluates the built-in starter rules in memory. That fallback does not write the local table and does not create policies in PingOne. The same starters are used when a live decision succeeds but does not return the feature statement. Mock mode always evaluates them locally. A failed decision call fails closed for PingOne tools, MCP writes, and chat. An admin still sees the Policy tab unless risk is `HIGH` or blocked, so they can confirm Scaffold. A read-only session shows why: no policies granted chat, the decision endpoint failed or denied, or Protect risk. Admins get a Scaffold policies shortcut on that notice.
+
+The starter rules, applied in this order:
+
+| Policy | When | Effect |
+| --- | --- | --- |
+| Session can use chat | Risk level is `LOW` or `UNKNOWN`, and the Protect action is `allow`, `step_up_mfa`, or `restrict_tools` | Chat stays available and tools can still be approved |
+| Administrator tools | The user is in `access.adminGroup` | Policy tab and PingOne tools |
+| Medium risk | Risk level is `MEDIUM` | Chat and configuration stay available. Every tool invocation is off. The Policy tab grant from the administrator rule stays |
+| Read-only risk | Protect action is `read_only` | No tool invocation, chat read-only |
+| High risk lockdown | Risk level is `HIGH`, or the Protect action is `block` | Policy tab off, tools off, chat locked, agent and extension configuration locked |
+
+When Protect is enabled, an administrator's live score overrides that table. `LOW` opens chat, tools, configuration, and the Policy tab. `MEDIUM` keeps chat, configuration, and the Policy tab, and turns every tool off. `HIGH` or `block` locks chat, agent configuration, extension configuration, tools, and the Policy tab. The gates follow the next poll. A decision that fails closed still leaves configuration usable and still shows an administrator the Policy tab, unless the score is `HIGH` or `block`.
+
+Add another local or PingOne policy with `when.groupsAny` set to a different group when that group should receive its own tools. The same decision attributes carry the group list.
+
+Confirming Scaffold in PingOne mode still keeps the five starter rows for local evaluation, and it also builds the real Authorize tree described in [docs/authorize-real-policies.md](docs/authorize-real-policies.md). That build creates the `EnterpriseAgent` Trust Framework, two introspection services, a parent policy with `DENY_OVERRIDES`, and the User and Delegation child policies. The first create POSTs the tree. A later run that finds both children and matching delegation rules updates the User policy rules in place. A parent PUT still ignores children. Descriptions are plain text. Refresh stays read-only. Reset local policy cache deletes local policy rows and saved Trust Framework ids. It does not delete anything in PingOne and it does not create replacements. The next confirmed Scaffold links existing PingOne objects by name. Authorize calls share one queue. Successful creates wait 300ms before the next management write. A `429` `REQUEST_LIMITED` response is retried using the `Retry-After` delay, exponential backoff, and jitter. If the retries are exhausted, the screen says `PingOne is rate limiting, try again in Ns`. `QUOTA_EXCEEDED` uses the same HTTP status and is not retried.
+
+`authorizationPolicies` belongs to PingOne's configuration rate group (600 requests per minute on a paid license). Trial licenses use a lower cap and cannot buy a higher base rate. A single IP is also capped (35% of the license rate, or the whole lower trial cap). Decision evaluation is a different group: 150 requests per second, or one request per second when the endpoint uses the latest policy version. Scaffold tags the authorization version and saves its id on the decision endpoint (`authorize.alwaysCurrent` omits that id and is for development only). The saved endpoint id is written to the local settings and, when the config file is writable, to `authorize.decisionEndpointId`. The client then `POST`s `{apiHost}/v1/environments/{envId}/decisionEndpoints/{decisionEndpointId}`:
+
+```json
+{
+  "parameters": {
+    "EnterpriseAgent.access-token": "<SSO access token>",
+    "EnterpriseAgent.tx-token": "<token-exchanged token>",
+    "EnterpriseAgent.risk-level": "UNKNOWN",
+    "EnterpriseAgent.risk-score": 0,
+    "EnterpriseAgent.risk-action": "allow",
+    "EnterpriseAgent.admin-group": "Administrator"
+  },
+  "userContext": { "user": { "id": "<PingOne user id>" } }
+}
+```
+
+Every REQUEST attribute is sent on every call. `EnterpriseAgent.risk-score` is a JSON number (`10` LOW, `50` MEDIUM, `90` HIGH, `0` UNKNOWN). The other parameters are strings. Groups and token claims come from introspection, not from these keys. If either token is empty, the client does not call PingOne and fails closed. `DENY`, `INDETERMINATE`, and `NOT_APPLICABLE` fail closed. A `PERMIT` is read from a statement whose `code` is `enterprise-agent-features`. The statement payload is static JSON and does not use `{{uuid}}` interpolation. `isApproved` is not referenced. Decisions are cached for `authorize.cacheMs` (default 30 seconds). A `PERMIT` payload looks like:
+
+```json
+{ "policyTab": true, "pingoneTools": true, "mcpWrites": true, "chat": "allow" }
+```
+
+`chat` is `allow` or `read_only`. Decisions are cached for `authorize.cacheMs` and requested again when the group list, risk level, or Protect action changes. High risk hides the Policy tab even for an administrator.
+
+### 8. Skills
+
+Each agent has a Skills tab. A skill is a name, description, instructions, optional files, and optional required groups. Upload `SKILL.md` (front matter `name`, `description`, `requiredGroups`) or a zip that contains `SKILL.md` plus those files. The built-in PingOne skill cannot be deleted. It is hidden from anyone outside the admin group, and the tool node refuses PingOne MCP tools unless that skill is assigned to the agent that is speaking. When that skill is assigned to an administrator, the agent instructions include `resources/skills/pingone-authorize-ea-api-build/SKILL.md` and a catalog of its reference files. The reference bodies stay out of the prompt. The read-only tool `read_skill_reference` returns one of those files, including `scripts/walk_policy_tree.py` as text. Its `name` argument is required and limited to that catalog. A missing or unknown name returns the valid names, and a path or file name with or without `.md` still resolves. The app does not run that script. The same admin, feature, and skill gates hide and deny the tool for everyone else. Call it before PingOne MCP tools that read or change Authorize policies, attributes, statements, or decision endpoints. Other skills are hidden unless the signed-in user's groups include one of `requiredGroups` (or the skill lists none). Write tools still wait for approval, and the Protect action still applies. The reference tool is read-only, so a read-only Protect action still allows it, and it still waits for approval.
 
 ## What works in this version
 
 - Branding file, sample Pingy theme, and a test that the sample agent name is not hardcoded under `src/`.
-- App shell: login, chat, rooms, routines, tools, instructions, settings.
+- App shell: login, chat, rooms, routines, tools, instructions, settings, skills, and a Policy tab for administrators.
 - Mock PingOne sign-in with the five risk scenarios, plus the real pi.flow and loopback clients.
 - Keychain session storage, refresh when a refresh token exists, re-auth otherwise.
-- RFC 8693 exchange on the AI Agent client, with the user access token as `subject_token` and the agent's cached client-credentials token as `actor_token`. Worker credentials remain the fallback. The LangGraph tool node exchanges the audience token and injects it into the MCP call.
-- Protect evaluation client, reason extraction, policy engine, and risk text in the system prompt.
-- MCP stdio, Streamable HTTP, and SSE fallback. Server management UI. Per-tool allow once / always / deny. Tool cards in the transcript.
+- RFC 8693 exchange on the AI Agent client, with the user access token as `subject_token` and the agent's cached client-credentials token as `actor_token`. Worker credentials remain the fallback for exchange. The LangGraph tool node exchanges the audience token and injects it into the MCP call. The PingOne MCP server and Authorize use the worker client-credentials token instead of an exchanged token.
+- Protect evaluation client, reason extraction, policy engine, and risk text in the system prompt. After sign-in, risk is polled on `protect.pollIntervalSeconds` and pushed to the risk indicator, the Protect action, and the Authorize gates.
+- Group claim `groups` (configurable), admin gate defaulting to `Administrator`, skills upload, the built-in PingOne skill (including the bundled PingOne Authorize guide and on-demand references), and the Policy tab. Authorize decisions can turn the Policy tab, PingOne tools, MCP writes, and chat on or off, and fail closed when the decision endpoint cannot be reached.
+- MCP stdio, Streamable HTTP, and SSE fallback. Extensions use a Goose-style add dialog (name, type, description, endpoint or command, timeout, headers, and keychain environment variables) and cards with an enable switch, edit, and delete. Per-tool allow once / always / deny. Tool cards in the transcript. HTTP extensions without an audience sign in with MCP authorization (RFC 9728 protected resource metadata, RFC 8414 or OpenID discovery, dynamic client registration or a client ID metadata document, authorization code and PKCE S256 on a loopback redirect, refresh, and insufficient_scope step-up). Tokens and client secrets stay in the keychain. The card shows Needs sign-in, then connected, plus a sign-out control and a debug trace with secrets redacted. stdio launched from the macOS GUI gets the usual Homebrew and user bin directories on `PATH`.
 - LangGraph.js turns for chat, group rooms, and routines. Streaming still feeds the Thinking panel, live tool status, and stop that keeps the partial answer. `provider.showReasoning` (default true) hides reasoning for an enterprise policy. Chats can be deleted from the list or the open chat. Deleting a room's history leaves the room, its agents, instructions, and routines in place.
 - Layered instructions. The enterprise layer is read-only in the UI. Persona resets to the branding file. The user layer is editable.
 - Group rooms as one turn-taking LangGraph over each member, room instructions, routines, and cron while the window is open, with run history. A SQLite checkpointer stores the thread so an approval interrupt can resume.
@@ -353,15 +419,15 @@ The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-
 
 - OS installers, auto-update, and code signing.
 - pi.flow statuses this UI does not complete: FIDO2 assertion, push confirmation, magic link, account recovery, and external identity-provider redirects. Those stop with a message that names the flow status and points at the system browser. Identifier-first policies are handled.
-- Continuous Protect re-evaluation during a session, and richer feedback than the completion-status update.
+- Predictor feedback richer than the completion-status update, and a fresh Protect score on a sensitive tool call. Session polling is `protect.pollIntervalSeconds`.
 - Prompt caching and full vision parity. Anthropic extended thinking and OpenAI reasoning summaries stream into the Thinking panel when `provider.showReasoning` is true.
 - Group chat fan-out, @mentions, and debate. Replies are sequential.
 - Routines while the app is closed.
 - Conversation search, export, rename, and delete.
-- MCP resources, prompts, sampling, and elicitation. Remote MCP OAuth is not implemented; HTTP servers get the exchanged PingOne token only.
+- MCP resources, prompts, sampling, and elicitation. HTTP extensions without an audience use MCP authorization; an audience in config still selects PingOne token exchange, and the PingOne server still uses the worker token.
 - Tool-result streaming.
 - Encryption of conversation rows at rest. Tokens are encrypted; message text is not.
-- A policy editor. Policy is JSON.
+- A Protect risk-policy editor. That policy is still JSON. Authorize enforcement is the Policy tab.
 - Per-agent provider selection in the UI. The global provider wins.
 - Localization, automated UI tests, PingOne logout/revoke, and a deep link in place of the fixed loopback port.
 - JWKS verification of ID tokens. The payload is decoded and the signature is not checked.
@@ -372,14 +438,14 @@ The Signals SDK is loaded only for `tenant.mode: pingone`. The renderer content-
 
 1. Package and sign macOS, Windows, and Linux builds.
 2. Finish the remaining pi.flow statuses and PingOne logout plus refresh-token revoke.
-3. Re-evaluate Protect on a timer and on sensitive tool calls, and send predictor feedback beyond completion status.
+3. Re-evaluate Protect on sensitive tool calls, and send predictor feedback beyond completion status. Post-login polling is `protect.pollIntervalSeconds`.
 4. Verify ID tokens against the environment JWKS.
 5. Let step-up and a tool restriction apply together when policy asks for both.
 6. Use each agent's own provider, and surface that choice in the UI.
 7. Run group turns in parallel, with @mentions.
 8. Run due routines after the app launches, and document a signed-in background helper for when it is closed.
 9. Encrypt conversation content at rest with the same keychain key.
-10. MCP resources, prompts, and sampling, plus remote MCP OAuth distinct from PingOne token exchange.
+10. MCP resources, prompts, and sampling. Remote MCP authorization is implemented for HTTP extensions that have no audience.
 11. Conversation search, rename, delete, and export.
 12. Replace the fixed loopback port with a registered deep link.
 13. Add a UI test pass for login scenarios, approval, and rooms.

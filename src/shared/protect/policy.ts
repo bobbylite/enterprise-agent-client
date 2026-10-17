@@ -20,6 +20,7 @@ export function decideRisk(policy: RiskPolicyConfig, level: RiskLevel, reasons: 
 
 export function summarizeRisk(level: RiskLevel, action: RiskAction, reasons: RiskReason[]): string {
   const why = reasons.length > 0 ? reasons.map((reason) => reason.label).join(', ') : 'no elevated predictors';
+  if (level === 'MEDIUM') return `${level} risk (${why}). chat only, tools disabled.`;
   return `${level} risk (${why}). Policy: ${actionLabel(action)}.`;
 }
 

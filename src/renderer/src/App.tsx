@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AppState, Branding, BrandingColors } from '@shared/types';
 import { LoginScreen } from './screens/LoginScreen';
 import { Shell } from './screens/Shell';
+import { collectProtectSignals } from './signals';
 
 function applyColors(colors: BrandingColors): void {
   const root = document.documentElement;
@@ -15,6 +16,19 @@ export function App() {
   const [branding, setBranding] = useState<Branding | null>(null);
   const [state, setState] = useState<AppState | null>(null);
   const [error, setError] = useState('');
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  useEffect(() => {
+    const stopState = window.agent.onAppState(setState);
+    const stopSignals = window.agent.onCollectSignals(() => {
+      void collectProtectSignals(stateRef.current?.mode ?? 'mock').then((signals) => window.agent.provideSignals(signals));
+    });
+    return () => {
+      stopState();
+      stopSignals();
+    };
+  }, []);
 
   useEffect(() => {
     void (async () => {

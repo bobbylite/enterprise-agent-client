@@ -1,16 +1,28 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import { Ipc } from '@shared/channels';
-import type { AgentBridge, ChatEvent } from '@shared/types';
+import type { AgentBridge, AppState, ChatEvent } from '@shared/types';
 
 const api: AgentBridge = {
   getBranding: () => ipcRenderer.invoke(Ipc.getBranding),
   getState: () => ipcRenderer.invoke(Ipc.getState),
+  onAppState: (listener) => {
+    const wrapped = (_event: IpcRendererEvent, payload: AppState) => listener(payload);
+    ipcRenderer.on(Ipc.appState, wrapped);
+    return () => ipcRenderer.removeListener(Ipc.appState, wrapped);
+  },
+  onCollectSignals: (listener) => {
+    const wrapped = () => listener();
+    ipcRenderer.on(Ipc.collectSignals, wrapped);
+    return () => ipcRenderer.removeListener(Ipc.collectSignals, wrapped);
+  },
+  provideSignals: (signals) => ipcRenderer.invoke(Ipc.provideSignals, signals),
   submitCredentials: (username, password, signals) => ipcRenderer.invoke(Ipc.submitCredentials, username, password, signals),
   submitOtp: (otp, signals) => ipcRenderer.invoke(Ipc.submitOtp, otp, signals),
   selectDevice: (deviceId, signals) => ipcRenderer.invoke(Ipc.selectDevice, deviceId, signals),
   startSystemBrowserLogin: (signals) => ipcRenderer.invoke(Ipc.startSystemBrowserLogin, signals),
   cancelLogin: () => ipcRenderer.invoke(Ipc.cancelLogin),
   setMockScenario: (scenario) => ipcRenderer.invoke(Ipc.setMockScenario, scenario),
+  setMockAdmin: (admin) => ipcRenderer.invoke(Ipc.setMockAdmin, admin),
   logout: () => ipcRenderer.invoke(Ipc.logout),
   listConversations: () => ipcRenderer.invoke(Ipc.listConversations),
   createConversation: () => ipcRenderer.invoke(Ipc.createConversation),
@@ -36,8 +48,11 @@ const api: AgentBridge = {
   listMcpServers: () => ipcRenderer.invoke(Ipc.listMcpServers),
   saveMcpServer: (input) => ipcRenderer.invoke(Ipc.saveMcpServer, input),
   deleteMcpServer: (id) => ipcRenderer.invoke(Ipc.deleteMcpServer, id),
+  setMcpEnabled: (id, enabled) => ipcRenderer.invoke(Ipc.setMcpEnabled, id, enabled),
   connectMcp: (id) => ipcRenderer.invoke(Ipc.connectMcp, id),
   disconnectMcp: (id) => ipcRenderer.invoke(Ipc.disconnectMcp, id),
+  signInMcp: (id, input) => ipcRenderer.invoke(Ipc.signInMcp, id, input),
+  signOutMcp: (id) => ipcRenderer.invoke(Ipc.signOutMcp, id),
   respondApproval: (id, choice) => ipcRenderer.invoke(Ipc.respondApproval, id, choice),
   listRoutines: () => ipcRenderer.invoke(Ipc.listRoutines),
   saveRoutine: (input) => ipcRenderer.invoke(Ipc.saveRoutine, input),
@@ -49,6 +64,19 @@ const api: AgentBridge = {
   listTokens: () => ipcRenderer.invoke(Ipc.listTokens),
   revealToken: (id) => ipcRenderer.invoke(Ipc.revealToken, id),
   reexchangeToken: (id) => ipcRenderer.invoke(Ipc.reexchangeToken, id),
+  listSkills: () => ipcRenderer.invoke(Ipc.listSkills),
+  importSkill: (input) => ipcRenderer.invoke(Ipc.importSkill, input),
+  importSkillFile: () => ipcRenderer.invoke(Ipc.importSkillFile),
+  setSkillEnabled: (id, enabled) => ipcRenderer.invoke(Ipc.setSkillEnabled, id, enabled),
+  deleteSkill: (id) => ipcRenderer.invoke(Ipc.deleteSkill, id),
+  assignSkill: (agentId, skillId, assigned) => ipcRenderer.invoke(Ipc.assignSkill, agentId, skillId, assigned),
+  listPolicies: () => ipcRenderer.invoke(Ipc.listPolicies),
+  refreshPolicies: () => ipcRenderer.invoke(Ipc.refreshPolicies),
+  scaffoldPolicies: (confirm) => ipcRenderer.invoke(Ipc.scaffoldPolicies, confirm),
+  dryRunAuthorizePolicy: () => ipcRenderer.invoke(Ipc.dryRunAuthorizePolicy),
+  resetPolicyCache: () => ipcRenderer.invoke(Ipc.resetPolicyCache),
+  setPolicyEnabled: (id, enabled) => ipcRenderer.invoke(Ipc.setPolicyEnabled, id, enabled),
+  listAudit: () => ipcRenderer.invoke(Ipc.listAudit),
   onChatEvent: (listener) => {
     const wrapped = (_event: IpcRendererEvent, payload: ChatEvent) => listener(payload);
     ipcRenderer.on(Ipc.chatEvent, wrapped);

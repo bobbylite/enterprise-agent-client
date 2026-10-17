@@ -1,4 +1,5 @@
 import type { RiskLevel } from '../types';
+import { riskLevel, riskSignal } from './reasons';
 
 export interface RiskEvaluationResult {
   id?: string;
@@ -30,6 +31,18 @@ export function buildRiskEvent(input: {
   return event;
 }
 
+export class RiskEvaluationError extends Error {
+  readonly status: number;
+  readonly retryAfterSeconds: number | null;
+
+  constructor(message: string, status: number, retryAfterSeconds: number | null, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'RiskEvaluationError';
+    this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
 export async function createRiskEvaluation(input: {
   url: string;
   accessToken: string;
@@ -49,24 +62,37 @@ export async function createRiskEvaluation(input: {
     body: JSON.stringify(body),
   });
   const text = await response.text();
-  const parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  let parsed: Record<string, unknown> = {};
+  if (text) {
+    try {
+      parsed = JSON.parse(text) as Record<string, unknown>;
+    } catch (error) {
+      if (!response.ok) {
+        throw new RiskEvaluationError(
+          `Risk evaluation failed (${response.status}).`,
+          response.status,
+          response.status === 429 ? retryAfterSeconds(response) : null,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
   if (!response.ok) {
     const message =
       (parsed.message as string | undefined) ||
       (parsed.details as { message?: string }[] | undefined)?.map((item) => item.message).filter(Boolean).join(' ') ||
       `Risk evaluation failed (${response.status}).`;
-    throw new Error(message);
+    throw new RiskEvaluationError(message, response.status, response.status === 429 ? retryAfterSeconds(response) : null);
   }
-  const result = (parsed.result ?? {}) as { level?: string; recommendedAction?: string };
-  const level = result.level?.toUpperCase();
-  if (level !== 'LOW' && level !== 'MEDIUM' && level !== 'HIGH') {
-    throw new Error('Risk evaluation did not return a level.');
-  }
+  const result = (parsed.result ?? {}) as { level?: unknown; score?: unknown; recommendedAction?: string };
+  if (!riskSignal(result.level, result.score)) throw new Error('Risk evaluation did not return a level.');
+  const level = riskLevel(result.level, result.score);
   return {
     id: typeof parsed.id === 'string' ? parsed.id : undefined,
     level,
     details: parsed.details,
-    recommendedAction: result.recommendedAction,
+    recommendedAction: typeof result.recommendedAction === 'string' ? result.recommendedAction : undefined,
   };
 }
 
@@ -122,6 +148,16 @@ async function readPublicIp(fetchImpl: typeof fetch, url: string, timeoutMs: num
   }
   const line = text.split(/\s+/)[0] ?? '';
   return isIpAddress(line) ? line : undefined;
+}
+
+function retryAfterSeconds(response: Response): number | null {
+  const header = response.headers.get('retry-after')?.trim();
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds;
+  const date = Date.parse(header);
+  if (Number.isFinite(date)) return Math.max(0, (date - Date.now()) / 1000);
+  return null;
 }
 
 function isIpAddress(value: string): boolean {
