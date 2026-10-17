@@ -36,7 +36,7 @@ export function ApprovalModal() {
           <button type="button" className="ghost" onClick={() => choose('deny')}>
             Deny
           </button>
-          <button type="button" onClick={() => choose('once')}>
+          <button type="button" className="primary" onClick={() => choose('once')}>
             Allow once
           </button>
           {request.allowAlways ? (
