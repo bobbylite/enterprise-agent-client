@@ -1,0 +1,66 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "First-time tester: install & launch",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "First-time tester: install"
+    },
+    {
+      "name": "Debug main process",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "${workspaceFolder}/node_modules/.bin/electron-vite",
+      "windows": {
+        "runtimeExecutable": "${workspaceFolder}/node_modules/.bin/electron-vite.cmd"
+      },
+      "args": ["dev", "--sourcemap", "--inspect"],
+      "autoAttachChildProcesses": true,
+      "console": "integratedTerminal",
+      "sourceMaps": true,
+      "outFiles": ["${workspaceFolder}/out/main/**/*.js"],
+      "skipFiles": ["<node_internals>/**", "${workspaceFolder}/node_modules/**"]
+    },
+    {
+      "name": "Dev: electron",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "${workspaceFolder}/node_modules/.bin/electron-vite",
+      "windows": {
+        "runtimeExecutable": "${workspaceFolder}/node_modules/.bin/electron-vite.cmd"
+      },
+      "args": ["dev", "--sourcemap", "--inspect", "--remoteDebuggingPort", "9222"],
+      "autoAttachChildProcesses": true,
+      "console": "integratedTerminal",
+      "sourceMaps": true,
+      "outFiles": ["${workspaceFolder}/out/main/**/*.js"],
+      "skipFiles": ["<node_internals>/**", "${workspaceFolder}/node_modules/**"],
+      "presentation": {
+        "hidden": true
+      }
+    },
+    {
+      "name": "Dev: renderer",
+      "type": "chrome",
+      "request": "attach",
+      "port": 9222,
+      "webRoot": "${workspaceFolder}",
+      "timeout": 60000,
+      "presentation": {
+        "hidden": true
+      }
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Dev",
+      "configurations": ["Dev: electron", "Dev: renderer"],
+      "stopAll": true
+    }
+  ]
+}

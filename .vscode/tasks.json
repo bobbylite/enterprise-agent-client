@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "First-time tester: install",
+      "type": "process",
+      "command": "node",
+      "args": ["scripts/first-time-tester.mjs"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "detail": "Check Node.js 22.13+, npm install (including the Electron binary), and create .env and config/enterprise.json only when they are missing."
+    },
+    {
+      "label": "Run tests",
+      "type": "npm",
+      "script": "test",
+      "group": "test",
+      "problemMatcher": [],
+      "detail": "Run the Vitest suite."
+    }
+  ]
+}
