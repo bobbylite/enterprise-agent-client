@@ -4,6 +4,8 @@ A white-label desktop AI agent. The product name, agent name, logo, colors, and 
 
 The sample theme in `branding/default.json` names the app and the agent **Pingy**. That name is an example only. Replace the branding file to ship the client under another name.
 
+A first-time tester can follow [QUICKSTART.md](QUICKSTART.md). In VS Code, **First-time tester: install & launch** checks Node.js, installs dependencies, creates local config only when it is missing, and starts mock mode.
+
 ## What this repository contains
 
 This is the foundation: a runnable Electron app with PingOne sign-in (including a mock mode), token exchange, PingOne Protect risk policy, an MCP client with tool approvals, single-agent chat, and the data model plus screens for instruction layers, group rooms, routines, cron, per-agent skills, and a group-gated Policy tab for PingOne Authorize. Later work is listed under [Follow-up issues](#follow-up-issues).
@@ -104,6 +106,8 @@ npm run dev
 ```
 
 Mock mode is the committed example, so `npm run dev` signs in locally and does not call PingOne. Any non-empty password is accepted. On the login screen, choose a risk scenario: low, new device, anomalous location, impossible travel, or bot.
+
+The same first run is the VS Code configuration **First-time tester: install & launch**. It never overwrites an existing `.env` or `config/enterprise.json`. **Dev** debugs the main and renderer processes, **Debug main process** debugs the main process only, and the **Run tests** task runs `npm test`. The steps, environment variables, and PingOne checklist are in [QUICKSTART.md](QUICKSTART.md).
 
 ### If dev reports "Electron uninstall"
 
