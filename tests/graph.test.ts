@@ -8,6 +8,7 @@ import { openCheckpointer } from '../src/main/checkpoint-sqlite';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { anthropicTurnFields, openAiTurnFields, readModelChunk } from '../src/main/chat-model';
 import type { RuntimeTool } from '../src/main/runtime-tool';
+import { skillReferenceDenied } from '../src/main/skill-bundle';
 import type { ApprovalRequest, ChatEvent, InstructionFields } from '../src/shared/types';
 
 const blank: InstructionFields = {
@@ -28,6 +29,8 @@ function participant(patch?: Partial<GraphParticipant>): GraphParticipant {
     persona: { ...blank, persona: 'Be a careful assistant.' },
     user: { ...blank, communicationStyle: 'Use short sentences.' },
     risk: 'Session risk context (authoritative for this sign-in):\nRisk level: HIGH.\nPolicy action: block.',
+    skillIds: [],
+    skills: '',
     ...patch,
   };
 }
@@ -96,7 +99,7 @@ describe('LangGraph runtime', () => {
       const stream = await graph.stream(
         {
           conversationId: 'c1',
-          participants: [participant({ risk: 'Risk level: LOW.\nPolicy action: allow.' })],
+          participants: [participant({ risk: 'Risk level: LOW.\nPolicy action: allow.', skills: 'Skill: PingOne\nUse the worker token.' })],
           messages: [{ role: 'user', content: 'hello' }],
           availableTools: [],
         },
@@ -117,6 +120,130 @@ describe('LangGraph runtime', () => {
     expect(custom.some((event) => event.type === 'assistant-delta')).toBe(true);
     expect(events.some((event) => event.type === 'assistant-reasoning')).toBe(true);
     expect(system.indexOf('Enterprise policy (locked)')).toBeLessThan(system.indexOf('Agent persona'));
+    expect(system).toContain('Skill: PingOne');
+  });
+
+  it('denies a PingOne tool in the tool node even when it is still listed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'graph-pingone-'));
+    const checkpointer = openCheckpointer(join(directory, 'turns.sqlite'));
+    const graph = compileAgentGraph(checkpointer);
+    const seen: string[] = [];
+    const { deps: bound, calls } = deps({
+      gateTool: () => 'PingOne tools are limited to the Administrator group.',
+      persistTool: (tool) => {
+        seen.push(`${tool.status}:${tool.result ?? ''}`);
+      },
+    });
+    try {
+      await runAgentGraph({
+        graph,
+        checkpointer,
+        threadId: 'pingone-thread',
+        runId: 'pingone-run',
+        deps: bound,
+        initial: {
+          conversationId: 'c-pingone',
+          participants: [participant({ skillIds: [], skills: '' })],
+          messages: [{ role: 'user', content: 'echo hello' }],
+          availableTools: [
+            {
+              key: 'pingone__echo',
+              serverId: 'pingone',
+              serverName: 'PingOne',
+              name: 'createPolicy',
+              description: 'Create a policy',
+              inputSchema: { type: 'object', properties: { message: { type: 'string' } } },
+              readOnlyHint: false,
+            },
+          ],
+          riskAction: 'allow',
+        },
+      });
+      expect(calls.token).toEqual([]);
+      expect(calls.tool).toEqual([]);
+      expect(seen).toContain('denied:PingOne tools are limited to the Administrator group.');
+    } finally {
+      checkpointer.close();
+    }
+  });
+
+  it('denies read_skill_reference in the tool node for a non-admin even when it is listed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'graph-skill-ref-'));
+    const checkpointer = openCheckpointer(join(directory, 'turns.sqlite'));
+    const graph = compileAgentGraph(checkpointer);
+    const seen: string[] = [];
+    const { deps: bound, calls } = deps({
+      provider: 'generic',
+      model: 'generic-1',
+      baseUrl: 'https://llm.example/generate',
+      gateTool: (tool, participant) =>
+        skillReferenceDenied({
+          serverId: tool.serverId,
+          name: tool.name,
+          mcpServerId: 'pingone',
+          admin: false,
+          adminGroup: 'Administrator',
+          pingoneTools: true,
+          skillIds: participant?.skillIds ?? ['pingone'],
+        }),
+      persistTool: (tool) => {
+        seen.push(`${tool.status}:${tool.result ?? ''}`);
+      },
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { messages?: { role: string }[] };
+        const sawTool = body.messages?.some((message) => message.role === 'tool') ?? false;
+        if (!sawTool) {
+          return new Response(
+            JSON.stringify({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'call-ref',
+                  name: 'skill__read_skill_reference',
+                  arguments: JSON.stringify({ name: 'references/ea-api-operational-quirks.md' }),
+                },
+              ],
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response(JSON.stringify({ content: 'Stopped.' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    try {
+      await runAgentGraph({
+        graph,
+        checkpointer,
+        threadId: 'skill-ref-thread',
+        runId: 'skill-ref-run',
+        deps: bound,
+        initial: {
+          conversationId: 'c-skill-ref',
+          participants: [participant({ skillIds: ['pingone'], skills: '' })],
+          messages: [{ role: 'user', content: 'read the authorize reference' }],
+          availableTools: [
+            {
+              key: 'skill__read_skill_reference',
+              serverId: 'skill',
+              serverName: 'PingOne skill',
+              name: 'read_skill_reference',
+              description: 'Read a skill reference',
+              inputSchema: { type: 'object', properties: { name: { type: 'string' } } },
+              readOnlyHint: true,
+            },
+          ],
+          riskAction: 'allow',
+        },
+      });
+      expect(calls.token).toEqual([]);
+      expect(calls.tool).toEqual([]);
+      expect(seen).toContain('denied:PingOne tools are limited to the Administrator group.');
+    } finally {
+      checkpointer.close();
+    }
   });
 
   it('blocks a tool inside the graph without exchanging a token', async () => {
@@ -229,6 +356,41 @@ describe('LangGraph runtime', () => {
       expect(calls.tool[0]).toContain('hello');
     } finally {
       releaseGraphRun(runId);
+    }
+  });
+
+  it('does not execute a tool at medium risk even when the action would approve every call', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'graph-medium-'));
+    const checkpointer = openCheckpointer(join(directory, 'turns.sqlite'));
+    const graph = compileAgentGraph(checkpointer);
+    let asked = false;
+    const { deps: bound, calls } = deps({
+      requestApproval: async () => {
+        asked = true;
+        return 'once';
+      },
+    });
+    try {
+      await runAgentGraph({
+        graph,
+        checkpointer,
+        threadId: 'medium-thread',
+        runId: 'medium-run',
+        deps: bound,
+        initial: {
+          conversationId: 'c-medium',
+          participants: [participant({ risk: 'Risk level: MEDIUM.\nPolicy action: restrict_tools.' })],
+          messages: [{ role: 'user', content: 'echo hello' }],
+          availableTools: [echoTool(false)],
+          riskAction: 'restrict_tools',
+          riskLevel: 'MEDIUM',
+        },
+      });
+      expect(asked).toBe(false);
+      expect(calls.token).toEqual([]);
+      expect(calls.tool).toEqual([]);
+    } finally {
+      checkpointer.close();
     }
   });
 

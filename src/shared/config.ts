@@ -20,6 +20,48 @@ const reasonCode = z.enum([
   'OTHER',
 ]);
 
+const mcpServerSchema = z
+  .object({
+    id: z.string().min(1),
+    name: z.string().min(1),
+    type: z.enum(['stdio', 'streamable_http', 'sse', 'builtin']).optional(),
+    transport: z.enum(['stdio', 'http', 'sse']).optional(),
+    description: z.string().optional(),
+    command: z.string().optional(),
+    cmd: z.string().optional(),
+    args: z.array(z.string()).optional(),
+    url: z.string().optional(),
+    uri: z.string().optional(),
+    headers: z.record(z.string(), z.string()).optional(),
+    envKeys: z.array(z.string()).optional(),
+    env_keys: z.array(z.string()).optional(),
+    timeout: z.number().int().positive().optional(),
+    enabled: z.boolean().optional(),
+    audience: z.string().optional(),
+    scope: z.string().optional(),
+  })
+  .transform((value) => {
+    const type =
+      value.type ?? (value.transport === 'http' ? 'streamable_http' : value.transport) ?? 'stdio';
+    const transport: 'stdio' | 'http' | 'sse' | 'builtin' = type === 'streamable_http' ? 'http' : type;
+    return {
+      id: value.id,
+      name: value.name,
+      type,
+      transport,
+      description: value.description ?? '',
+      command: value.cmd ?? value.command ?? '',
+      args: value.args ?? [],
+      url: value.uri ?? value.url ?? '',
+      headers: value.headers ?? {},
+      envKeys: value.envKeys ?? value.env_keys ?? [],
+      timeout: value.timeout ?? 300,
+      enabled: value.enabled ?? true,
+      audience: value.audience ?? '',
+      scope: value.scope ?? '',
+    };
+  });
+
 export const enterpriseConfigSchema = z.object({
   tenant: z.object({
     mode: z.enum(['mock', 'pingone']),
@@ -54,6 +96,8 @@ export const enterpriseConfigSchema = z.object({
     resolvePublicIp: z.boolean(),
     reportedIp: z.string(),
     userType: z.enum(['PING_ONE', 'EXTERNAL']),
+    pollIntervalSeconds: z.number().int().nonnegative().default(30),
+    pauseWhenHidden: z.boolean().default(false),
     policy: z.object({
       levels: z.object({
         LOW: riskAction,
@@ -70,6 +114,38 @@ export const enterpriseConfigSchema = z.object({
     }),
   }),
   enterpriseInstructions: instructionSchema,
+  access: z
+    .object({
+      adminGroup: z.string().min(1).default('Administrator'),
+      groupsClaim: z.string().min(1).default('groups'),
+    })
+    .default({ adminGroup: 'Administrator', groupsClaim: 'groups' }),
+  authorize: z
+    .object({
+      decisionEndpointId: z.string().default(''),
+      cacheMs: z.number().int().positive().default(30_000),
+      mcpServerId: z.string().min(1).default('pingone'),
+      delegationAudience: z.string().default(''),
+      alwaysCurrent: z.boolean().default(false),
+      delegations: z
+        .array(
+          z.object({
+            humanSub: z.string().default(''),
+            agentSub: z.string().default(''),
+            audience: z.string().default(''),
+            scope: z.string().default(''),
+          }),
+        )
+        .default([]),
+    })
+    .default({
+      decisionEndpointId: '',
+      cacheMs: 30_000,
+      mcpServerId: 'pingone',
+      delegationAudience: '',
+      alwaysCurrent: false,
+      delegations: [],
+    }),
   agents: z.array(
     z.object({
       id: z.string().min(1),
@@ -88,18 +164,7 @@ export const enterpriseConfigSchema = z.object({
       agentIds: z.array(z.string()),
     }),
   ),
-  mcpServers: z.array(
-    z.object({
-      id: z.string().min(1),
-      name: z.string().min(1),
-      transport: z.enum(['stdio', 'http', 'sse']),
-      command: z.string().optional(),
-      args: z.array(z.string()).optional(),
-      url: z.string().optional(),
-      audience: z.string().optional(),
-      scope: z.string().optional(),
-    }),
-  ),
+  mcpServers: z.array(mcpServerSchema),
   routines: z.array(
     z.object({
       id: z.string().min(1),
@@ -151,8 +216,24 @@ export function assertConfigHasNoSecrets(value: unknown, path = 'config'): void 
   }
 }
 
+export function assertMcpServersHaveNoEnvValues(raw: unknown): void {
+  if (!raw || typeof raw !== 'object') return;
+  const servers = (raw as { mcpServers?: unknown }).mcpServers;
+  if (!Array.isArray(servers)) return;
+  servers.forEach((server, index) => {
+    if (!server || typeof server !== 'object' || Array.isArray(server)) return;
+    const envs = (server as { envs?: unknown }).envs;
+    if (envs && typeof envs === 'object' && !Array.isArray(envs) && Object.keys(envs as object).length > 0) {
+      throw new Error(
+        `Refusing to load config.mcpServers[${index}].envs. Store environment values in the OS keychain and list names in envKeys.`,
+      );
+    }
+  });
+}
+
 export function parseEnterpriseConfig(raw: unknown): EnterpriseConfig {
   assertConfigHasNoSecrets(raw);
+  assertMcpServersHaveNoEnvValues(raw);
   const parsed = enterpriseConfigSchema.parse(raw);
   if (parsed.tenant.mode === 'pingone') {
     if (!parsed.tenant.environmentId || !parsed.tenant.clientId) {

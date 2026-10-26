@@ -3,7 +3,16 @@ import type { Attachment, Branding, ChatEvent, ChatSnapshot, Conversation } from
 import { applyChatEvent } from '../chat-events';
 import { Transcript } from '../components/Transcript';
 
-export function ChatScreen({ branding, showReasoning }: { branding: Branding; showReasoning: boolean }) {
+export function ChatScreen({
+  branding,
+  showReasoning,
+  chatMode,
+}: {
+  branding: Branding;
+  showReasoning: boolean;
+  chatMode: 'allow' | 'read_only' | 'locked';
+}) {
+  const composerLocked = chatMode !== 'allow';
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [snapshot, setSnapshot] = useState<ChatSnapshot | null>(null);
   const [draft, setDraft] = useState('');
@@ -108,7 +117,7 @@ export function ChatScreen({ branding, showReasoning }: { branding: Branding; sh
                 <p>Messages stream here. Try “echo hello” after connecting the local echo tool.</p>
               </div>
             ) : (
-              <Transcript messages={snapshot.messages} showReasoning={showReasoning} />
+              <Transcript messages={snapshot.messages} showReasoning={showReasoning} resetKey={snapshot.conversation.id} />
             )}
             {error ? <p className="error">{error}</p> : null}
             {attachments.length > 0 ? (
@@ -122,17 +131,25 @@ export function ChatScreen({ branding, showReasoning }: { branding: Branding; sh
               className="composer"
               onSubmit={(event) => {
                 event.preventDefault();
+                if (composerLocked) return;
                 void send();
               }}
             >
               <textarea
                 value={draft}
-                placeholder={`Message ${branding.agentName}`}
+                placeholder={
+                  chatMode === 'locked'
+                    ? 'Chat is locked because Protect scored this session HIGH.'
+                    : chatMode === 'read_only'
+                      ? 'Chat is read-only for this session'
+                      : `Message ${branding.agentName}`
+                }
+                disabled={composerLocked}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
-                    void send();
+                    if (!composerLocked) void send();
                   }
                 }}
               />
@@ -140,6 +157,7 @@ export function ChatScreen({ branding, showReasoning }: { branding: Branding; sh
                 <button
                   type="button"
                   className="ghost"
+                  disabled={composerLocked}
                   onClick={() => void window.agent.pickAttachments().then((picked) => setAttachments((current) => [...current, ...picked]))}
                 >
                   Attach
@@ -153,7 +171,7 @@ export function ChatScreen({ branding, showReasoning }: { branding: Branding; sh
                     Stop
                   </button>
                 ) : (
-                  <button className="primary" type="submit">
+                  <button className="primary" type="submit" disabled={composerLocked}>
                     Send
                   </button>
                 )}

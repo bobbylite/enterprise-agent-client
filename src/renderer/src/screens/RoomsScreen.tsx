@@ -4,7 +4,16 @@ import { applyChatEvent } from '../chat-events';
 import { Field } from '../components/Markdown';
 import { Transcript } from '../components/Transcript';
 
-export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
+export function RoomsScreen({
+  showReasoning,
+  chatMode,
+  configLocked,
+}: {
+  showReasoning: boolean;
+  chatMode: 'allow' | 'read_only' | 'locked';
+  configLocked: boolean;
+}) {
+  const composerLocked = chatMode !== 'allow';
   const [rooms, setRooms] = useState<Room[]>([]);
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [selected, setSelected] = useState<Room | null>(null);
@@ -68,6 +77,12 @@ export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
           <h2>{selected ? selected.name : 'New room'}</h2>
           <p>Pick agents from the Agents list. They share these room instructions and reply in turn.</p>
         </header>
+        {configLocked ? (
+          <div className="notice access-notice locked-banner">
+            <p>Agent configuration is locked because Protect scored this session HIGH.</p>
+          </div>
+        ) : null}
+        <fieldset className="locked-config" disabled={configLocked}>
         <form
           className="stack compact"
           onSubmit={(event) => {
@@ -132,14 +147,15 @@ export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
             ) : null}
           </div>
         </form>
-        {snapshot ? <Transcript messages={snapshot.messages} showReasoning={showReasoning} /> : null}
+        </fieldset>
+        {snapshot ? <Transcript messages={snapshot.messages} showReasoning={showReasoning} resetKey={snapshot.conversation.id} /> : null}
         {error ? <p className="error">{error}</p> : null}
         {selected ? (
           <form
             className="composer"
             onSubmit={(event) => {
               event.preventDefault();
-              if (!selected) return;
+              if (!selected || composerLocked) return;
               setBusy(true);
               const text = draft;
               setDraft('');
@@ -151,13 +167,24 @@ export function RoomsScreen({ showReasoning }: { showReasoning: boolean }) {
                 .finally(() => setBusy(false));
             }}
           >
-            <textarea value={draft} placeholder="Message the room" onChange={(event) => setDraft(event.target.value)} />
+            <textarea
+              value={draft}
+              placeholder={
+                chatMode === 'locked'
+                  ? 'Chat is locked because Protect scored this session HIGH.'
+                  : chatMode === 'read_only'
+                    ? 'Chat is read-only for this session'
+                    : 'Message the room'
+              }
+              disabled={composerLocked}
+              onChange={(event) => setDraft(event.target.value)}
+            />
             {busy ? (
               <button className="primary" type="button" onClick={() => snapshot && void window.agent.stopGeneration(snapshot.conversation.id)}>
                 Stop
               </button>
             ) : (
-              <button className="primary" type="submit">
+              <button className="primary" type="submit" disabled={composerLocked}>
                 Send
               </button>
             )}

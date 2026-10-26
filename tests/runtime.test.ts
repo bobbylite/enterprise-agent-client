@@ -6,7 +6,9 @@ import { describe, expect, it } from 'vitest';
 import { Repository } from '../src/main/db';
 import { Runtime } from '../src/main/runtime';
 import { parseBranding } from '../src/shared/branding';
+import { applyPolicyWrite, authorizeWriteError } from '../src/shared/authorize/framework';
 import { parseEnterpriseConfig } from '../src/shared/config';
+import { decodeJwtPayload, encodeJsonSegment } from '../src/shared/ids';
 import { MemorySecretStore } from '../src/shared/secrets';
 import type { ChatEvent } from '../src/shared/types';
 
@@ -483,6 +485,469 @@ describe('mock runtime', () => {
   });
 });
 
+describe('admin gate', () => {
+  it('hides policy and the PingOne skill from a non-admin and allows them for an administrator', async () => {
+    const { runtime } = await boot();
+    const employee = await runtime.submitCredentials('ada', 'secret', '');
+    expect(employee.session?.groups).toEqual(['Employees']);
+    expect(employee.session?.admin).toBe(false);
+    expect(employee.features.policyTab).toBe(false);
+    expect(employee.features.pingoneTools).toBe(false);
+    expect(employee.features.chat).toBe('allow');
+    await expect(runtime.listPolicies()).rejects.toThrow(/Administrator/);
+    await expect(runtime.scaffoldPolicies(true)).rejects.toThrow(/Administrator/);
+    await expect(runtime.dryRunAuthorizePolicy()).rejects.toThrow(/Administrator/);
+    await expect(runtime.resetPolicyCache()).rejects.toThrow(/Administrator/);
+    const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+    const employeePage = runtime.openAgent(branded!.id);
+    expect(employeePage.skills.some((skill) => skill.id === 'pingone')).toBe(false);
+    expect(() => runtime.assignSkill(branded!.id, 'pingone', true)).toThrow(/not found/);
+
+    await runtime.logout();
+    await runtime.setMockAdmin(true);
+    const admin = await runtime.submitCredentials('ada', 'secret', '');
+    expect(admin.session?.admin).toBe(true);
+    expect(admin.session?.groups).toEqual(['Administrator']);
+    expect(admin.features.policyTab).toBe(true);
+    expect(admin.features.pingoneTools).toBe(true);
+    const adminPage = runtime.openAgent(branded!.id);
+    expect(adminPage.skills.some((skill) => skill.id === 'pingone' && skill.builtin && skill.requiresAdmin)).toBe(true);
+    const assigned = runtime.assignSkill(branded!.id, 'pingone', true);
+    expect(assigned.skillIds).toContain('pingone');
+    expect(assigned.skills.find((skill) => skill.id === 'pingone')?.assigned).toBe(true);
+  });
+
+  it('scaffolds once, toggles enforcement, and audits both', async () => {
+    const { runtime } = await boot(0, (config) => {
+      config.protect.enabled = false;
+    });
+    await runtime.setMockAdmin(true);
+    await runtime.submitCredentials('ada', 'secret', '');
+    const preview = await runtime.scaffoldPolicies(false);
+    expect(preview.created).toEqual([]);
+    expect(preview.policies).toEqual([]);
+    expect(preview.preview.map((policy) => policy.id)).toEqual([
+      'enterprise-agent:session',
+      'enterprise-agent:admin',
+      'enterprise-agent:medium',
+      'enterprise-agent:read-only',
+      'enterprise-agent:high-risk',
+    ]);
+    const created = await runtime.scaffoldPolicies(true);
+    expect(created.created).toHaveLength(5);
+    const again = await runtime.scaffoldPolicies(true);
+    expect(again.created).toEqual([]);
+    expect(await runtime.listPolicies()).toHaveLength(5);
+
+    await runtime.setPolicyEnabled('enterprise-agent:session', false);
+    const after = runtime.state();
+    expect(after.features.chat).toBe('read_only');
+    expect(after.features.mcpWrites).toBe(false);
+    expect(after.features.policyTab).toBe(true);
+    expect(after.restriction?.reason).toBe('policy');
+    const audit = runtime.listAudit();
+    expect(audit.some((event) => event.action === 'policy:scaffold' && event.username === 'ada')).toBe(true);
+    expect(audit.some((event) => event.action === 'policy:enforcement' && event.detail.includes('disabled'))).toBe(true);
+
+    const reset = await runtime.resetPolicyCache();
+    expect(reset.policies).toEqual([]);
+    expect(reset.cleared).toMatch(/5 local policies/);
+    expect(reset.cleared).toMatch(/Authorize decision cache/);
+    expect(reset.cleared).toMatch(/scaffold still in progress/);
+    expect(await runtime.listPolicies()).toEqual([]);
+    expect(runtime.listAudit().some((event) => event.action === 'policy:reset-cache')).toBe(true);
+    const afterReset = runtime.state();
+    expect(afterReset.features.chat).toBe('allow');
+    expect(afterReset.features.policyTab).toBe(true);
+    expect(afterReset.features.source).toBe('starter');
+    expect(afterReset.restriction).toBeNull();
+    const restored = await runtime.scaffoldPolicies(true);
+    expect(restored.created).toHaveLength(5);
+  });
+
+  it('writes a dry-run policy tree without calling PingOne', async () => {
+    const { runtime } = await boot(0, undefined, async () => {
+      throw new Error('dry run called PingOne');
+    });
+    await runtime.setMockAdmin(true);
+    await runtime.submitCredentials('ada', 'secret', '');
+    const result = await runtime.dryRunAuthorizePolicy();
+    expect(existsSync(result.path)).toBe(true);
+    expect(result.introspectionNote).toContain('user-introspect-client-id');
+    expect(result.introspectionNote).toContain('no authentication');
+    expect(result.introspectionNote).not.toContain('user-introspect-client-secret');
+    const body = JSON.parse(readFileSync(result.path, 'utf8')) as { name?: string; children?: { name?: string; id?: string }[] };
+    expect(body.name).toBe('Enterprise Agent Features');
+    expect(body.children?.map((child) => child.name)).toEqual(['Enterprise Agent User', 'Enterprise Agent Delegation']);
+    expect(body.children?.every((child) => !child.id)).toBe(true);
+  });
+
+  it('locks an administrator session down at high risk', async () => {
+    const { runtime } = await boot(0, (config) => {
+      config.protect.policy.levels.HIGH = 'allow';
+      config.protect.policy.reasonOverrides = config.protect.policy.reasonOverrides.filter((item) => item.code !== 'IMPOSSIBLE_TRAVEL');
+    });
+    await runtime.setMockAdmin(true);
+    await runtime.setMockScenario('impossible_travel');
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(state.session?.admin).toBe(true);
+    expect(state.risk?.level).toBe('HIGH');
+    expect(state.risk?.action).toBe('allow');
+    expect(state.features.policyTab).toBe(false);
+    expect(state.features.pingoneTools).toBe(false);
+    expect(state.features.mcpWrites).toBe(false);
+    expect(state.features.tools).toBe(false);
+    expect(state.features.agentConfig).toBe(false);
+    expect(state.features.extensionConfig).toBe(false);
+    expect(state.features.chat).toBe('locked');
+    expect(state.restriction?.reason).toBe('risk');
+    expect(state.restriction?.message).toMatch(/locked until the risk drops/);
+    await expect(runtime.listPolicies()).rejects.toThrow(/Policy tab/);
+    const snapshot = runtime.createConversation();
+    await expect(runtime.sendMessage(snapshot.conversation.id, 'hello', [])).rejects.toThrow(/locked/i);
+    const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+    const page = runtime.openAgent(branded!.id);
+    expect(() =>
+      runtime.saveAgent({
+        id: branded!.id,
+        name: page.profile.name,
+        provider: page.profile.provider,
+        model: page.profile.model,
+        persona: page.persona,
+        user: page.user,
+      }),
+    ).toThrow(/Agent configuration is locked/);
+    await expect(
+      runtime.saveMcpServer({
+        name: 'Echo',
+        transport: 'stdio',
+        command: 'node',
+        args: 'examples/echo-mcp-server.mjs',
+        url: '',
+        audience: '',
+        scope: '',
+        enabled: true,
+      }),
+    ).rejects.toThrow(/Extension configuration is locked/);
+  });
+
+  it('opens an administrator at low risk and turns tools off at medium risk', async () => {
+    const { runtime, events } = await boot();
+    try {
+      await runtime.setMockAdmin(false);
+      const employee = await runtime.submitCredentials('ada', 'secret', '');
+      expect(employee.features.policyTab).toBe(false);
+      expect(employee.features.chat).toBe('allow');
+      expect(employee.features.tools).toBe(true);
+      await runtime.logout();
+
+      await runtime.setMockAdmin(true);
+      const low = await runtime.submitCredentials('ada', 'secret', '');
+      expect(low.features).toMatchObject({
+        policyTab: true,
+        pingoneTools: true,
+        mcpWrites: true,
+        tools: true,
+        agentConfig: true,
+        extensionConfig: true,
+        chat: 'allow',
+      });
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      const page = runtime.openAgent(branded!.id);
+      runtime.saveAgent({
+        id: branded!.id,
+        name: page.profile.name,
+        provider: page.profile.provider,
+        model: page.profile.model,
+        persona: page.persona,
+        user: page.user,
+      });
+      const directory = mkdtempSync(join(tmpdir(), 'medium-echo-'));
+      const marker = join(directory, 'called.txt');
+      const script = join(directory, 'echo-mark.mjs');
+      writeFileSync(
+        script,
+        `import { writeFileSync as markCalled } from 'node:fs';\nconst calledMarker = ${JSON.stringify(marker)};\n${readFileSync('examples/echo-mcp-server.mjs', 'utf8').replace(
+          "if (message.method === 'tools/call') {",
+          "if (message.method === 'tools/call') { markCalled(calledMarker, 'called');",
+        )}`,
+      );
+      const echo = await runtime.saveMcpServer({
+        name: 'Echo',
+        transport: 'stdio',
+        command: 'node',
+        args: script,
+        url: '',
+        audience: '',
+        scope: '',
+        enabled: true,
+      });
+
+      const medium = await runtime.setMockScenario('anomalous_location');
+      expect(medium.risk?.level).toBe('MEDIUM');
+      expect(medium.risk?.action).toBe('restrict_tools');
+      expect(medium.risk?.summary).toContain('chat only, tools disabled');
+      expect(medium.restriction?.message).toBe('chat only, tools disabled');
+      expect(medium.features).toMatchObject({
+        policyTab: true,
+        pingoneTools: false,
+        mcpWrites: false,
+        tools: false,
+        agentConfig: true,
+        extensionConfig: true,
+        chat: 'allow',
+      });
+      runtime.saveRoutine({
+        name: 'Still allowed',
+        prompt: 'Write a note',
+        agentId: branded!.id,
+        targetType: 'agent',
+        targetId: branded!.id,
+        cron: '0 9 * * 1-5',
+        enabled: false,
+      });
+      await runtime.connectMcp(echo.id);
+      const snapshot = runtime.createConversation();
+      events.length = 0;
+      await runtime.sendMessage(snapshot.conversation.id, 'echo hello', []);
+      expect(events.some((event) => event.type === 'approval-required')).toBe(false);
+      expect(events.some((event) => event.type === 'tool' && (event.tool.status === 'done' || event.tool.status === 'running' || event.tool.status === 'calling'))).toBe(false);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('uses a worker token for the PingOne server and denies the tool until the skill is assigned', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pingone-token-'));
+    const tokenFile = join(directory, 'token.txt');
+    const script = join(directory, 'capture.mjs');
+    writeFileSync(script, "import { writeFileSync } from 'node:fs'; writeFileSync(process.argv[2], process.env.MCP_ACCESS_TOKEN ?? '');\n");
+    const { runtime, events } = await boot();
+    try {
+      await runtime.setMockAdmin(false);
+      await runtime.submitCredentials('ada', 'secret', '');
+      await runtime.saveMcpServer({
+        id: 'pingone',
+        name: 'PingOne',
+        transport: 'stdio',
+        command: 'node',
+        args: `${script} ${tokenFile}`,
+        url: '',
+        audience: '',
+        scope: '',
+        enabled: true,
+      });
+      await expect(runtime.connectMcp('pingone')).rejects.toThrow(/Administrator/);
+      expect(existsSync(tokenFile)).toBe(false);
+
+      await runtime.logout();
+      await runtime.setMockAdmin(true);
+      await runtime.submitCredentials('ada', 'secret', '');
+      await expect(runtime.connectMcp('pingone')).rejects.toThrow();
+      const payload = decodeJwtPayload(readFileSync(tokenFile, 'utf8'));
+      expect(payload.aud).toBe('worker');
+      expect(payload.sub).toBe('worker');
+      expect(payload.act).toBeUndefined();
+
+      await runtime.saveMcpServer({
+        id: 'pingone',
+        name: 'PingOne',
+        transport: 'stdio',
+        command: 'node',
+        args: 'examples/echo-mcp-server.mjs',
+        url: '',
+        audience: '',
+        scope: '',
+        enabled: true,
+      });
+      const connected = await runtime.connectMcp('pingone');
+      expect(connected.tools.map((tool) => tool.name)).toContain('echo');
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      const snapshot = runtime.createConversation();
+      await runtime.sendMessage(snapshot.conversation.id, 'echo hello', []);
+      expect(events.some((event) => event.type === 'tool' && event.tool.serverId === 'pingone')).toBe(false);
+
+      runtime.assignSkill(branded!.id, 'pingone', true);
+      const pending = runtime.sendMessage(snapshot.conversation.id, 'echo hello again', []);
+      const approval = await waitFor(events, (event) => event.type === 'approval-required' && event.request.serverId === 'pingone');
+      if (approval.type !== 'approval-required') throw new Error('missing approval');
+      runtime.respondApproval(approval.request.id, 'once');
+      await pending;
+      expect(events.some((event) => event.type === 'tool' && event.tool.serverId === 'pingone' && event.tool.status === 'done')).toBe(true);
+      expect(runtime.listAudit().some((event) => event.action.startsWith('tool:pingone/') && event.agentId === branded!.id)).toBe(true);
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('injects the Authorize skill only for an admin who assigned it, and gates the reference tool', async () => {
+    const systems: string[] = [];
+    const toolLists: string[][] = [];
+    let toolCall = 0;
+    const { runtime, events } = await boot(0, undefined, async (url, init) => {
+      if (!String(url).includes('llm.example')) return json(500, { message: String(url) });
+      const body = JSON.parse(String(init?.body)) as {
+        system?: string;
+        tools?: {
+          name: string;
+          description?: string;
+          inputSchema?: {
+            required?: string[];
+            additionalProperties?: boolean;
+            properties?: { name?: { enum?: string[] } };
+          };
+        }[];
+        messages?: { role: string; content?: string }[];
+      };
+      systems.push(body.system ?? '');
+      toolLists.push((body.tools ?? []).map((tool) => tool.name));
+      const skillTool = (body.tools ?? []).find((tool) => tool.name === 'skill__read_skill_reference');
+      if (skillTool) {
+        expect(skillTool.description).toContain('references/ea-api-operational-quirks.md');
+        expect(skillTool.inputSchema?.required).toContain('name');
+        expect(skillTool.inputSchema?.additionalProperties).toBe(false);
+        expect(skillTool.inputSchema?.properties?.name?.enum).toContain('references/ea-api-operational-quirks.md');
+      }
+      const sawTool = (body.messages ?? []).some((message) => message.role === 'tool');
+      const user = [...(body.messages ?? [])].reverse().find((message) => message.role === 'user');
+      if (!sawTool && user?.content?.includes('read the authorize reference')) {
+        return json(200, {
+          content: '',
+          tool_calls: [
+            {
+              id: `call-ref-${(toolCall += 1)}`,
+              name: 'skill__read_skill_reference',
+              arguments: JSON.stringify({ name: 'scripts/walk_policy_tree.py' }),
+            },
+          ],
+        });
+      }
+      return json(200, { content: 'Noted.' });
+    });
+    try {
+      const settings = runtime.getSettings();
+      await runtime.saveSettings({
+        provider: 'generic',
+        model: 'generic-1',
+        temperature: settings.temperature,
+        openaiBaseUrl: settings.openaiBaseUrl,
+        anthropicBaseUrl: settings.anthropicBaseUrl,
+        genericBaseUrl: 'https://llm.example/generate',
+      });
+      await runtime.submitCredentials('ada', 'secret', '');
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      const employeeChat = runtime.createConversation();
+      await runtime.sendMessage(employeeChat.conversation.id, 'read the authorize reference', []);
+      expect(systems.at(-1) ?? '').not.toContain('EA Admin API Build');
+      expect(systems.at(-1) ?? '').not.toContain('Rate limiting is silent');
+      expect(toolLists.at(-1) ?? []).not.toContain('skill__read_skill_reference');
+      expect(
+        events.some(
+          (event) =>
+            event.type === 'tool' && event.tool.status === 'denied' && event.tool.result === 'That tool is not connected.',
+        ),
+      ).toBe(true);
+
+      await runtime.logout();
+      await runtime.setMockAdmin(true);
+      await runtime.submitCredentials('ada', 'secret', '');
+      const adminChat = runtime.createConversation();
+      await runtime.sendMessage(adminChat.conversation.id, 'hello', []);
+      expect(systems.at(-1) ?? '').not.toContain('EA Admin API Build');
+      expect(toolLists.at(-1) ?? []).not.toContain('skill__read_skill_reference');
+
+      runtime.assignSkill(branded!.id, 'pingone', true);
+      const pending = runtime.sendMessage(adminChat.conversation.id, 'read the authorize reference', []);
+      const approval = await waitFor(
+        events,
+        (event) => event.type === 'approval-required' && event.request.toolName === 'read_skill_reference',
+      );
+      if (approval.type !== 'approval-required') throw new Error('missing approval');
+      expect(approval.request.readOnlyHint).toBe(true);
+      runtime.respondApproval(approval.request.id, 'once');
+      await pending;
+      const injected = systems.filter((system) => system.includes('EA Admin API Build'));
+      expect(injected.length).toBeGreaterThan(0);
+      expect(injected.every((system) => system.includes('Before any PingOne MCP tool call'))).toBe(true);
+      expect(injected.every((system) => !system.includes('Rate limiting is silent'))).toBe(true);
+      expect(toolLists.some((names) => names.includes('skill__read_skill_reference'))).toBe(true);
+      const done = events.find(
+        (event) => event.type === 'tool' && event.tool.toolName === 'read_skill_reference' && event.tool.status === 'done',
+      );
+      expect(done?.type === 'tool' ? done.tool.result : '').toContain('#!/usr/bin/env python3');
+      expect(done?.type === 'tool' ? done.tool.result : '').not.toContain('Rate limiting is silent');
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('returns the valid reference names when the skill tool is called with {}', async () => {
+    const { runtime, events } = await boot(0, undefined, async (url, init) => {
+      if (!String(url).includes('llm.example')) return json(500, { message: String(url) });
+      const body = JSON.parse(String(init?.body)) as { messages?: { role: string; content?: string }[] };
+      const sawTool = (body.messages ?? []).some((message) => message.role === 'tool');
+      const user = [...(body.messages ?? [])].reverse().find((message) => message.role === 'user');
+      if (!sawTool && user?.content?.includes('read the authorize reference')) {
+        return json(200, {
+          content: '',
+          tool_calls: [{ id: 'call-empty', name: 'skill__read_skill_reference', arguments: '{}' }],
+        });
+      }
+      return json(200, { content: 'Noted.' });
+    });
+    try {
+      const settings = runtime.getSettings();
+      await runtime.saveSettings({
+        provider: 'generic',
+        model: 'generic-1',
+        temperature: settings.temperature,
+        openaiBaseUrl: settings.openaiBaseUrl,
+        anthropicBaseUrl: settings.anthropicBaseUrl,
+        genericBaseUrl: 'https://llm.example/generate',
+      });
+      await runtime.setMockAdmin(true);
+      await runtime.submitCredentials('ada', 'secret', '');
+      const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+      runtime.assignSkill(branded!.id, 'pingone', true);
+      const snapshot = runtime.createConversation();
+      const pending = runtime.sendMessage(snapshot.conversation.id, 'read the authorize reference', []);
+      const approval = await waitFor(
+        events,
+        (event) => event.type === 'approval-required' && event.request.toolName === 'read_skill_reference',
+      );
+      if (approval.type !== 'approval-required') throw new Error('missing approval');
+      runtime.respondApproval(approval.request.id, 'once');
+      await pending;
+      const failed = events.find(
+        (event) => event.type === 'tool' && event.tool.toolName === 'read_skill_reference' && event.tool.status === 'error',
+      );
+      const result = failed?.type === 'tool' ? failed.tool.result ?? '' : '';
+      expect(result).toMatch(/not found/);
+      expect(result).toContain('Valid names:');
+      expect(result).toContain('references/ea-api-operational-quirks.md');
+      expect(result).toContain('scripts/walk_policy_tree.py');
+    } finally {
+      await runtime.dispose();
+    }
+  });
+
+  it('hides a skill whose required groups do not match the session', async () => {
+    const { runtime } = await boot();
+    await runtime.submitCredentials('ada', 'secret', '');
+    const uploaded = runtime.importSkill({
+      name: 'Finance close',
+      description: 'Books',
+      instructions: 'Reconcile the books.',
+      requiredGroups: ['Finance'],
+    });
+    expect(runtime.listSkills().some((skill) => skill.id === uploaded.id)).toBe(false);
+    const branded = runtime.listAgents().find((agent) => agent.nameFromBranding);
+    expect(runtime.openAgent(branded!.id).skills.some((skill) => skill.id === uploaded.id)).toBe(false);
+    expect(() => runtime.deleteSkill('pingone')).toThrow(/not found/);
+  });
+});
+
 describe('pi.flow runtime', () => {
   function pingone(config: ReturnType<typeof parseEnterpriseConfig>): void {
     config.tenant.mode = 'pingone';
@@ -532,6 +997,323 @@ describe('pi.flow runtime', () => {
       'application/vnd.pingidentity.usernamePassword.check+json',
       'application/x-www-form-urlencoded',
     ]);
+  });
+
+  it('reads the Administrator group from the access token', async () => {
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+      },
+      flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] })),
+    );
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(state.session?.admin).toBe(true);
+    expect(state.session?.groups).toEqual(['Administrator']);
+    expect(state.features.policyTab).toBe(true);
+    expect(state.features.source).toBe('starter');
+  });
+
+  it('fails closed when the Authorize decision endpoint cannot be reached', async () => {
+    let decisionAuth = '';
+    const secrets = new MemorySecretStore();
+    await secrets.set('workerClientSecret', 'worker-secret');
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+        config.authorize.decisionEndpointId = 'decision-1';
+      },
+      async (url, init) => {
+        const target = String(url);
+        const body = String(init?.body ?? '');
+        if (target.includes('/as/token') && body.includes('client_credentials')) {
+          return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        }
+        if (target.includes('/decisionEndpoints/')) {
+          decisionAuth = new Headers(init?.headers).get('authorization') ?? '';
+          const parameters = (JSON.parse(body) as { parameters: Record<string, string> }).parameters;
+          expect(parameters['EnterpriseAgent.admin-group']).toBe('Administrator');
+          expect(parameters['EnterpriseAgent.risk-level']).toBe('LOW');
+          expect(parameters['EnterpriseAgent.risk-score']).toBe(10);
+          expect(parameters['EnterpriseAgent.risk-action']).toBe('allow');
+          expect(typeof parameters['EnterpriseAgent.access-token']).toBe('string');
+          expect(String(parameters['EnterpriseAgent.access-token']).length).toBeGreaterThan(0);
+          expect(String(parameters['EnterpriseAgent.tx-token']).length).toBeGreaterThan(0);
+          expect(parameters['user.groups']).toBeUndefined();
+          throw new Error('Authorize unreachable');
+        }
+        return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+      },
+      secrets,
+      { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+    );
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(decisionAuth).toBe('Bearer worker-token');
+    expect(state.features.source).toBe('fail_closed');
+    expect(state.features.policyTab).toBe(true);
+    expect(state.features.pingoneTools).toBe(false);
+    expect(state.features.mcpWrites).toBe(false);
+    expect(state.features.chat).toBe('read_only');
+    expect(state.restriction?.reason).toBe('decision_failure');
+    expect(state.restriction?.message).toMatch(/decision endpoint/);
+    const preview = await runtime.scaffoldPolicies(false);
+    expect(preview.created).toEqual([]);
+    expect(preview.preview).toHaveLength(5);
+  });
+
+  it('applies an Authorize feature statement from the worker decision call', async () => {
+    const secrets = new MemorySecretStore();
+    await secrets.set('workerClientSecret', 'worker-secret');
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+        config.authorize.decisionEndpointId = 'decision-1';
+      },
+      async (url, init) => {
+        const target = String(url);
+        const body = String(init?.body ?? '');
+        if (target.includes('/as/token') && body.includes('client_credentials')) {
+          return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        }
+        if (target.includes('/decisionEndpoints/')) {
+          return json(200, {
+            decision: 'PERMIT',
+            statements: [
+              {
+                code: 'enterprise-agent-features',
+                payload: JSON.stringify({ policyTab: true, pingoneTools: false, mcpWrites: true, chat: 'allow' }),
+              },
+            ],
+          });
+        }
+        return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+      },
+      secrets,
+      { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+    );
+    const state = await runtime.submitCredentials('ada', 'secret', '');
+    expect(state.features.source).toBe('authorize');
+    expect(state.features.policyTab).toBe(true);
+    expect(state.features.pingoneTools).toBe(false);
+    expect(state.features.mcpWrites).toBe(true);
+    expect(state.features.chat).toBe('allow');
+    await runtime.saveMcpServer({
+      id: 'pingone',
+      name: 'PingOne',
+      transport: 'stdio',
+      command: 'node',
+      args: 'examples/echo-mcp-server.mjs',
+      url: '',
+      audience: '',
+      scope: '',
+      enabled: true,
+    });
+    await expect(runtime.connectMcp('pingone')).rejects.toThrow(/turned PingOne tools off/);
+  });
+
+  it('retries a rate-limited scaffold and does not create the same policies again', async () => {
+    const remote: { id: string; name: string; description: string; enabled: boolean }[] = [];
+    const posts: string[] = [];
+    let limited = true;
+    const secrets = new MemorySecretStore();
+    await secrets.set('workerClientSecret', 'worker-secret');
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+      },
+      async (url, init) => {
+        const target = String(url);
+        const method = init?.method ?? 'GET';
+        const bodyText = String(init?.body ?? '');
+        const side = authorizeSide(target, method, bodyText);
+        if (side) return side;
+        if (target.includes('/authorizationPolicies') && method === 'GET') {
+          return json(200, { _embedded: { authorizationPolicies: remote } });
+        }
+        if (target.includes('/authorizationPolicies') && method === 'POST') {
+          const body = JSON.parse(bodyText) as { name: string; description: string };
+          if (limited) {
+            limited = false;
+            return new Response(JSON.stringify({ code: 'REQUEST_LIMITED' }), {
+              status: 429,
+              headers: { 'content-type': 'application/json', 'retry-after': '0' },
+            });
+          }
+          if (remote.some((item) => item.name === body.name)) return json(409, { message: 'duplicate' });
+          const id = `policy-${remote.length + 1}`;
+          remote.push({ id, name: body.name, description: body.description, enabled: true });
+          posts.push(body.name);
+          return json(201, { id });
+        }
+        if (target.includes('/as/token') && bodyText.includes('client_credentials')) {
+          return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        }
+        return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+      },
+      secrets,
+      { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+    );
+    await runtime.submitCredentials('ada', 'secret', '');
+    const [first, overlapping] = await Promise.all([runtime.scaffoldPolicies(true), runtime.scaffoldPolicies(true)]);
+    expect(posts).toHaveLength(5);
+    expect(first.created.length + overlapping.created.length).toBe(5);
+    const again = await runtime.scaffoldPolicies(true);
+    expect(again.created).toEqual([]);
+    expect(posts).toHaveLength(5);
+
+    remote.splice(0, remote.length);
+    const recreated = await runtime.scaffoldPolicies(true);
+    expect(recreated.created.map((policy) => policy.name).sort()).toEqual([
+      'Administrator tools',
+      'High risk lockdown',
+      'Medium risk',
+      'Read-only risk',
+      'Session can use chat',
+    ]);
+    expect(posts).toHaveLength(10);
+    const listed = await runtime.listPolicies();
+    expect(listed.map((policy) => policy.id).filter((id) => !id.includes(':pingone:')).sort()).toEqual([
+      'enterprise-agent:admin',
+      'enterprise-agent:high-risk',
+      'enterprise-agent:medium',
+      'enterprise-agent:read-only',
+      'enterprise-agent:session',
+    ]);
+    expect(listed.some((policy) => policy.name === 'Enterprise Agent User')).toBe(true);
+
+    remote.splice(0, remote.length);
+    const postsBeforeReset = posts.length;
+    const reset = await runtime.resetPolicyCache();
+    expect(reset.policies).toEqual([]);
+    expect(reset.cleared).toMatch(/8 local policies/);
+    expect(reset.cleared).toMatch(/Trust Framework ids/);
+    expect(reset.cleared).toMatch(/Authorize decision cache/);
+    expect(posts).toHaveLength(postsBeforeReset);
+    const refreshed = await runtime.refreshPolicies();
+    expect(posts).toHaveLength(postsBeforeReset);
+    expect(refreshed).toEqual([]);
+    expect(remote).toEqual([]);
+    const recovered = runtime.state();
+    expect(recovered.features.source).toBe('fail_closed');
+    expect(recovered.features.policyTab).toBe(true);
+    expect(recovered.features.pingoneTools).toBe(false);
+    expect(recovered.features.chat).toBe('read_only');
+    expect(recovered.features.mcpWrites).toBe(false);
+    expect(recovered.restriction?.reason).toBe('decision_failure');
+    await runtime.scaffoldPolicies(false);
+    expect(posts).toHaveLength(postsBeforeReset);
+    const created = await runtime.scaffoldPolicies(true);
+    expect(created.created).toHaveLength(5);
+    expect(posts).toHaveLength(postsBeforeReset + 5);
+    expect(remote).toHaveLength(5);
+  });
+
+  it('saves an always-current decision endpoint when PingOne lists no authorization version', async () => {
+    authorizeVersions = 'empty';
+    try {
+      const secrets = new MemorySecretStore();
+      await secrets.set('workerClientSecret', 'worker-secret');
+      const { runtime, db } = await boot(
+        0,
+        (config) => {
+          pingone(config);
+          config.protect.enabled = false;
+        },
+        async (url, init) => {
+          const target = String(url);
+          const method = init?.method ?? 'GET';
+          const bodyText = String(init?.body ?? '');
+          const side = authorizeSide(target, method, bodyText);
+          if (side) return side;
+          if (target.includes('/authorizationPolicies') && method === 'GET') return json(200, { _embedded: { authorizationPolicies: [] } });
+          if (target.includes('/authorizationPolicies') && method === 'POST') {
+            const body = JSON.parse(bodyText) as { name: string; description: string };
+            return json(201, { id: `policy-${body.name}`, name: body.name, description: body.description, enabled: true });
+          }
+          if (target.includes('/as/token') && bodyText.includes('client_credentials')) {
+            return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+          }
+          return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+        },
+        secrets,
+        { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+      );
+      await runtime.submitCredentials('ada', 'secret', '');
+      const created = await runtime.scaffoldPolicies(true);
+      expect(created.warning).toMatch(/always-current/);
+      expect(created.warning).toMatch(/Versions response/);
+      const saved = db.getSetting('authorize.decisionEndpointId');
+      expect(saved).toBeTruthy();
+      expect(runtime.state().mode).toBe('pingone');
+    } finally {
+      authorizeVersions = 'items';
+    }
+  });
+
+  it('stops creating policies when the local cache is reset during a scaffold', async () => {
+    const remote: { id: string; name: string; description: string; enabled: boolean }[] = [];
+    let posted = 0;
+    const gate: { release: (() => void) | null } = { release: null };
+    const secrets = new MemorySecretStore();
+    await secrets.set('workerClientSecret', 'worker-secret');
+    const { runtime } = await boot(
+      0,
+      (config) => {
+        pingone(config);
+        config.protect.enabled = false;
+      },
+      async (url, init) => {
+        const target = String(url);
+        const method = init?.method ?? 'GET';
+        const bodyText = String(init?.body ?? '');
+        const side = authorizeSide(target, method, bodyText);
+        if (side) return side;
+        if (target.includes('/authorizationPolicies') && method === 'GET') {
+          return json(200, { _embedded: { authorizationPolicies: remote } });
+        }
+        if (target.includes('/authorizationPolicies') && method === 'POST') {
+          posted += 1;
+          if (posted === 1) {
+            await new Promise<void>((resolve) => {
+              gate.release = resolve;
+            });
+          }
+          const body = JSON.parse(bodyText) as { name: string; description: string };
+          const id = `policy-${remote.length + 1}`;
+          remote.push({ id, name: body.name, description: body.description, enabled: true });
+          return json(201, { id });
+        }
+        if (target.includes('/as/token') && bodyText.includes('client_credentials')) {
+          return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+        }
+        return flowFetch(unsignedJwt({ sub: 'user-1', groups: ['Administrator'] }))(url, init);
+      },
+      secrets,
+      { PINGONE_WORKER_CLIENT_ID: 'worker-id' },
+    );
+    await runtime.submitCredentials('ada', 'secret', '');
+    const scaffolding = runtime.scaffoldPolicies(true);
+    const started = Date.now();
+    while (!gate.release && Date.now() - started < 5000) await new Promise((resolve) => setTimeout(resolve, 10));
+    const release = gate.release;
+    if (!release) throw new Error('The scaffold did not start a create.');
+    const reset = await runtime.resetPolicyCache();
+    expect(reset.cleared).toMatch(/scaffold still in progress/);
+    release();
+    const finished = await scaffolding;
+    expect(posted).toBe(1);
+    expect(finished.created).toEqual([]);
+    expect(await runtime.listPolicies()).toEqual([]);
+    const refreshed = await runtime.refreshPolicies();
+    expect(posted).toBe(1);
+    expect(refreshed.map((policy) => policy.name)).toEqual(['Administrator tools']);
   });
 
   it('reports an external identity provider instead of posting usernamePassword.check', async () => {
@@ -780,6 +1562,133 @@ async function waitFor(events: ChatEvent[], predicate: (event: ChatEvent) => boo
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('Timed out waiting for an event.');
+}
+
+function unsignedJwt(claims: Record<string, unknown>): string {
+  return `${encodeJsonSegment({ alg: 'none', typ: 'JWT' })}.${encodeJsonSegment(claims)}.sig`;
+}
+
+function flowFetch(accessToken: string): typeof fetch {
+  let state = '';
+  return async (url, init) => {
+    const type = new Headers(init?.headers).get('content-type') ?? '';
+    const target = String(url);
+    if (target.includes('/as/authorize')) {
+      state = new URL(target).searchParams.get('state') ?? '';
+      return json(200, {
+        id: 'flow-1',
+        status: 'USERNAME_PASSWORD_REQUIRED',
+        _links: { 'usernamePassword.check': { href: 'https://auth.example/env-1/flows/flow-1' } },
+      });
+    }
+    if (type.includes('usernamePassword.check')) {
+      return json(200, {
+        id: 'flow-1',
+        status: 'COMPLETED',
+        authorizeResponse: { code: 'auth-code', state },
+        _embedded: { user: { id: 'user-1', username: 'ada' } },
+      });
+    }
+    if (target.includes('/as/token')) {
+      return json(200, { access_token: accessToken, expires_in: 3600, token_type: 'Bearer' });
+    }
+    return json(500, { message: target });
+  };
+}
+
+const authorizeResources = new Map<string, Record<string, unknown>>();
+let authorizeSeq = 0;
+let authorizeVersions: 'items' | 'empty' = 'items';
+
+function authorizeSide(target: string, method: string, bodyText: string): Response | null {
+  const managed = /authorizationAttributes|authorizationServices|authorizationVersions|decisionEndpoints|authorizationPolicies/.test(target);
+  if (!managed) return null;
+  const idMatch = target.match(/\/(authorizationAttributes|authorizationServices|authorizationPolicies|authorizationVersions|decisionEndpoints)\/([^/?]+)/);
+  const body = bodyText ? (JSON.parse(bodyText) as Record<string, unknown>) : {};
+  const rejected = authorizeWriteError(target, method, body);
+  if (rejected) return json(400, { code: 'INVALID_DATA', message: rejected });
+  const collection = target.includes('authorizationAttributes')
+    ? 'authorizationAttributes'
+    : target.includes('authorizationServices')
+      ? 'authorizationServices'
+      : target.includes('authorizationVersions')
+        ? 'authorizationVersions'
+        : target.includes('decisionEndpoints')
+          ? 'decisionEndpoints'
+          : 'authorizationPolicies';
+  if (collection === 'authorizationPolicies' && !idMatch && method === 'GET') return null;
+  if (collection === 'authorizationPolicies' && !idMatch && method === 'POST' && String(body.description ?? '').includes('enterprise-agent-scaffold')) {
+    return null;
+  }
+  if (collection === 'authorizationVersions' && !idMatch && method === 'GET') {
+    if (authorizeVersions === 'empty') return json(200, { _embedded: { items: [] } });
+    const collectionUrl = target.split('?')[0] ?? target;
+    return json(200, {
+      _embedded: {
+        items: [
+          {
+            id: 'ver-new',
+            createdAt: '2026-08-15T17:00:52.000Z',
+            _links: { tag: { href: `${collectionUrl}/ver-new/tag` } },
+          },
+          { id: 'ver-old', createdAt: '2026-08-01T16:08:00.000Z' },
+        ],
+      },
+    });
+  }
+  if (target.includes('/authorizationVersions/') && target.split('?')[0]?.endsWith('/tag') && method === 'PUT') {
+    const versionId = target.match(/authorizationVersions\/([^/?]+)\/tag/)?.[1] ?? 'ver-new';
+    return json(200, { id: versionId, tag: { updatedAt: '2026-08-15T17:00:52.000Z' } });
+  }
+  if (!idMatch && method === 'GET') {
+    const rows = [...authorizeResources.values()].filter((item) => item.collection === collection);
+    return json(200, { _embedded: { [collection]: rows } });
+  }
+  if (!idMatch && method === 'POST') {
+    const id = `tf-${(authorizeSeq += 1)}`;
+    const saved =
+      collection === 'authorizationPolicies'
+        ? {
+            ...applyPolicyWrite('POST', undefined, body, id, new Set(authorizeResources.keys()), () => `tf-${(authorizeSeq += 1)}`, (childId, child) => {
+              authorizeResources.set(childId, { ...child, collection: 'authorizationPolicies' });
+            }),
+            collection,
+          }
+        : { ...body, id, version: 'v1', collection, children: body.children ?? [] };
+    authorizeResources.set(id, saved);
+    return json(201, saved);
+  }
+  const id = idMatch?.[2] ?? '';
+  if (collection === 'authorizationVersions' && id && method === 'GET') {
+    return json(200, { id, tag: { updatedAt: '2026-08-15T17:00:52.000Z' } });
+  }
+  if (method === 'DELETE') {
+    authorizeResources.delete(id);
+    return new Response(null, { status: 204 });
+  }
+  if (method === 'GET') {
+    const saved = authorizeResources.get(id);
+    return saved ? json(200, saved) : json(404, { message: 'missing' });
+  }
+  if (method === 'PUT') {
+    const saved: Record<string, unknown> = { ...(authorizeResources.get(id) ?? {}), ...body, id, version: 'v2', collection };
+    if (collection === 'decisionEndpoints' && !Object.prototype.hasOwnProperty.call(body, 'authorizationVersion')) {
+      delete saved.authorizationVersion;
+    }
+    if (collection === 'authorizationPolicies') {
+      const prior = authorizeResources.get(id);
+      Object.assign(
+        saved,
+        applyPolicyWrite('PUT', prior, body, id, new Set(authorizeResources.keys()), () => `tf-${(authorizeSeq += 1)}`, (childId, child) => {
+          authorizeResources.set(childId, { ...child, collection: 'authorizationPolicies' });
+        }),
+        { collection },
+      );
+    }
+    authorizeResources.set(id, saved);
+    return json(200, saved);
+  }
+  return null;
 }
 
 function json(status: number, body: unknown): Response {

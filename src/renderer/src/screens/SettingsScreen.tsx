@@ -105,7 +105,9 @@ export function SettingsScreen({ state }: { state: AppState }) {
         <Field label={`AI Agent client secret ${settings.keys.agent ? '(stored)' : '(not set)'}`}>
           <input type="password" value={agentClientSecret} placeholder="Token exchange (PINGONE_AGENT_CLIENT_SECRET)" onChange={(event) => setAgentClientSecret(event.target.value)} />
         </Field>
-        <p className="muted">Protect uses the worker secret. Token exchange uses the AI Agent secret. If that secret is empty, exchange falls back to the worker.</p>
+        <p className="muted">
+          Protect uses the worker secret. Token exchange uses the AI Agent secret. If that secret is empty, exchange falls back to the worker. User SSO introspection sends tenant.clientId as client_id and does not use a secret.
+        </p>
         {message ? <p className="notice">{message}</p> : null}
         <button className="primary" type="submit">
           Save settings

@@ -13,7 +13,7 @@ import { renderRiskContext } from '../src/shared/protect/context';
 import { buildRiskEvent, resolvePublicIp } from '../src/shared/protect/evaluate';
 import { mockRiskPayload } from '../src/shared/protect/mock';
 import { decideRisk, summarizeRisk, unscoredRisk } from '../src/shared/protect/policy';
-import { extractRiskReasons } from '../src/shared/protect/reasons';
+import { extractRiskReasons, riskIndicatorClass, riskLevel } from '../src/shared/protect/reasons';
 import {
   createOpenAiProvider,
   isReasoningModel,
@@ -27,7 +27,7 @@ import { createGenericProvider } from '../src/shared/providers/generic';
 import { parseAnthropicData, parseOpenAiData } from '../src/shared/providers/sse';
 import { mockResult } from '../src/shared/providers/mock';
 import { assertValidCron, cronMatches } from '../src/shared/schedule/cron';
-import { AudienceTokenCache, exchangeSubjectToken } from '../src/shared/tokens/exchange';
+import { AudienceTokenCache, exchangeSubjectToken, fetchClientCredentials } from '../src/shared/tokens/exchange';
 import { MemorySecretStore } from '../src/shared/secrets';
 import { parseEnv, redactSecrets } from '../src/shared/env';
 import { encodeJsonSegment } from '../src/shared/ids';
@@ -376,6 +376,29 @@ describe('token exchange', () => {
     expect(delegated.get('actor_token')).toBe('agent-actor-token');
     expect(delegated.get('actor_token_type')).toBe('urn:ietf:params:oauth:token-type:access_token');
   });
+
+  it('authenticates client credentials with HTTP Basic and omits body credentials', async () => {
+    let body = '';
+    let authorization = '';
+    const token = await fetchClientCredentials({
+      tokenEndpoint: 'https://auth.example/env/as/token',
+      clientId: 'worker-id',
+      clientSecret: 'worker-secret',
+      scope: 'p1:read:user',
+      fetchImpl: async (_url, init) => {
+        body = String(init?.body);
+        authorization = new Headers(init?.headers).get('authorization') ?? '';
+        return json(200, { access_token: 'worker-token', expires_in: 3600, token_type: 'Bearer' });
+      },
+    });
+    const params = new URLSearchParams(body);
+    expect(params.get('grant_type')).toBe('client_credentials');
+    expect(params.get('scope')).toBe('p1:read:user');
+    expect(params.get('client_id')).toBeNull();
+    expect(params.get('client_secret')).toBeNull();
+    expect(Buffer.from(authorization.replace(/^Basic /, ''), 'base64').toString('utf8')).toBe('worker-id:worker-secret');
+    expect(token.accessToken).toBe('worker-token');
+  });
 });
 
 describe('protect policy', () => {
@@ -387,6 +410,26 @@ describe('protect policy', () => {
     expect(extractRiskReasons(mockRiskPayload('impossible_travel').details).map((reason) => reason.code)).toContain('IMPOSSIBLE_TRAVEL');
     expect(extractRiskReasons(mockRiskPayload('bot').details).map((reason) => reason.code)).toContain('BOT');
     expect(extractRiskReasons(mockRiskPayload('low').details)).toEqual([]);
+  });
+
+  it('maps Protect level text and scores onto the indicator colors', () => {
+    expect(riskLevel('LOW')).toBe('LOW');
+    expect(riskLevel('low')).toBe('LOW');
+    expect(riskLevel('Low Risk')).toBe('LOW');
+    expect(riskLevel('medium')).toBe('MEDIUM');
+    expect(riskLevel('HIGH_RISK')).toBe('HIGH');
+    expect(riskLevel('unknown')).toBe('UNKNOWN');
+    expect(riskLevel('not-a-level')).toBe('UNKNOWN');
+    expect(riskLevel(10)).toBe('LOW');
+    expect(riskLevel(undefined, 50)).toBe('MEDIUM');
+    expect(riskLevel(undefined, '85')).toBe('HIGH');
+    expect(riskLevel('LOW', 90)).toBe('LOW');
+    expect(riskIndicatorClass('LOW')).toBe('good');
+    expect(riskIndicatorClass('low')).toBe('good');
+    expect(riskIndicatorClass('MEDIUM')).toBe('warn');
+    expect(riskIndicatorClass('high')).toBe('danger');
+    expect(riskIndicatorClass('UNKNOWN')).toBe('unknown');
+    expect(riskIndicatorClass(undefined)).toBe('unknown');
   });
 
   it('lets the most restrictive matching action win', () => {
@@ -495,6 +538,15 @@ describe('instructions and approvals', () => {
     });
     expect(choiceFromUser('always', false)).toMatchObject({ type: 'allow', persistence: 'once' });
     expect(previewApproval({ riskAction: 'block', readOnlyHint: true })).toMatchObject({ type: 'deny' });
+    expect(previewApproval({ riskAction: 'restrict_tools', riskLevel: 'MEDIUM', readOnlyHint: true })).toMatchObject({
+      type: 'deny',
+      reason: 'chat only, tools disabled',
+      automatic: true,
+    });
+    expect(previewApproval({ riskAction: 'allow', riskLevel: 'MEDIUM', readOnlyHint: false, remembered: 'always' })).toMatchObject({
+      type: 'deny',
+      automatic: true,
+    });
   });
 });
 

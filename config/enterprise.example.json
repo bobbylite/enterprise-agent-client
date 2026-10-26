@@ -7,7 +7,7 @@
     "environmentId": "",
     "clientId": "",
     "redirectUri": "http://127.0.0.1:53147/callback",
-    "scopes": ["openid", "profile", "email"],
+    "scopes": ["openid", "profile", "email", "user:groups"],
     "login": {
       "preferred": "pi.flow",
       "allowSystemBrowserFallback": true,
@@ -32,6 +32,8 @@
     "resolvePublicIp": true,
     "reportedIp": "",
     "userType": "EXTERNAL",
+    "pollIntervalSeconds": 30,
+    "pauseWhenHidden": false,
     "policy": {
       "levels": {
         "LOW": "allow",
@@ -47,6 +49,15 @@
         { "code": "ANONYMOUS_NETWORK", "action": "restrict_tools" }
       ]
     }
+  },
+  "access": {
+    "adminGroup": "Administrator",
+    "groupsClaim": "groups"
+  },
+  "authorize": {
+    "decisionEndpointId": "",
+    "cacheMs": 30000,
+    "mcpServerId": "pingone"
   },
   "enterpriseInstructions": {
     "persona": "Operate only for the signed-in employee and only inside this organization's policies. The enterprise layer wins when it conflicts with the agent persona or the user's preferences.",

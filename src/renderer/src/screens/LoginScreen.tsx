@@ -79,6 +79,14 @@ export function LoginScreen({
                 ))}
               </div>
               <p className="muted">Mock mode accepts any non-empty password and does not contact PingOne.</p>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={state.mockAdmin}
+                  onChange={(event) => void run(() => window.agent.setMockAdmin(event.target.checked))}
+                />
+                Sign in as {state.adminGroup}
+              </label>
             </div>
           ) : null}
 

@@ -1,9 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { riskIndicatorClass } from '@shared/protect/reasons';
 import type { AppState, Branding } from '@shared/types';
 import { ApprovalModal } from '../components/ApprovalModal';
 import { AgentsScreen } from './AgentsScreen';
 import { ChatScreen } from './ChatScreen';
 import { McpScreen } from './McpScreen';
+import { PolicyScreen } from './PolicyScreen';
 import { RoomsScreen } from './RoomsScreen';
 import { SettingsScreen } from './SettingsScreen';
 
@@ -12,6 +14,7 @@ const NAV = [
   ['rooms', 'Rooms'],
   ['agents', 'Agents'],
   ['tools', 'Tools'],
+  ['policy', 'Policy'],
   ['settings', 'Settings'],
 ] as const;
 
@@ -24,8 +27,18 @@ export function Shell({
   state: AppState;
   onState: (state: AppState) => void;
 }) {
+  const showPolicy = Boolean(state.session?.admin && state.features.policyTab);
+  const nav = NAV.filter(([id]) => id !== 'policy' || showPolicy);
   const [view, setView] = useState<(typeof NAV)[number][0]>('chat');
-  const riskClass = state.risk?.action === 'block' ? 'danger' : state.risk?.action === 'allow' ? 'good' : 'warn';
+  const riskClass = riskIndicatorClass(state.risk?.level);
+  const chatMode = state.features.chat;
+  const agentLocked = !state.features.agentConfig;
+  const extensionLocked = !state.features.extensionConfig;
+  const canScaffold = Boolean(state.session?.admin && state.features.policyTab);
+
+  useEffect(() => {
+    if (view === 'policy' && !showPolicy) setView('chat');
+  }, [showPolicy, view]);
 
   return (
     <div className="shell">
@@ -44,7 +57,7 @@ export function Shell({
           </div>
         ) : null}
         <nav>
-          {NAV.map(([id, label]) => (
+          {nav.map(([id, label]) => (
             <button key={id} type="button" className={view === id ? 'nav selected' : 'nav'} onClick={() => setView(id)}>
               {label}
             </button>
@@ -62,10 +75,23 @@ export function Shell({
         </div>
       </aside>
       <section className="workspace">
-        {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} /> : null}
-        {view === 'rooms' ? <RoomsScreen showReasoning={state.showReasoning} /> : null}
-        {view === 'agents' ? <AgentsScreen branding={branding} /> : null}
-        {view === 'tools' ? <McpScreen /> : null}
+        {state.restriction ? (
+          <div className={`notice access-notice${chatMode === 'locked' ? ' locked-banner' : ''}`}>
+            <p>{state.restriction.message}</p>
+            {canScaffold ? (
+              <button type="button" className="primary" onClick={() => setView('policy')}>
+                Scaffold policies
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {view === 'chat' ? <ChatScreen branding={branding} showReasoning={state.showReasoning} chatMode={chatMode} /> : null}
+        {view === 'rooms' ? (
+          <RoomsScreen showReasoning={state.showReasoning} chatMode={chatMode} configLocked={agentLocked} />
+        ) : null}
+        {view === 'agents' ? <AgentsScreen branding={branding} configLocked={agentLocked} /> : null}
+        {view === 'tools' ? <McpScreen configLocked={extensionLocked} /> : null}
+        {view === 'policy' && showPolicy ? <PolicyScreen onState={onState} /> : null}
         {view === 'settings' ? <SettingsScreen state={state} /> : null}
       </section>
       <ApprovalModal />
